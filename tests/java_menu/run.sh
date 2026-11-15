@@ -110,11 +110,13 @@ PASS=0
 FAIL=0
 FAILED_NAMES=()
 
-# Processos JDTLS "parecidos com teste": o launcher do Mason e o processo Java
-# cujo -data aponta para fixtures do Java Menu ou para os workspaces de teste.
-# Nada aqui encerra um JDTLS de outra sessão do usuário: só o que APARECEU
-# durante o nosso spec (snapshot-diff) e sobreviveu ao fim dele é órfão nosso.
-JDTLS_PAT='mason/bin/jdtls|jdtls-ws-|java-menu-'
+# Processos dos testes: a linha de comando só casa com recursos criados pelos
+# próprios specs (fixtures java-menu-* e workspaces jdtls-ws-*), nunca com um
+# launcher jdtls genérico. Um processo é encerrado somente se (a) NÃO existia
+# no snapshot anterior ao spec e (b) sobreviveu ao fim dele — ou seja, órfão
+# nosso. Servidores de outras sessões existem antes do snapshot e nunca são
+# tocados; processos sem identidade de teste conhecida nunca são mortos.
+JDTLS_PAT='jdtls-ws-|java-menu-'
 
 snapshot_pids() {
   pgrep -f "$JDTLS_PAT" 2>/dev/null | sort >"$1"
@@ -147,12 +149,20 @@ run_spec() {
   snapshot_pids "$pre_pids"
   local t0 t1 rc
   t0=$(date +%s)
+  # O spec roda via pcall(dofile): erro de assert NÃO pode ser mascarado por
+  # um qa! posterior (com `-c luafile` + `-c qa!` o nvim sai 0 mesmo com
+  # E5113 — falso PASS). Em falha: stack trace completo no log + cquit 1.
+  local inner="local name_spec = '$name'
+local ok, err = pcall(dofile, [[$SCRIPT_DIR/$name.lua]])
+if ok then return end
+io.stderr:write('[SPEC_ERROR] ' .. name_spec .. '\n' .. tostring(err) .. '\n')
+vim.cmd('cquit 1')"
   if [ -n "$TIMEOUT_BIN" ]; then
     (cd "$REPO_DIR" && timeout --foreground "$timeout_s" "$NVIM" --headless -u NONE -n \
-      "${RTP[@]}" -c "luafile $SCRIPT_DIR/$name.lua" -c "qa!") >"$log" 2>&1
+      "${RTP[@]}" -c "lua $inner" -c "qa!") >"$log" 2>&1
   else
     (cd "$REPO_DIR" && "$NVIM" --headless -u NONE -n \
-      "${RTP[@]}" -c "luafile $SCRIPT_DIR/$name.lua" -c "qa!") >"$log" 2>&1
+      "${RTP[@]}" -c "lua $inner" -c "qa!") >"$log" 2>&1
   fi
   rc=$?
   t1=$(date +%s)

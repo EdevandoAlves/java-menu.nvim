@@ -24,7 +24,7 @@ end
 local function count_ours(mode, pre)
   local n = 0
   for _, m in ipairs(vim.api.nvim_get_keymap(mode)) do
-    if type(m.desc) == "string" and m.desc:find("^Java Menu: ", 1, true) and (not pre or m.lhs:find(pre, 1, true)) then
+    if type(m.desc) == "string" and m.desc:find("Java Menu: ", 1, true) and (not pre or m.lhs:find(pre, 1, true)) then
       n = n + 1
     end
   end
@@ -52,7 +52,7 @@ for name, action in pairs(jm.actions) do
       "atalho " .. prefix .. action.key .. " (" .. mode .. ") não registrado"
     )
     assert(m.desc == "Java Menu: " .. action.desc, "desc inesperada para " .. name .. ": " .. tostring(m.desc))
-    assert(type(m.rhs) == "string" or type(m.rhs) == "function", "rhs inesperado para " .. name)
+    assert(m.callback ~= nil or type(m.rhs) == "function", "atalho " .. name .. " sem callback Lua")
   end
 end
 assert(vim.fn.exists(":JavaMenu") == 2, "comando :JavaMenu não registrado")

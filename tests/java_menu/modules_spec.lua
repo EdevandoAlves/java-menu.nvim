@@ -100,7 +100,11 @@ if ok_jc and type(jc) == "table" then
   assert(parts, "adaptador rejeitou o jc.nvim real: " .. tostring(err))
   local style, style_err = jca.import_style()
   assert(style, "adaptador sem import_style do jc real: " .. tostring(style_err))
-  assert(style == "all" or style == "chain" or style == "never", "import_style inesperado: " .. tostring(style))
+  assert(
+    type(style) == "table" and type(style.order) == "table" and #style.order > 0,
+    "import_style sem lista de presets"
+  )
+  assert(type(style.load) == "function" and type(style.save) == "function", "import_style sem load/save chamáveis")
   local busy = jca.jdtls_busy()
   assert(busy == true or busy == false, "jdtls_busy deveria ser booleano")
 else

@@ -62,9 +62,18 @@ local function require_jc()
 end
 
 ---Remove os registros criados por um setup() anterior (idempotência).
+---Só apaga o atalho se ele ainda é nosso (desc prefixada): se o usuário
+---substituiu um dos nossos atalhos por um próprio, ele é preservado e
+---tratado como conflito no novo registro.
 local function clear_previous()
   for _, m in ipairs(registered.maps) do
-    pcall(vim.keymap.del, m.mode, m.lhs)
+    local cur = vim.fn.maparg(m.lhs, m.mode, false, true)
+    if type(cur) == "table" and not vim.tbl_isempty(cur) then
+      local ours = type(cur.desc) == "string" and cur.desc:find(DESC_PREFIX, 1, true) ~= nil
+      if ours then
+        pcall(vim.keymap.del, m.mode, m.lhs)
+      end
+    end
   end
   registered.maps = {}
   if registered.command then
@@ -87,12 +96,12 @@ end
 
 local function apply_keymaps(prefix, groups, conflicts)
   for name, action in pairs(M.actions) do
-    if groups[name] then
+    if groups[name] ~= false then -- default: todos os grupos habilitados
       local lhs = prefix .. action.key
       local want_desc = desc_for(action)
       for _, mode in ipairs(action.modes) do
         if conflicting(lhs, mode, want_desc) then
-          conflicts[#conflicts + 1] = ("%s (%s): já mapeado para outro propósito — atalho preservado, grupo '%s' não registrado"):format(
+          conflicts[#conflicts + 1] = ("%s (%s): conflito — já mapeado para outro propósito; atalho preservado e grupo '%s' não registrado"):format(
             lhs,
             mode,
             name
