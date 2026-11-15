@@ -37,7 +37,7 @@ command -v "$NVIM" >/dev/null 2>&1 || {
 }
 
 LAZY_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy"
-LOG_DIR="${JAVA_MENU_TEST_LOG_DIR:-/tmp/opencode/java-menu-tests/run-$(date +%Y%m%d-%H%M%S)-$$}"
+LOG_DIR="${JAVA_MENU_TEST_LOG_DIR:-${TMPDIR:-/tmp}/java-menu-tests/run-$(date +%Y%m%d-%H%M%S)-$$}"
 mkdir -p "$LOG_DIR"
 
 TMO_FAST="${JAVA_MENU_TEST_TIMEOUT_FAST:-180}"

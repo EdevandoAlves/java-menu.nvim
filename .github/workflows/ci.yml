@@ -1,0 +1,100 @@
+# CI inicial do java-menu.nvim — Linux, validação estática e local.
+# Escopo desta fase: FAST (12 specs), stylua --check e checagem de :help.
+# Os 4 specs INTEGRATION (JDTLS/Maven/DAP reais) rodam localmente e
+# permanecem fora do CI por enquanto.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # Versão do Neovim usada no desenvolvimento/testes locais.
+  NVIM_VERSION: v0.12.6
+  # Revisão do jc.nvim contra a qual a suíte foi validada.
+  JC_REVISION: 0aaf5bbc07ed1a69d66779187d48bfea6ec863b6
+  # Stylua fixado na mesma versão do desenvolvimento local.
+  STYLUA_VERSION: v2.6.0
+  # Dados do Neovim dentro do workspace: é por aqui que o runner localiza
+  # os plugins (tests/java_menu/run.sh usa XDG_DATA_HOME/nvim/lazy).
+  XDG_DATA_HOME: ${{ github.workspace }}/.deps
+
+jobs:
+  fast:
+    name: FAST specs (Neovim v0.12.6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim ${{ env.NVIM_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz" \
+            -o /tmp/nvim.tar.gz
+          mkdir -p /tmp/nvim
+          tar -xzf /tmp/nvim.tar.gz -C /tmp/nvim --strip-components=1
+          echo "/tmp/nvim/bin" >> "$GITHUB_PATH"
+          /tmp/nvim/bin/nvim --version | head -1
+
+      - name: Install jc.nvim at pinned revision
+        run: |
+          set -euo pipefail
+          mkdir -p "$XDG_DATA_HOME/nvim/lazy"
+          git clone --no-checkout https://github.com/artur-shaik/jc.nvim "$XDG_DATA_HOME/nvim/lazy/jc.nvim"
+          git -C "$XDG_DATA_HOME/nvim/lazy/jc.nvim" checkout "$JC_REVISION"
+          actual="$(git -C "$XDG_DATA_HOME/nvim/lazy/jc.nvim" rev-parse HEAD)"
+          test "$actual" = "$JC_REVISION" || {
+            echo "jc.nvim checkout em $actual, esperado $JC_REVISION" >&2
+            exit 1
+          }
+
+      - name: Run FAST suite
+        run: tests/java_menu/run.sh fast
+
+  style:
+    name: stylua --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stylua ${{ env.STYLUA_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/JohnnyMorganz/stylua/releases/download/${STYLUA_VERSION}/stylua-linux-x86_64.zip" \
+            -o /tmp/stylua.zip
+          unzip -o /tmp/stylua.zip -d /tmp/stylua
+          chmod +x /tmp/stylua/stylua
+          /tmp/stylua/stylua --version
+
+      - name: Check formatting (fail on divergence, no auto-format)
+        run: /tmp/stylua/stylua --check lua tests
+
+  help:
+    name: Vim help tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim ${{ env.NVIM_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz" \
+            -o /tmp/nvim.tar.gz
+          mkdir -p /tmp/nvim
+          tar -xzf /tmp/nvim.tar.gz -C /tmp/nvim --strip-components=1
+          echo "/tmp/nvim/bin" >> "$GITHUB_PATH"
+
+      - name: Validate :help (helptags + required tags)
+        run: |
+          set -euo pipefail
+          nvim --headless -u NONE \
+            -c "set rtp+=${{ github.workspace }}" \
+            -c "luafile tests/java_menu/help_check.lua" \
+            -c "qa!"
