@@ -1,0 +1,291 @@
+*java-menu.txt*   Contextual Java menus and workflows for Neovim       *java-menu*
+
+Author:  java-menu.nvim contributors
+License: none chosen yet (repository not published) |java-menu-credits|
+
+==============================================================================
+CONTENTS                                                      *java-menu-contents*
+
+    1. Introduction ........................... |java-menu-intro|
+    2. Requirements ........................... |java-menu-requirements|
+    3. Installation ........................... |java-menu-install|
+    4. Setup .................................. |java-menu-setup|
+    5. Commands ............................... |java-menu-commands|
+    6. Keymaps ................................ |java-menu-keymaps|
+    7. Menu groups ............................ |java-menu-groups|
+    8. WorkspaceEdit preview .................. |java-menu-preview|
+    9. Limitations ............................ |java-menu-limitations|
+   10. Troubleshooting ........................ |java-menu-troubleshooting|
+   11. Credits ................................. |java-menu-credits|
+
+==============================================================================
+1. INTRODUCTION                                                *java-menu-intro*
+
+java-menu.nvim is a contextual menu layer for Java development in Neovim.
+Seven groups — New, Generate, Refactor, Imports, Build/Run, Tests, Debug —
+collect the operations you need for the current situation, and every entry
+says whether it is available and, when it is not, why.
+
+The Java work itself is done by |jc.nvim| and by the jdtls language server
+you already run. java-menu.nvim never starts, installs or manages a language
+server. It organizes existing capabilities, adds a preview-and-apply
+workflow for WorkspaceEdit refactorings (|java-menu-preview|) and a guided
+Change Signature menu, and stays out of the way otherwise.
+
+It is complementary to jc.nvim, not a replacement. If you prefer driving
+jc.nvim's commands and mappings directly, you may not need this plugin.
+
+Menus work from Java sources, `pom.xml`, `build.gradle(.kts)` and any buffer
+inside a Java project; they are not gated on |filetype| alone.
+
+==============================================================================
+2. REQUIREMENTS                                            *java-menu-requirements*
+
+- jc.nvim (https://github.com/artur-shaik/jc.nvim) — required. `setup()`
+  fails with a clear error when it is missing.
+- A running jdtls, started by your own configuration (nvim-jdtls, nvim-java
+  or lspconfig) — required for semantic operations (Generate, Refactor,
+  Imports, run-main classpath, Tests, Debug). New and Build/Run work
+  without it. java-menu.nvim detects whichever client is already attached
+  to the buffer.
+- Optional: snacks.nvim (pickers; falls back to `vim.ui.select`/
+  `vim.ui.input`), which-key.nvim (group label), neotest (Tests menu,
+  via jc.nvim's adapter), nvim-dap + java-debug bundle (Debug menu),
+  Maven or Gradle (Build/Run; `mvnw`/`gradlew` preferred when executable).
+
+Developed and tested on Neovim 0.12, Linux. The practical Neovim floor is
+the one jc.nvim itself requires; older versions are untested.
+
+==============================================================================
+3. INSTALLATION                                              *java-menu-install*
+
+There is no public repository yet; install from a local checkout. With
+lazy.nvim, declare jc.nvim as its own spec (java-menu's `setup()` needs it
+loaded at startup) and point `dir` at your clone: >lua
+
+  {
+    "artur-shaik/jc.nvim",
+    lazy = false,
+    ft = { "java" },
+    opts = { keys_prefix = "<leader>j", default_mappings = false },
+  },
+  {
+    dir = "~/path/to/java-menu.nvim", -- your local clone
+    name = "java-menu.nvim",
+    main = "java_menu",
+    lazy = false,
+    opts = { prefix = "<leader>j" },
+    dependencies = { "artur-shaik/jc.nvim" },
+  }
+<
+Declaring jc.nvim only as an inline `dependencies` entry without a spec of
+its own does not work: lazy.nvim then loads it too late and `setup()` fails
+with its missing-dependency error.
+
+Then generate help tags: >vim
+
+  :helptags ALL
+<
+When jc.nvim is missing, `setup()` fails with an error naming the missing
+dependency instead of half-registering menus.
+
+==============================================================================
+4. SETUP                                                        *java-menu-setup*
+                                                              *java-menu-opts*
+                                                        *java-menu-configure*
+>lua
+  require("java_menu").setup({
+    prefix = "<leader>j", -- keymap prefix
+    groups = {            -- enable/disable groups (default: all enabled)
+      new = true,
+      generate = true,
+      refactor = true,
+      imports = true,
+      build = true,
+      tests = true,
+      debug = true,
+    },
+    which_key = true,     -- label the group in which-key when installed
+  })
+<
+                                                                *java-menu-trigger*
+`require("java_menu").trigger(name)` runs one group on demand (name is one
+of the group keys above) — useful for lazy-loading a single menu from your
+own key specs.
+
+Behavior you get without asking:
+- `setup()` is idempotent: re-running it removes its own keymaps and
+  command first, then re-registers. Nothing is duplicated.
+- Existing keymaps are respected: a conflicting mapping is kept, the
+  java-menu one is skipped, and the conflict is reported with the exact
+  key.
+- No Java module is loaded by `setup()`; each keymap requires its module
+  on first use.
+
+==============================================================================
+5. COMMANDS                                                  *java-menu-commands*
+                                                            *java-menu-javamenu*
+                                                              *java-menu-trigger-cmd*
+`:JavaMenu [group]` ~
+Opens one of the seven menus, with command-line completion for
+`new | generate | refactor | imports | build | tests | debug`. Without an
+argument it lists the accepted groups.
+
+==============================================================================
+6. KEYMAPS                                                    *java-menu-keymaps*
+
+Global keymaps registered by `setup()`; `<prefix>` is the `prefix` option
+(default `<leader>j`).
+
+|Mode|  Key             | Action                    | Requirements             |
+|-----|------------------|---------------------------|--------------------------|
+|n    | `<prefix>n`      | New                       | basic creation needs no jdtls |
+|n    | `<prefix>g`      | Generate                  | one jdtls client         |
+|n/x  | `<prefix>r`      | Refactor                  | jdtls for most entries   |
+|n    | `<prefix>i`      | Imports                   | jdtls attached           |
+|n    | `<prefix>b`      | Build / Run               | Maven or Gradle          |
+|n    | `<prefix>t`      | Tests                     | neotest + jdtls          |
+|n    | `<prefix>d`      | Debug                     | nvim-dap + java-debug    |
+
+Keymap conflicts with mappings that are not java-menu's are never
+overwritten: yours is kept, ours is skipped, and the conflict is reported.
+
+==============================================================================
+7. MENU GROUPS                                                  *java-menu-groups*
+                                                                *java-menu-new*
+New ~
+Wizard for Class, Abstract Class, Interface, Enum, Record, Annotation,
+Exception, Class with main, Singleton, Serializable and jc.nvim's template
+library (JUnit 5, Spring stereotypes, JPA entity, ...). Project-aware
+source root, package and module resolution; `extends`/`implements` search
+through jdtls when attached; JUnit/Spring/JPA availability detected from
+the build file. Basic class creation works without jdtls.
+
+                                                              *java-menu-generate*
+Generate ~
+Constructor (field selection), default constructor, getters/setters,
+`toString()`, `hashCode()`/`equals()`, unimplemented abstract methods —
+via jc.nvim, with duplicate detection (an existing equivalent is offered
+for reuse/replacement instead of appended blindly).
+
+                                                              *java-menu-refactor*
+Refactor ~
+Extract variable (also all occurrences), extract constant, extract method
+(visual mode), static import (also enum constants), flip call arguments,
+rename symbol, move class, change signature. Rename, Move Class and Change
+Signature results go through the preview workflow (|java-menu-preview|).
+Rename Package and Move Package appear in the menu but are permanently
+disabled: current jdtls offers no supported path for them.
+
+                                                               *java-menu-imports*
+Imports ~
+Organize (smart, remembering your choices via jc.nvim), organize with
+candidate choice, add missing, remove unused, organize without reordering,
+replace import (pick among same-named types), import style presets,
+expand wildcard imports.
+
+                                                                  *java-menu-build*
+Build / Run ~
+Run a main class (classpath from jdtls), run a Spring Boot application,
+compile, package, clean, install, or pick a custom goal. Detects
+`mvnw`/`mvn`/`gradlew`/`gradle` (wrapper preferred), runs from the reactor
+root, scopes Maven with `-pl <module> -am` and Gradle with
+`:module:task`. Output goes to a dedicated buffer. One build process runs
+at a time: starting another build — including Repeat — is refused until
+you stop. Repeat/Stop/Output are keyed by project root, and stopping a
+process that belongs to another project asks "keep / terminate" first.
+
+                                                                  *java-menu-tests*
+Tests ~
+Run nearest/file/suite/pick through neotest with jc.nvim's adapter
+(classpath from jdtls), re-run last, stop, summary/output, optional
+precompile, jump to a paired test class. Without neotest the menu says so
+instead of breaking.
+
+                                                                  *java-menu-debug*
+Debug ~
+Debug a main class (only launch configs of the current project are
+offered; ambiguous ones are flagged), debug nearest/class JUnit test via
+jdtls' java-test, attach to a running JVM, toggle/conditional breakpoints
+and session controls — through nvim-dap and the java-debug bundle.
+
+==============================================================================
+8. WORKSPACEEDIT PREVIEW                                     *java-menu-preview*
+
+Rename, Move Class and Change Signature do not write immediately. jdtls
+computes a WorkspaceEdit; java-menu.nvim normalizes it into an ordered
+plan and shows a review menu listing every affected file. Selecting a file
+opens a diff view. From there:
+
+- Apply: performs the file operations (renames, creates, deletes go to
+  disk) and applies the text edits into your buffers. Buffers are never
+  saved for you — run `:wa` (or save what you want) afterwards.
+- Cancel: aborts with nothing changed.
+
+Before applying, the plan is revalidated: buffers with unsaved
+modifications to affected files block the apply, and a file that changed
+on disk since the preview opened makes the operation refuse rather than
+corrupt it.
+
+Change Signature reads the method signature from jdtls
+(`java/getChangeSignatureInfo`) and lets you reorder/edit parameters,
+rename the method, change visibility and return type, and optionally
+generate delegate methods.
+
+==============================================================================
+9. LIMITATIONS                                              *java-menu-limitations*
+
+- jc.nvim Lua surface: a few operations call jc.nvim functions outside its
+  documented command/mapping surface — some explicitly internal
+  (`_filter_type_symbols`, `_prioritize_types`, `_set_import`, used by
+  Replace Import's candidate filtering), others plain module functions
+  (per-project import-style storage, the busy check). All are
+  contract-checked at runtime: when one is missing or unexpected, the
+  operation is disabled with a clear reason instead of half-applied.
+  Developed against jc.nvim v1.7.0; no version matrix is promised.
+- Multiple jdtls clients: operations jc.nvim resolves against one global
+  client are blocked with an explanatory reason while more than one
+  client is attached — Generate, every Imports entry except Replace
+  Import, and Extract Variable / Extract Method / Static Import.
+  Rename, Move Class, Change Signature and Replace Import keep working
+  per buffer.
+- Gradle discovery is static: nested modules come from parsing
+  `settings.gradle(.kts)` includes and explicit `projectDir` entries.
+  Dynamic declarations produce a partial-result note instead of invented
+  modules. Gradle task execution is untested (no Gradle in the test
+  environment); Maven execution is tested for real.
+- Rename Package / Move Package are disabled (see |java-menu-refactor|).
+- Tested on Linux only; no Windows/macOS validation.
+
+==============================================================================
+10. TROUBLESHOOTING                                     *java-menu-troubleshooting*
+
+- `setup()` errors mentioning jc.nvim — install artur-shaik/jc.nvim and
+  make sure it loads before java-menu.nvim (see |java-menu-install|).
+- A `<prefix>…` key did not register — another mapping owns that key; the
+  conflict notice names it. Free the key or change `prefix`.
+- Build entries disabled — the menu reason tells you what is missing
+  (no `mvnw`/`mvn`/`gradlew`/`gradle`, no project root from this buffer).
+- Operations blocked mentioning two jdtls clients — close or stop the
+  other project's client, or use one of the per-buffer operations
+  (|java-menu-limitations|).
+- Generate/Imports say jdtls is not attached — start jdtls your usual way
+  and reopen the file; java-menu.nvim detects the client when it attaches.
+- Help tags missing — run `:helptags ALL` after installing/updating.
+
+==============================================================================
+11. CREDITS                                                    *java-menu-credits*
+
+jc.nvim (https://github.com/artur-shaik/jc.nvim) by Artur Shaik — the Java
+engine behind nearly every operation here: code generation, class
+templates, organize-imports, the neotest adapter. If you prefer direct
+commands and mappings, use jc.nvim on its own. java-menu.nvim is an
+independent add-on; it is not affiliated with, endorsed by, or maintained
+by jc.nvim's author. jc.nvim is distributed under the MIT license; this
+project's own license has not been chosen yet.
+
+Also relied upon: jdtls (Eclipse JDT Language Server), snacks.nvim,
+which-key.nvim, neotest, nvim-dap and java-debug (all optional except
+jdtls itself — see |java-menu-requirements|).
+
+ vim:tw=78:ts=8:ft=help:norl:

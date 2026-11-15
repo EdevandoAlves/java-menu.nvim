@@ -6,11 +6,11 @@
 --
 -- Run:
 --   nvim --headless -u NONE \
---     -c "set rtp+=/home/vz/Projects/java-menu.nvim" \
---     -c "set rtp+=/home/vz/.local/share/nvim/lazy/nvim-jdtls" \
---     -c "set rtp+=/home/vz/.local/share/nvim/lazy/nvim-lspconfig" \
---     -c "set rtp+=/home/vz/.local/share/nvim/lazy/nvim-dap" \
---     -c "set rtp+=/home/vz/.local/share/nvim/lazy/jc.nvim" \
+--     -c "set rtp+=~/Projects/java-menu.nvim" \
+--     -c "set rtp+=~/.local/share/nvim/lazy/nvim-jdtls" \
+--     -c "set rtp+=~/.local/share/nvim/lazy/nvim-lspconfig" \
+--     -c "set rtp+=~/.local/share/nvim/lazy/nvim-dap" \
+--     -c "set rtp+=~/.local/share/nvim/lazy/jc.nvim" \
 --     -c "luafile tests/java_menu/jdtls_projects_spec.lua" -c qa
 
 local lsp = require("java_menu.lsp")
