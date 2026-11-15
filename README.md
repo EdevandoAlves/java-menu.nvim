@@ -78,9 +78,7 @@ Note on jdtls capabilities: jc.nvim expects jdtls started with its extended clie
 
 ## Installation
 
-There is **no public GitHub repository yet**, so today the plugin is installed from a local directory. When it is published, the same spec works with the repo URL in place of `dir`.
-
-With [lazy.nvim](https://github.com/folke/lazy.nvim), from a local checkout:
+Install with [lazy.nvim](https://github.com/folke/lazy.nvim) straight from GitHub:
 
 ```lua
 -- jc.nvim first: a real spec of its own, configured the way you normally would.
@@ -96,10 +94,21 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim), from a local checkout:
   },
 },
 
--- java-menu.nvim, from your local clone (there is no published repo yet;
--- when there is one, swap `dir` for the repo URL)
+-- java-menu.nvim, from GitHub
 {
-  dir = "~/path/to/java-menu.nvim", -- your local clone; the path is an example
+  "EdevandoAlves/java-menu.nvim",
+  main = "java_menu",
+  lazy = false,
+  opts = { prefix = "<leader>j" },
+  dependencies = { "artur-shaik/jc.nvim" },
+},
+```
+
+Installing from a local checkout instead? Point `dir` at your clone — everything else stays the same:
+
+```lua
+{
+  dir = "~/path/to/java-menu.nvim", -- your local clone
   name = "java-menu.nvim",
   main = "java_menu",
   lazy = false,
@@ -229,4 +238,6 @@ The integration suite attaches real jdtls clients to temporary Maven projects, p
 - [which-key.nvim](https://github.com/folke/which-key.nvim) — optional keymap discoverability.
 - [neotest](https://github.com/nvim-neotest/neotest) and [nvim-dap](https://github.com/mfussenegger/nvim-dap) — optional test runner and debugger integration points.
 
-No license has been chosen yet — the repository is not published, and picking a license is pending that step.
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Edevando Alves. jc.nvim is distributed under the MIT license by its author; java-menu.nvim is an independent work built on top of it, not a derivative distribution.

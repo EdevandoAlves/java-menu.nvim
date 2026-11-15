@@ -1,7 +1,7 @@
 *java-menu.txt*   Contextual Java menus and workflows for Neovim       *java-menu*
 
 Author:  java-menu.nvim contributors
-License: none chosen yet (repository not published) |java-menu-credits|
+License: MIT |java-menu-credits|
 
 ==============================================================================
 CONTENTS                                                      *java-menu-contents*
@@ -59,9 +59,8 @@ the one jc.nvim itself requires; older versions are untested.
 ==============================================================================
 3. INSTALLATION                                              *java-menu-install*
 
-There is no public repository yet; install from a local checkout. With
-lazy.nvim, declare jc.nvim as its own spec (java-menu's `setup()` needs it
-loaded at startup) and point `dir` at your clone: >lua
+Install with lazy.nvim. Declare jc.nvim as its own spec (java-menu's
+`setup()` needs it loaded at startup): >lua
 
   {
     "artur-shaik/jc.nvim",
@@ -69,6 +68,17 @@ loaded at startup) and point `dir` at your clone: >lua
     ft = { "java" },
     opts = { keys_prefix = "<leader>j", default_mappings = false },
   },
+  {
+    "EdevandoAlves/java-menu.nvim", -- GitHub
+    main = "java_menu",
+    lazy = false,
+    opts = { prefix = "<leader>j" },
+    dependencies = { "artur-shaik/jc.nvim" },
+  }
+<
+Installing from a local checkout instead? Point `dir` at your clone and
+keep everything else the same: >lua
+
   {
     dir = "~/path/to/java-menu.nvim", -- your local clone
     name = "java-menu.nvim",
@@ -282,7 +292,8 @@ templates, organize-imports, the neotest adapter. If you prefer direct
 commands and mappings, use jc.nvim on its own. java-menu.nvim is an
 independent add-on; it is not affiliated with, endorsed by, or maintained
 by jc.nvim's author. jc.nvim is distributed under the MIT license; this
-project's own license has not been chosen yet.
+project is distributed under the MIT license as well (Copyright (c) 2026
+Edevando Alves).
 
 Also relied upon: jdtls (Eclipse JDT Language Server), snacks.nvim,
 which-key.nvim, neotest, nvim-dap and java-debug (all optional except
