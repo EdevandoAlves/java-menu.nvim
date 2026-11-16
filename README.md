@@ -1,8 +1,10 @@
-# java-menu.nvim
+  # java-menu.nvim
 
 **A contextual Java workflow interface for Neovim, built on top of [jc.nvim](https://github.com/artur-shaik/jc.nvim).**
 
 java-menu.nvim brings commonly used Java operations together through discoverable menus and adds guided workflows for selected refactorings. It does not replace jc.nvim — if you prefer direct commands, keymaps, and jc.nvim's existing interactive tools, you may not need this plugin.
+
+![Generate Constructor using java-menu.nvim](assets/constructor.gif)
 
 ---
 
@@ -50,6 +52,10 @@ What java-menu.nvim does with it:
 If you are happy driving jc.nvim's commands (`:JCgenerateConstructor`, `:JCimportsOrganizeSmart`, `:JCbuildTask`, …) and mappings directly, you honestly do not need this plugin. java-menu.nvim exists for people who prefer browsing a contextual menu — and for the few workflows above that jc.nvim does not cover.
 
 ## Features
+
+**New Class wizard**
+
+![Create a Java class with java-menu.nvim](assets/class.gif)
 
 - **New** — wizard for Class, Abstract Class, Interface, Enum, Record, Annotation, Exception, Class with main, Singleton, Serializable and jc.nvim's template library (JUnit 5, Spring stereotypes, JPA entity, …). Project-aware package and source-root resolution, `extends`/`implements` search through jdtls when attached, fields with per-kind editing, and availability detection (JUnit/Spring/JPA) from the build file. Basic class creation works **without jdtls**.
 - **Generate** — constructors (field selection), default constructor, getters/setters, `toString()`, `hashCode()`/`equals()`, unimplemented abstract methods. Interactive selection via jc.nvim, with duplicate detection (an existing equivalent constructor or accessor set is offered for reuse/replacement instead of blindly appended). Requires one jdtls client.
@@ -198,6 +204,10 @@ Plus:
 These keymaps belong to java-menu.nvim. jc.nvim ships its own separate command/mapping set (see its README) — this documentation does not duplicate it, and java-menu.nvim's `setup()` never overwrites a non-java-menu mapping (see Configuration).
 
 ## Usage and workflows
+
+### Maven compile
+
+![Compile a Maven project using java-menu.nvim](assets/compile.gif)
 
 **Preview before applying a refactoring.** Rename, Move Class, and Change Signature do not write immediately. jdtls computes a WorkspaceEdit; java-menu.nvim normalizes it into an ordered plan and shows a review menu listing every affected file. Selecting a file opens a diff view; `Apply` performs the file operations (renames, creates, deletes go to disk) and applies the text edits into your buffers — it deliberately **never saves them** (`:wa` is yours to run). `Cancel` aborts with nothing changed. Before applying, the plan is revalidated: buffers with unsaved modifications to affected files block the apply (with a notice), and if a file changed on disk since the preview opened, the operation refuses rather than corrupting it.
 
