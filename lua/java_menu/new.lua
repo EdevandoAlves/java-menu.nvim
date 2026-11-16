@@ -1,12 +1,12 @@
 -- java_menu/new.lua
--- Fluxo "New" do menu <leader>j: popups centrais (Snacks) + validação + criação.
--- Usa os templates públicos do jc.nvim quando disponíveis; cai para o gerador
--- anterior (config/java.lua) nos tipos básicos se o jc não estiver carregado.
+-- "New" flow of the <leader>j menu: central popups (Snacks) + validation + creation.
+-- Uses jc.nvim public templates when available; falls back to the previous
+-- generator (config/java.lua) for basic kinds when jc is not loaded.
 --
--- Fase 5A: extends/implements/campos/componentes, templates extras do jc e
--- resumo antes de criar. A semântica de tipos vem do JDTLS (workspace/symbol);
--- os tipos escolhidos entram como FQN, então o arquivo não depende de imports
--- automáticos. Sem JDTLS, a criação básica continua e os tipos são digitados.
+-- Supports extends/implements/fields/components, extra jc templates and a
+-- summary before creating. Type semantics come from JDTLS (workspace/symbol);
+-- chosen types enter as FQNs, so the file does not depend on automatic imports.
+-- Without JDTLS, basic creation still works and types are typed manually.
 
 local ui = require("java_menu.ui")
 local project = require("java_menu.project")
@@ -16,16 +16,16 @@ local M = {}
 
 ---@class JavaKind
 ---@field label string
----@field template string template do jc.nvim
----@field legacy string|nil tipo aceito pelo gerador anterior (sem jc)
+---@field template string jc.nvim template
+---@field legacy string|nil kind accepted by the previous generator (without jc)
 ---@field decl string "class"|"interface"|"enum"|"record"|"annotation"
 ---@field abstract boolean|nil
----@field extends_slot string|nil "class" (uma superclasse) | "interface" (várias)
+---@field extends_slot string|nil "class" (one superclass) | "interface" (several)
 ---@field implements boolean|nil
 ---@field fields string|nil "fields"|"components"|"methods"|"elements"
 ---@field values boolean|nil
 ---@field requires string|nil "junit"|"spring"|"jpa"
----@field extra boolean|nil template adicional (exige jc.nvim)
+---@field extra boolean|nil additional template (requires jc.nvim)
 
 ---@type JavaKind[]
 M.kinds = {
@@ -75,8 +75,8 @@ M.kinds = {
   },
   { label = "Annotation", template = "annotation", legacy = "annotation", decl = "annotation", fields = "elements" },
 
-  -- templates adicionais do jc.nvim (só os que fazem sentido no Java puro ou
-  -- com a dependência detectada no build)
+  -- additional jc.nvim templates (only those meaningful in plain Java or with
+  -- the dependency detected in the build file)
   {
     label = "Exception",
     template = "exception",
@@ -166,10 +166,10 @@ M.kinds = {
   },
 }
 
-local OTHER_ROOT = "(outro diretório…)"
+local OTHER_ROOT = "(another directory…)"
 
--- palavras reservadas e literais de Java (lista como string para não usar
--- palavras reservadas do Lua como chaves)
+-- Java reserved words and literals (list kept as a string to avoid using
+-- Lua reserved words as keys)
 local keywords = {}
 for word in
   ([[
@@ -186,8 +186,8 @@ local function notify(msg, level)
   vim.notify("Java: " .. msg, level or vim.log.levels.INFO)
 end
 
----Seleção central (Snacks) via componente compartilhado, com fallback para o
----vim.ui.select nativo. Não substitui vim.ui.select globalmente.
+---Central selection (Snacks) through the shared component, with a fallback to
+---native vim.ui.select. Does not replace vim.ui.select globally.
 local function select(items, opts, on_choice)
   local prompt = opts and opts.prompt or "Java"
   if ui.snacks() then
@@ -196,7 +196,7 @@ local function select(items, opts, on_choice)
   return vim.ui.select(items, opts, on_choice)
 end
 
----Entrada central de texto via componente compartilhado (fallback vim.ui.input).
+---Central text input through the shared component (vim.ui.input fallback).
 local function input(opts, on_confirm)
   return ui.ask(opts.prompt, opts.default, on_confirm)
 end
@@ -232,8 +232,8 @@ local primitives = {
   double = true,
 }
 
----Valida uma expressão de tipo (primitivo, FQN, generics, arrays).
----Não tenta ser um parser completo: rejeita o que é claramente inválido.
+---Validate a type expression (primitive, FQN, generics, arrays).
+---Not a full parser: rejects what is clearly invalid.
 ---@param value string
 ---@param allow_void boolean|nil
 ---@return boolean
@@ -285,10 +285,10 @@ local function contains(list, value)
   return false
 end
 
--- ---------- dependências do projeto ----------
+-- ---------- project dependencies ----------
 
----Texto (minúsculo) dos arquivos de build da raiz e dos módulos diretos.
----Usado para habilitar/desabilitar templates e decidir javax vs jakarta.
+---Lowercase text of the root and direct-module build files.
+---Used to enable/disable templates and decide javax vs jakarta.
 ---@param root string
 ---@return string
 local function build_text(root)
@@ -324,7 +324,7 @@ local function has_jpa(deps)
     or deps:find("eclipselink", 1, true) ~= nil
 end
 
----Namespace de persistência do projeto ("jakarta" ou "javax").
+---Project persistence namespace ("jakarta" or "javax").
 ---@param deps string
 ---@return string|nil
 local function persistence_namespace(deps)
@@ -342,9 +342,9 @@ local function persistence_namespace(deps)
   return nil
 end
 
--- ---------- templates do jc.nvim ----------
+-- ---------- jc.nvim templates ----------
 
----Templates públicos do jc.nvim (módulo de dados, não inicia servidor).
+---jc.nvim public templates (data module, does not start a server).
 local function jc_templates()
   local ok, templates = pcall(require, "jc.templates")
   if ok and type(templates.render) == "function" then
@@ -362,9 +362,9 @@ local FIXED_IMPORTS = {
   repository = { "org.springframework.data.jpa.repository.JpaRepository" },
 }
 
----Imports que o template não declara sozinho (as anotações do jc são
----resolvidas por organize-imports no fluxo original; aqui declaramos o
----namespace detectado para nunca gerar import ambíguo).
+---Imports the template does not declare itself (jc annotations are resolved
+---by organize-imports in the original flow; here we declare the detected
+---namespace so an ambiguous import is never generated).
 ---@param kind JavaKind
 ---@param deps string
 ---@return string[]|nil
@@ -390,26 +390,26 @@ end
 ---@return boolean, string|nil
 local function kind_availability(kind, deps)
   if kind.requires == "junit" and not has_junit(deps) then
-    return false, "projeto sem dependência JUnit no pom/build.gradle"
+    return false, "project has no JUnit dependency in pom/build.gradle"
   end
   if kind.requires == "spring" and not has_spring(deps) then
-    return false, "projeto sem dependência Spring no pom/build.gradle"
+    return false, "project has no Spring dependency in pom/build.gradle"
   end
   if kind.requires == "jpa" then
     if not has_jpa(deps) then
-      return false, "projeto sem JPA (spring-data-jpa / jakarta.persistence)"
+      return false, "project has no JPA (spring-data-jpa / jakarta.persistence)"
     end
     if kind.template == "entity" and not persistence_namespace(deps) then
-      return false, "não consegui decidir jakarta.persistence vs javax.persistence"
+      return false, "could not decide between jakarta.persistence and javax.persistence"
     end
   end
   if kind.extra then
     local templates = jc_templates()
     if not templates then
-      return false, "jc.nvim não está carregado"
+      return false, "jc.nvim is not loaded"
     end
     if type(templates.get) ~= "function" or templates.get(kind.template) == nil then
-      return false, "template '" .. kind.template .. "' não existe neste jc.nvim"
+      return false, "template '" .. kind.template .. "' does not exist in this jc.nvim"
     end
   end
   return true
@@ -420,7 +420,7 @@ local function jdtls_attached(bufnr)
   return lsp.client(bufnr) ~= nil
 end
 
----Renderiza o tipo com o template do jc.nvim.
+---Render the kind with the jc.nvim template.
 ---@param kind JavaKind
 ---@param pkg string
 ---@param name string
@@ -441,13 +441,13 @@ local function render_jc(kind, pkg, name, opts)
   if kind.abstract then
     body = body:gsub("public class ", "public abstract class ", 1)
   end
-  -- os templates do jc.nvim contam com um :normal! gg=G depois; sem parser Java
-  -- normalizamos aqui para remover linhas em branco extras
+  -- jc.nvim templates expect a :normal! gg=G afterwards; without a Java parser
+  -- we normalize here to remove extra blank lines
   body = body:gsub("\n\n\n+", "\n\n")
   return body
 end
 
----Cria o arquivo do tipo pedido. Nunca sobrescreve.
+---Create the requested kind file. Never overwrites.
 ---@param kind JavaKind
 ---@param source_root string
 ---@param pkg string
@@ -464,40 +464,40 @@ function M.create(kind, source_root, pkg, name, opts)
   local rel = vim.fs.relpath(root, file) or file
 
   if vim.fn.filereadable(file) == 1 then
-    notify("já existe, nada foi sobrescrito: " .. rel, vim.log.levels.WARN)
+    notify("already exists, nothing was overwritten: " .. rel, vim.log.levels.WARN)
     vim.cmd.edit(vim.fn.fnameescape(file))
     return file
   end
 
   pcall(vim.fn.mkdir, dir, "p")
   if vim.fn.isdirectory(dir) == 0 then
-    notify("não consegui criar o diretório " .. dir, vim.log.levels.ERROR)
+    notify("could not create directory " .. dir, vim.log.levels.ERROR)
     return nil
   end
   if vim.fn.filewritable(dir) ~= 2 then
-    notify("diretório sem permissão de escrita: " .. dir, vim.log.levels.ERROR)
+    notify("directory is not writable: " .. dir, vim.log.levels.ERROR)
     return nil
   end
 
   local body = render_jc(kind, pkg, name, opts)
   if body then
-    -- :edit dispara BufNewFile, então o jc marca o arquivo como novo e
-    -- atualiza o build path do jdtls no primeiro write
+    -- :edit triggers BufNewFile, so jc marks the file as new and
+    -- updates the jdtls build path on first write
     vim.cmd.edit(vim.fn.fnameescape(file))
     vim.api.nvim_buf_set_lines(0, 0, -1, false, vim.split(body:gsub("\n+$", ""), "\n", { plain = true }))
-    -- os templates do jc contam com o mesmo pós-passo do gerador dele
+    -- jc templates rely on the same post-step as its generator
     vim.cmd("silent! normal! gg=G")
     vim.cmd.write()
-    notify("criado " .. rel)
+    notify("created " .. rel)
     return file
   end
 
   if kind.extra then
-    notify("o template '" .. kind.template .. "' exige o jc.nvim carregado", vim.log.levels.ERROR)
+    notify("template '" .. kind.template .. "' requires jc.nvim to be loaded", vim.log.levels.ERROR)
     return nil
   end
 
-  -- fallback: gerador anterior (apenas tipos básicos)
+  -- fallback: previous generator (basic kinds only)
   local has_options = opts
     and (
       (opts.extends and opts.extends ~= "")
@@ -506,11 +506,11 @@ function M.create(kind, source_root, pkg, name, opts)
       or (opts.values and #opts.values > 0)
     )
   if has_options then
-    notify("jc.nvim não está carregado — extends/implements/campos não serão aplicados", vim.log.levels.WARN)
+    notify("jc.nvim is not loaded — extends/implements/fields will not be applied", vim.log.levels.WARN)
   end
   local ok, legacy = pcall(require, "config.java")
   if not ok or type(legacy.create) ~= "function" then
-    notify("jc.nvim não está carregado e o gerador anterior não está disponível", vim.log.levels.ERROR)
+    notify("jc.nvim is not loaded and the previous generator is unavailable", vim.log.levels.ERROR)
     return nil
   end
 
@@ -525,16 +525,16 @@ function M.create(kind, source_root, pkg, name, opts)
   return created
 end
 
--- ---------- busca de tipos no JDTLS ----------
+-- ---------- type search in JDTLS ----------
 
 local TYPE_KINDS = {
-  -- LSP SymbolKind: 5 class, 10 enum, 11 interface, 23 struct(record no jdtls)
+  -- LSP SymbolKind: 5 class, 10 enum, 11 interface, 23 struct (record in jdtls)
   class = { [5] = true },
   interface = { [11] = true },
   all = { [5] = true, [10] = true, [11] = true, [23] = true },
 }
 
----workspace/symbol no cliente JDTLS do buffer de origem.
+---workspace/symbol on the JDTLS client of the source buffer.
 ---@param query string
 ---@param allowed table<number, boolean>
 ---@param client vim.lsp.Client|nil
@@ -569,12 +569,12 @@ local function search_types(query, allowed, client)
   local root = project.root()
   for _, sym in ipairs(result) do
     local uri = sym.location and sym.location.uri or ""
-    -- tipos aninhados não são importáveis pelo nome simples (e aqui entram
-    -- como FQN, mas o jdtls indexa $Inner: evita poluir a lista)
+    -- nested types are not importable by simple name (and here enter
+    -- as FQN, but jdtls indexes $Inner: avoid polluting the list)
     local enclosing = sym.containerName and sym.containerName:match("[^.]+$")
     local nested = uri:find("%$") ~= nil or (enclosing ~= nil and enclosing:match("^%u") ~= nil)
-    -- o índice é de todo o workspace: aceita tipos do projeto atual e das
-    -- dependências no classpath (jdt://), ignorando outros projetos abertos
+    -- the index covers the whole workspace: accepts types from the current
+    -- project and classpath dependencies (jdt://), ignoring other open projects
     local from_project = false
     if uri:match("^file:") and root then
       local path = vim.uri_to_fname(uri)
@@ -592,25 +592,25 @@ local function search_types(query, allowed, client)
   return out
 end
 
----Pergunta um tipo (busca no JDTLS ou FQN manual).
----@param slot string rótulo ("Superclasse", "Interfaces"…)
+---Ask for a type (JDTLS search or manual FQN).
+---@param slot string label ("Superclass", "Interfaces"…)
 ---@param allowed table<number, boolean>
 ---@param multi boolean
 ---@param on_done fun(types: string[])
----@param on_cancel fun()|nil volta para a etapa anterior
----@param bufnr number|nil buffer de origem para o cliente JDTLS
+---@param on_cancel fun()|nil returns to the previous step
+---@param bufnr number|nil source buffer for the JDTLS client
 local function ask_type(slot, allowed, multi, on_done, on_cancel, bufnr)
   on_cancel = on_cancel or function() end
   local title = "Java: New — " .. slot
 
   local function manual()
-    input({ prompt = "Java: New — " .. slot .. ": FQN (ex.: java.util.ArrayList): " }, function(value)
+    input({ prompt = "Java: New — " .. slot .. ": FQN (e.g. java.util.ArrayList): " }, function(value)
       if value == nil then
         return on_cancel()
       end
       value = vim.trim(value)
       if not is_type(value, false) or (not multi and value:find(",", 1, true) ~= nil) then
-        notify("tipo Java inválido: " .. (value == "" and "(vazio)" or value), vim.log.levels.WARN)
+        notify("invalid Java type: " .. (value == "" and "(empty)" or value), vim.log.levels.WARN)
         return manual()
       end
       on_done({ value })
@@ -619,11 +619,11 @@ local function ask_type(slot, allowed, multi, on_done, on_cancel, bufnr)
 
   local client = lsp.client(bufnr)
   if not client then
-    notify("jdtls não está anexado — informe o tipo por FQN", vim.log.levels.WARN)
+    notify("jdtls is not attached — enter the type by FQN", vim.log.levels.WARN)
     return manual()
   end
 
-  input({ prompt = "Java: New — " .. slot .. ": buscar tipo no jdtls (vazio = digitar FQN): " }, function(query)
+  input({ prompt = "Java: New — " .. slot .. ": search type in jdtls (empty = enter FQN): " }, function(query)
     if query == nil then
       return on_cancel()
     end
@@ -633,7 +633,7 @@ local function ask_type(slot, allowed, multi, on_done, on_cancel, bufnr)
     end
     local found = search_types(query, allowed, client)
     if not found or #found == 0 then
-      notify("nenhum tipo encontrado para '" .. query .. "' — informe o FQN", vim.log.levels.WARN)
+      notify("no type found for '" .. query .. "' — enter the FQN", vim.log.levels.WARN)
       return manual()
     end
     if multi then
@@ -654,14 +654,14 @@ local function ask_type(slot, allowed, multi, on_done, on_cancel, bufnr)
   end)
 end
 
--- ---------- fluxo: opções ----------
+-- ---------- flow: options ----------
 
 local ask_options
 local show_summary
 
 local function ask_extends(state)
   local slot = state.kind.extends_slot
-  ask_type("Superclasse", TYPE_KINDS[slot], false, function(chosen)
+  ask_type("Superclass", TYPE_KINDS[slot], false, function(chosen)
     if not chosen or #chosen == 0 then
       return
     end
@@ -673,7 +673,7 @@ local function ask_extends(state)
 end
 
 local function ask_parents(state)
-  ask_type("Interfaces pai", TYPE_KINDS.interface, true, function(chosen)
+  ask_type("Parent interfaces", TYPE_KINDS.interface, true, function(chosen)
     if not chosen or #chosen == 0 then
       return ask_options(state)
     end
@@ -720,12 +720,12 @@ local function choose_modifier(on_done, current)
   for _, modifier in ipairs(FIELD_MODIFIERS) do
     local label = modifier.label
     if current == modifier.value then
-      label = label .. "  (atual)"
+      label = label .. "  (current)"
     end
     labels[#labels + 1] = label
     by_label[label] = modifier.value
   end
-  select(labels, { prompt = "Java: New — modificador do campo" }, function(choice)
+  select(labels, { prompt = "Java: New — field modifier" }, function(choice)
     if choice == nil then
       return
     end
@@ -735,13 +735,13 @@ end
 
 local function field_noun(kind)
   if kind.fields == "components" then
-    return "componente"
+    return "component"
   elseif kind.fields == "methods" then
-    return "método"
+    return "method"
   elseif kind.fields == "elements" then
-    return "elemento"
+    return "element"
   end
-  return "campo"
+  return "field"
 end
 
 local function field_text(kind, field)
@@ -754,22 +754,22 @@ local function field_text(kind, field)
 end
 
 ---@param state table
----@param edit_index number|nil ausente = adicionar; presente = editar no lugar
+---@param edit_index number|nil absent = add; present = edit in place
 local function ask_fields(state, edit_index)
   local kind = state.kind
   local is_component = kind.fields == "components"
   local is_member = kind.fields == "methods" or kind.fields == "elements"
   local target = edit_index and state.fields[edit_index] or nil
-  -- cópia: cancelar no meio da edição não altera o estado já confirmado
+  -- copy: cancelling mid-edit does not change already-confirmed state
   local field = target and vim.deepcopy(target) or { type = "", name = "", mod = "private" }
 
   local ask_one
   local ask_more
 
-  local more_prompt = is_component and "Java: New — componentes"
-    or kind.fields == "methods" and "Java: New — métodos"
-    or kind.fields == "elements" and "Java: New — elementos"
-    or "Java: New — campos"
+  local more_prompt = is_component and "Java: New — components"
+    or kind.fields == "methods" and "Java: New — methods"
+    or kind.fields == "elements" and "Java: New — elements"
+    or "Java: New — fields"
 
   local function back()
     ask_options(state)
@@ -785,11 +785,11 @@ local function ask_fields(state, edit_index)
   end
 
   ask_more = function()
-    select({ "Adicionar outro", "Voltar às opções" }, { prompt = more_prompt }, function(choice)
+    select({ "Add another", "Back to options" }, { prompt = more_prompt }, function(choice)
       if choice == nil then
         return back()
       end
-      if choice == "Adicionar outro" then
+      if choice == "Add another" then
         field = { type = "", name = "", mod = "private" }
         return ask_one()
       end
@@ -798,39 +798,36 @@ local function ask_fields(state, edit_index)
   end
 
   ask_one = function()
-    local type_prompt = is_component and "Java: New — tipo do componente: "
-      or is_member and "Java: New — tipo de retorno: "
-      or "Java: New — tipo do campo (FQN ou primitivo): "
+    local type_prompt = is_component and "Java: New — component type: "
+      or is_member and "Java: New — return type: "
+      or "Java: New — field type (FQN or primitive): "
     input({ prompt = type_prompt, default = field.type }, function(type_text)
       if type_text == nil then
         return back()
       end
       type_text = vim.trim(type_text)
       if not is_type(type_text, kind.fields == "methods") then
-        notify("tipo Java inválido: " .. (type_text == "" and "(vazio)" or type_text), vim.log.levels.WARN)
+        notify("invalid Java type: " .. (type_text == "" and "(empty)" or type_text), vim.log.levels.WARN)
         return ask_one()
       end
       field.type = type_text
 
-      local name_prompt = is_component and "Java: New — nome do componente: "
-        or kind.fields == "methods" and "Java: New — nome do método: "
-        or kind.fields == "elements" and "Java: New — nome do elemento: "
-        or "Java: New — nome do campo: "
+      local name_prompt = is_component and "Java: New — component name: "
+        or kind.fields == "methods" and "Java: New — method name: "
+        or kind.fields == "elements" and "Java: New — element name: "
+        or "Java: New — field name: "
       input({ prompt = name_prompt, default = field.name }, function(field_name)
         if field_name == nil then
           return back()
         end
         field_name = vim.trim(field_name)
         if not is_identifier(field_name) then
-          notify(
-            "identificador Java inválido: " .. (field_name == "" and "(vazio)" or field_name),
-            vim.log.levels.WARN
-          )
+          notify("invalid Java identifier: " .. (field_name == "" and "(empty)" or field_name), vim.log.levels.WARN)
           return ask_one()
         end
         for index, existing in ipairs(state.fields) do
           if index ~= edit_index and existing.name == field_name then
-            notify("já existe um campo/componente com esse nome: " .. field_name, vim.log.levels.WARN)
+            notify("a field/component with this name already exists: " .. field_name, vim.log.levels.WARN)
             return ask_one()
           end
         end
@@ -856,7 +853,7 @@ local function ask_fields(state, edit_index)
 end
 
 local function ask_values(state)
-  input({ prompt = "Java: New — constante do enum (vazio = terminar): ", default = "" }, function(value)
+  input({ prompt = "Java: New — enum constant (empty = finish): ", default = "" }, function(value)
     if value == nil then
       return ask_options(state)
     end
@@ -865,11 +862,11 @@ local function ask_values(state)
       return ask_options(state)
     end
     if not is_identifier(value) then
-      notify("identificador Java inválido: " .. value, vim.log.levels.WARN)
+      notify("invalid Java identifier: " .. value, vim.log.levels.WARN)
       return ask_values(state)
     end
     if contains(state.values, value) then
-      notify("constante duplicada: " .. value, vim.log.levels.WARN)
+      notify("duplicate constant: " .. value, vim.log.levels.WARN)
       return ask_values(state)
     end
     state.values[#state.values + 1] = value
@@ -880,16 +877,16 @@ end
 ---@param state table
 local function field_label(kind)
   if kind.fields == "components" then
-    return "Componentes do record"
+    return "Record components"
   elseif kind.fields == "methods" then
-    return "Métodos"
+    return "Methods"
   elseif kind.fields == "elements" then
-    return "Elementos da anotação"
+    return "Annotation elements"
   end
-  return "Campos"
+  return "Fields"
 end
 
----Pergunta (ou edita) package e nome preservando as demais escolhas.
+---Ask for (or edit) package and name while preserving the other choices.
 ---@param state table
 ---@param on_done fun()
 local function ask_identity(state, on_done)
@@ -902,13 +899,13 @@ local function ask_identity(state, on_done)
   end
 
   local function ask_name(pkg_value)
-    input({ prompt = "Java: New — nome do tipo: ", default = state.name or "" }, function(name)
+    input({ prompt = "Java: New — type name: ", default = state.name or "" }, function(name)
       if name == nil then
         return cancel()
       end
       name = vim.trim(name)
       if not is_identifier(name) then
-        notify("identificador Java inválido: " .. (name == "" and "(vazio)" or name), vim.log.levels.WARN)
+        notify("invalid Java identifier: " .. (name == "" and "(empty)" or name), vim.log.levels.WARN)
         return ask_name(pkg_value)
       end
       state.pkg = pkg_value
@@ -917,13 +914,13 @@ local function ask_identity(state, on_done)
     end)
   end
 
-  input({ prompt = "Java: New — package (vazio = default): ", default = state.pkg or "" }, function(pkg)
+  input({ prompt = "Java: New — package (empty = default): ", default = state.pkg or "" }, function(pkg)
     if pkg == nil then
       return cancel()
     end
     pkg = vim.trim(pkg)
     if not is_package(pkg) then
-      notify("package Java inválido: " .. pkg, vim.log.levels.WARN)
+      notify("invalid Java package: " .. pkg, vim.log.levels.WARN)
       return ask_identity(state, on_done)
     end
     ask_name(pkg)
@@ -965,7 +962,7 @@ end
 
 ask_options = function(state)
   local kind = state.kind
-  local items = { "(revisar e criar)" }
+  local items = { "(review and create)" }
   local handlers = {}
 
   local function add(label, fn)
@@ -974,12 +971,12 @@ ask_options = function(state)
   end
 
   if kind.extends_slot == "class" then
-    add("Superclasse (extends)" .. (state.extends and (": " .. state.extends) or ""), function()
+    add("Superclass (extends)" .. (state.extends and (": " .. state.extends) or ""), function()
       ask_extends(state)
     end)
   elseif kind.extends_slot == "interface" then
     local suffix = #state.parents > 0 and (": " .. table.concat(state.parents, ", ")) or ""
-    add("Interfaces pai (extends)" .. suffix, function()
+    add("Parent interfaces (extends)" .. suffix, function()
       ask_parents(state)
     end)
   end
@@ -1000,57 +997,57 @@ ask_options = function(state)
 
   if kind.values then
     local suffix = #state.values > 0 and (" (" .. #state.values .. ")") or ""
-    add("Constantes do enum" .. suffix, function()
+    add("Enum constants" .. suffix, function()
       ask_values(state)
     end)
   end
 
   local noun = field_noun(kind)
   if kind.implements and #state.implements > 0 then
-    add("Remover interface…", function()
-      remove_from_list(state.implements, "Java: New — remover interface", function()
+    add("Remove interface…", function()
+      remove_from_list(state.implements, "Java: New — remove interface", function()
         ask_options(state)
       end)
     end)
   end
   if kind.extends_slot == "interface" and #state.parents > 0 then
-    add("Remover interface pai…", function()
-      remove_from_list(state.parents, "Java: New — remover interface pai", function()
+    add("Remove parent interface…", function()
+      remove_from_list(state.parents, "Java: New — remove parent interface", function()
         ask_options(state)
       end)
     end)
   end
   if kind.fields and #state.fields > 0 then
-    add("Editar " .. noun .. "…", function()
-      pick_field(state, "Java: New — editar " .. noun, function(index)
+    add("Edit " .. noun .. "…", function()
+      pick_field(state, "Java: New — edit " .. noun, function(index)
         ask_fields(state, index)
       end)
     end)
-    add("Remover " .. noun .. "…", function()
-      pick_field(state, "Java: New — remover " .. noun, function(index)
+    add("Remove " .. noun .. "…", function()
+      pick_field(state, "Java: New — remove " .. noun, function(index)
         table.remove(state.fields, index)
         ask_options(state)
       end)
     end)
   end
   if kind.values and #state.values > 0 then
-    add("Remover constante…", function()
-      remove_from_list(state.values, "Java: New — remover constante", function()
+    add("Remove constant…", function()
+      remove_from_list(state.values, "Java: New — remove constant", function()
         ask_options(state)
       end)
     end)
   end
-  add("Editar nome/package…", function()
+  add("Edit name/package…", function()
     ask_identity(state, function()
       ask_options(state)
     end)
   end)
 
-  select(items, { prompt = "Java: New — opções (Enter revisa · Esc cancela)" }, function(choice)
+  select(items, { prompt = "Java: New — options (Enter reviews · Esc cancels)" }, function(choice)
     if choice == nil then
-      return -- cancelado: nada foi criado
+      return -- cancelled: nothing was created
     end
-    if choice == "(revisar e criar)" then
+    if choice == "(review and create)" then
       return show_summary(state)
     end
     local handler = handlers[choice]
@@ -1060,7 +1057,7 @@ ask_options = function(state)
   end)
 end
 
--- ---------- resumo e criação ----------
+-- ---------- summary and creation ----------
 
 local function file_path(source_root, pkg, name)
   local dir = source_root
@@ -1070,8 +1067,8 @@ local function file_path(source_root, pkg, name)
   return dir .. "/" .. name .. ".java"
 end
 
----Interfaces implementadas, incluindo o padrão do template (deduplicado:
----o template serializable já declara Serializable).
+---Implemented interfaces, including the template default (deduplicated:
+---the serializable template already declares Serializable).
 ---@param state table
 ---@return string[]
 local function effective_implements(state)
@@ -1129,21 +1126,21 @@ local function summary_lines(state)
   local file = file_path(state.root, state.pkg, state.name)
   local rel = vim.fs.relpath(root, file) or file
   local lines = {
-    "Tipo: " .. kind.label .. " (" .. kind.decl .. ")",
-    "Nome: " .. state.name,
+    "Type: " .. kind.label .. " (" .. kind.decl .. ")",
+    "Name: " .. state.name,
     "Package: " .. (state.pkg == "" and "(default)" or state.pkg),
     "Source root: " .. state.root,
-    "Arquivo: " .. rel,
+    "File: " .. rel,
   }
 
   if vim.fn.filereadable(file) == 1 then
-    lines[#lines + 1] = "AVISO: o arquivo já existe — nada será sobrescrito"
+    lines[#lines + 1] = "WARNING: the file already exists — nothing will be overwritten"
   end
 
   if state.extends then
     lines[#lines + 1] = "Extends: " .. state.extends
   elseif kind.template == "exception" then
-    lines[#lines + 1] = "Extends: Exception (padrão do template)"
+    lines[#lines + 1] = "Extends: Exception (template default)"
   end
   if state.kind.extends_slot == "interface" and #state.parents > 0 then
     lines[#lines + 1] = "Extends: " .. table.concat(state.parents, ", ")
@@ -1152,7 +1149,7 @@ local function summary_lines(state)
     if entity == "" then
       entity = "Entity"
     end
-    lines[#lines + 1] = "Extends: JpaRepository<" .. entity .. ", Long> (padrão do template)"
+    lines[#lines + 1] = "Extends: JpaRepository<" .. entity .. ", Long> (template default)"
   end
   local implemented = effective_implements(state)
   if #implemented > 0 then
@@ -1170,40 +1167,40 @@ local function summary_lines(state)
       for _, field in ipairs(state.fields) do
         parts[#parts + 1] = field.type .. " " .. field.name
       end
-      lines[#lines + 1] = "Componentes: " .. table.concat(parts, ", ")
+      lines[#lines + 1] = "Components: " .. table.concat(parts, ", ")
     elseif kind.fields == "methods" or kind.fields == "elements" then
       local parts = {}
       for _, field in ipairs(state.fields) do
         parts[#parts + 1] = field.type .. " " .. field.name .. "();"
       end
-      lines[#lines + 1] = (kind.fields == "methods" and "Métodos: " or "Elementos: ") .. table.concat(parts, " ")
+      lines[#lines + 1] = (kind.fields == "methods" and "Methods: " or "Elements: ") .. table.concat(parts, " ")
     else
       local parts = {}
       for _, field in ipairs(state.fields) do
         parts[#parts + 1] = field.mod .. " " .. field.type .. " " .. field.name .. ";"
       end
-      lines[#lines + 1] = "Campos: " .. table.concat(parts, " ")
+      lines[#lines + 1] = "Fields: " .. table.concat(parts, " ")
     end
   end
 
   if #state.values > 0 then
-    lines[#lines + 1] = "Constantes: " .. table.concat(state.values, ", ")
+    lines[#lines + 1] = "Constants: " .. table.concat(state.values, ", ")
   end
 
   return lines
 end
 
----Mostra o resumo e só cria depois de "Criar".
+---Show the summary and create only after "Create".
 ---@param state table
 show_summary = function(state)
   local lines = summary_lines(state)
-  local create_label = "✔ Criar"
-  local back_label = "← Voltar às opções"
-  local cancel_label = "✖ Cancelar"
+  local create_label = "✔ Create"
+  local back_label = "← Back to options"
+  local cancel_label = "✖ Cancel"
   local items = { create_label, back_label, cancel_label }
   vim.list_extend(items, lines)
 
-  select(items, { prompt = "Java: New — resumo (Enter cria · Esc cancela)" }, function(choice)
+  select(items, { prompt = "Java: New — summary (Enter creates · Esc cancels)" }, function(choice)
     if choice == nil then
       return -- cancelado
     end
@@ -1214,7 +1211,7 @@ show_summary = function(state)
       return
     end
     if choice ~= create_label then
-      -- linha informativa do resumo: reabre para não cancelar sem querer
+      -- informational summary line: reopen so it is not cancelled by accident
       return show_summary(state)
     end
     if state.done then
@@ -1229,12 +1226,12 @@ M._summary = show_summary
 
 -- ---------- entradas ----------
 
----Inicia o wizard com o estado das etapas anteriores.
+---Start the wizard with the state from previous steps.
 ---@param kind JavaKind
 ---@param source_root string
 ---@param suggested_pkg string
 ---@param deps string
----@param bufnr number buffer de origem (para busca de tipos no JDTLS)
+---@param bufnr number source buffer (for type search in JDTLS)
 local function start(kind, source_root, suggested_pkg, deps, bufnr)
   local state = {
     kind = kind,
@@ -1255,11 +1252,11 @@ local function start(kind, source_root, suggested_pkg, deps, bufnr)
   end)
 end
 
----Escolha do source root (com opção de digitar outro).
+---Source-root choice (with an option to type another one).
 ---@param kind JavaKind
 ---@param roots table[]
 ---@param deps string
----@param bufnr number buffer de origem (para busca de tipos no JDTLS)
+---@param bufnr number source buffer (for type search in JDTLS)
 local function pick_root(kind, roots, deps, bufnr)
   local preferred = project.preferred(roots)
   local ordered = { preferred }
@@ -1286,7 +1283,7 @@ local function pick_root(kind, roots, deps, bufnr)
         end
         path = vim.fs.normalize(vim.trim(path))
         if vim.fn.isdirectory(path) == 0 then
-          notify("diretório inexistente: " .. path, vim.log.levels.ERROR)
+          notify("directory does not exist: " .. path, vim.log.levels.ERROR)
           return
         end
         start(kind, path, project.package_for(0, path), deps, bufnr)
@@ -1301,24 +1298,24 @@ local function pick_root(kind, roots, deps, bufnr)
   end)
 end
 
----Entrada do `<leader>jn`.
+---Entry point of `<leader>jn`.
 function M.new()
   local bufnr = vim.api.nvim_get_current_buf()
   local root = project.root(bufnr)
   if not root then
-    notify("nenhum projeto Maven/Gradle (pom.xml, build.gradle) encontrado a partir deste buffer", vim.log.levels.WARN)
+    notify("no Maven/Gradle project (pom.xml, build.gradle) found from this buffer", vim.log.levels.WARN)
     return
   end
 
   local roots = project.source_roots(root)
   if #roots == 0 then
-    notify("projeto sem source root (src/main/java) em " .. root, vim.log.levels.WARN)
+    notify("project has no source root (src/main/java) in " .. root, vim.log.levels.WARN)
     return
   end
 
   if not jdtls_attached(bufnr) then
     notify(
-      "jdtls não está anexado — o arquivo será criado, mas autocomplete de tipos, imports automáticos e code actions ficam limitados até abrir o projeto em um buffer Java",
+      "jdtls is not attached — the file will be created, but type completion, automatic imports and code actions stay limited until the project is opened in a Java buffer",
       vim.log.levels.WARN
     )
   end
@@ -1331,13 +1328,13 @@ function M.new()
     local available, reason = kind_availability(kind, deps)
     local label = kind.label
     if not available then
-      label = label .. "  (indisponível: " .. reason .. ")"
+      label = label .. "  (unavailable: " .. reason .. ")"
     end
     labels[#labels + 1] = label
     by_label[label] = { kind = kind, available = available, reason = reason }
   end
 
-  select(labels, { prompt = "Java: New — tipo" }, function(label)
+  select(labels, { prompt = "Java: New — type" }, function(label)
     if label == nil then
       return -- cancelado
     end

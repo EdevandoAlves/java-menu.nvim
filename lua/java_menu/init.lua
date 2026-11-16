@@ -1,21 +1,20 @@
 -- java_menu/init.lua
--- API pública do java-menu.nvim: require("java_menu").setup(opts).
+-- Public API of java-menu.nvim: require("java_menu").setup(opts).
 --
--- O plugin é uma camada de menus sobre jc.nvim (dependência obrigatória)
--- e sobre o cliente JDTLS que o USUÁRIO já iniciou: aqui nada de servidor,
--- Mason, blink.cmp ou configuração pessoal. Os atalhos são globais (não só
--- ft=java), então o menu continua acessível em pom.xml, build.gradle(.kts)
--- e em qualquer diretório de projeto Java.
+-- The plugin is a menu layer over jc.nvim (a required dependency) and over the
+-- JDTLS client that the USER already started: no server, Mason, blink.cmp or
+-- personal configuration lives here. Keymaps are global (not limited to
+-- ft=java), so the menus stay available in pom.xml, build.gradle(.kts) and any
+-- buffer inside a Java project.
 --
--- Os módulos Java carregam sob demanda: o callback de cada atalho exige o
--- módulo apenas quando a tecla é usada (nenhum módulo é carregado pelo
--- setup()).
+-- Java modules load on demand: each keymap callback requires the module only
+-- when the key is used (setup() loads none of them).
 
 local M = {}
 
--- Ações do menu: nome → tecla (sufixo do prefixo), módulo, modos e rótulo.
--- A função pública de entrada de cada módulo mantém a responsabilidade que
--- já tinha (new.new, build.build, ...).
+-- Menu actions: name → key (prefix suffix), module, modes and label.
+-- Each module's public entry point keeps its original responsibility
+-- (new.new, build.build, ...).
 M.actions = {
   new = { key = "n", module = "java_menu.new", entry = "new", modes = { "n" }, desc = "New" },
   generate = { key = "g", module = "java_menu.generate", entry = "generate", modes = { "n" }, desc = "Generate" },
@@ -28,15 +27,14 @@ M.actions = {
 
 M.config = {
   prefix = "<leader>j",
-  -- habilitar/desabilitar grupos (chaves de M.actions); true por padrão
+  -- enable/disable groups (keys of M.actions); true by default
   groups = {},
-  -- registrar o rótulo do grupo no which-key quando disponível (opcional)
+  -- register the group label with which-key when available (optional)
   which_key = true,
 }
 
--- Mapas e comando criados pela última chamada de setup() — base da
--- idempotência: re-executar setup() limpa os próprios registros antes de
--- recriar, nunca duplicando.
+-- Keymaps and command created by the last setup() call; this is what makes
+-- setup() idempotent: it clears its own registrations before recreating them.
 local registered = {
   maps = {}, -- { { mode, lhs }, ... }
   command = nil,
@@ -48,23 +46,23 @@ local function desc_for(action)
   return DESC_PREFIX .. action.desc
 end
 
----Exige jc.nvim (dependência obrigatória) com erro claro e acionável.
+---Require jc.nvim (a hard dependency) with a clear, actionable error.
 local function require_jc()
   local ok, jc_jdtls = pcall(require, "jc.jdtls")
   if not ok or type(jc_jdtls) ~= "table" then
     error(
-      "java-menu.nvim: jc.nvim é dependência obrigatória e não foi encontrado "
-        .. "(require('jc.jdtls') falhou: "
+      "java-menu.nvim: jc.nvim is a required dependency and was not found "
+        .. "(require('jc.jdtls') failed: "
         .. tostring(jc_jdtls)
-        .. "). Instale artur-shaik/jc.nvim junto a este plugin."
+        .. "). Install artur-shaik/jc.nvim alongside this plugin."
     )
   end
 end
 
----Remove os registros criados por um setup() anterior (idempotência).
----Só apaga o atalho se ele ainda é nosso (desc prefixada): se o usuário
----substituiu um dos nossos atalhos por um próprio, ele é preservado e
----tratado como conflito no novo registro.
+---Remove registrations created by a previous setup() (idempotency).
+---A keymap is deleted only while it is still ours (its description carries
+---our prefix): if the user replaced one of our keymaps, it is preserved and
+---reported as a conflict by the new registration.
 local function clear_previous()
   for _, m in ipairs(registered.maps) do
     local cur = vim.fn.maparg(m.lhs, m.mode, false, true)
@@ -82,10 +80,10 @@ local function clear_previous()
   end
 end
 
----Atalhos já existentes de terceiros não são sobrescritos: são preservados
----e o conflito é informado uma vez, com o atalho afetado. Um mapeamento com
----a nossa descrição (registro próprio que sobreviveu ao cleanup) é tratado
----como nosso e pode ser recriado.
+---Existing keymaps from other plugins are never overwritten: they are kept
+---and the conflict is reported once, naming the affected key. A mapping with
+---our description (our own registration that survived cleanup) is treated as
+---ours and may be recreated.
 local function conflicting(lhs, mode, want_desc)
   local existing = vim.fn.maparg(lhs, mode, false, true)
   if type(existing) ~= "table" or vim.tbl_isempty(existing) then
@@ -96,12 +94,12 @@ end
 
 local function apply_keymaps(prefix, groups, conflicts)
   for name, action in pairs(M.actions) do
-    if groups[name] ~= false then -- default: todos os grupos habilitados
+    if groups[name] ~= false then -- default: all groups enabled
       local lhs = prefix .. action.key
       local want_desc = desc_for(action)
       for _, mode in ipairs(action.modes) do
         if conflicting(lhs, mode, want_desc) then
-          conflicts[#conflicts + 1] = ("%s (%s): conflito — já mapeado para outro propósito; atalho preservado e grupo '%s' não registrado"):format(
+          conflicts[#conflicts + 1] = ("%s (%s): conflict — already mapped for another purpose; keymap preserved and group '%s' not registered"):format(
             lhs,
             mode,
             name
@@ -127,16 +125,16 @@ local function sorted_action_names()
   return names
 end
 
----Executa um grupo do menu sob demanda — ponto de entrada para `keys` do
----gerenciador de plugins (carrega só o módulo da ação pedida).
+---Run one menu group on demand — entry point for plugin-manager `keys`
+---(loads only the requested action's module).
 ---@param name string
 function M.trigger(name)
   local action = M.actions[name]
   if not action then
     error(
-      "java-menu.nvim: ação desconhecida '"
+      "java-menu.nvim: unknown action '"
         .. tostring(name)
-        .. "' — opções: "
+        .. "' — options: "
         .. table.concat(sorted_action_names(), ", ")
     )
   end
@@ -157,7 +155,7 @@ local function apply_command()
     complete = function()
       return names
     end,
-    desc = "Abre um grupo do menu Java",
+    desc = "Open a Java menu group",
   })
   registered.command = "JavaMenu"
 end
@@ -166,24 +164,24 @@ local function apply_which_key(prefix)
   if not M.config.which_key then
     return
   end
-  -- integração opcional: ausência de which-key não é erro
+  -- optional integration: a missing which-key is not an error
   local ok, wk = pcall(require, "which-key")
   if ok and type(wk.add) == "function" then
     pcall(wk.add, { { prefix, group = "Java" } })
   end
 end
 
----Configura o plugin. Idempotente: re-executar limpa os próprios atalhos e
----o próprio comando antes de recriar; atalhos de terceiros são preservados
----e conflitos são informados. Nenhum módulo Java é carregado aqui.
+---Configure the plugin. Idempotent: running it again clears only its own
+---keymaps and command before recreating them; third-party keymaps are
+---preserved and conflicts are reported. No Java module is loaded here.
 ---@param opts { prefix?: string, groups?: table<string, boolean>, which_key?: boolean }|nil
 function M.setup(opts)
   opts = opts or {}
   if opts.prefix ~= nil and type(opts.prefix) ~= "string" then
-    error("java-menu.nvim: opts.prefix deve ser string, recebi " .. type(opts.prefix))
+    error("java-menu.nvim: opts.prefix must be a string, got " .. type(opts.prefix))
   end
   if opts.groups ~= nil and type(opts.groups) ~= "table" then
-    error("java-menu.nvim: opts.groups deve ser tabela, recebi " .. type(opts.groups))
+    error("java-menu.nvim: opts.groups must be a table, got " .. type(opts.groups))
   end
 
   require_jc()

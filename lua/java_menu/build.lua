@@ -1,7 +1,7 @@
 -- java_menu/build.lua
--- <leader>jb: build e run de projetos Java (Maven preferencialmente, Gradle se
--- houver wrapper executável). Reaproveita a infraestrutura das fases
--- anteriores (ui, project) e o `jc.settings` para o "repeat last" do jc.
+-- <leader>jb: build and run Java projects (Maven preferred, Gradle when an
+-- executable wrapper exists). Reuses the earlier infrastructure (ui, project)
+-- and `jc.settings` for jc's "repeat last".
 
 local ui = require("java_menu.ui")
 local project = require("java_menu.project")
@@ -25,19 +25,19 @@ local state = {
   kind = nil,
   cmd = nil,
   cwd = nil,
-  root = nil, -- projeto de origem do job (B2: isolamento entre projetos)
+  root = nil, -- project that started the job (isolation between projects)
   running = false,
   status = "idle",
   last_output = nil,
   last_output_root = nil,
 }
 
----Últimos argumentos de build por projeto (repeat não cruza projetos).
----jc.settings persiste por nome de projeto do cwd; aqui a chave é a raiz
----resolvida do buffer, então o repeat nunca executa args de A em B.
+---Last build arguments per project (repeat never crosses projects).
+---jc.settings persists by cwd project name; here the key is the resolved
+---buffer root, so repeat never runs A's args in B.
 local last_builds = {}
 
--- ---------- helpers de projeto ----------
+-- ---------- project helpers ----------
 
 local function is_file(path)
   return vim.fn.filereadable(path) == 1
@@ -47,7 +47,7 @@ local function is_exec(path)
   return path ~= nil and path ~= "" and vim.fn.executable(path) == 1
 end
 
----Ferramenta de build e runner a usar na raiz.
+---Build tool and runner to use at the root.
 ---@param root string
 ---@return table|nil tool { tool, runner, reason }
 local function build_tool(root)
@@ -64,7 +64,7 @@ local function build_tool(root)
     if is_exec("gradle") then
       return { tool = "gradle", runner = "gradle" }
     end
-    return { tool = "gradle", runner = nil, reason = "gradlew não é executável e gradle não está no PATH" }
+    return { tool = "gradle", runner = nil, reason = "gradlew is not executable and gradle is not in PATH" }
   end
 
   if is_file(root .. "/pom.xml") then
@@ -75,16 +75,16 @@ local function build_tool(root)
     if is_exec("mvn") then
       return { tool = "maven", runner = "mvn" }
     end
-    return { tool = "maven", runner = nil, reason = "mvnw não é executável e mvn não está no PATH" }
+    return { tool = "maven", runner = nil, reason = "mvnw is not executable and mvn is not in PATH" }
   end
 end
 
----Módulo ao qual um source root pertence.
+---Module that owns a source root.
 local function module_of_source_root(source_root)
   return (source_root:gsub("[/\\]src[/\\][^/\\]+[/\\]java$", ""))
 end
 
----Módulo do buffer atual (o source root mais específico que o contém).
+---Module of the current buffer (the most specific source root containing it).
 local function module_for(bufnr, root)
   local name = vim.api.nvim_buf_get_name(bufnr)
   local best
@@ -105,7 +105,7 @@ end
 
 -- ---------- descoberta ----------
 
----Classes com `public static void main`.
+---Classes with `public static void main`.
 local function main_classes(root)
   local out = {}
   for _, sr in ipairs(project.source_roots(root)) do
@@ -133,7 +133,7 @@ local function main_classes(root)
   return out
 end
 
----Módulos que declaram Spring Boot no pom.
+---Modules that declare Spring Boot in the pom.
 local function spring_modules(root)
   local out = {}
   for _, mod in ipairs(project.modules(root)) do
@@ -148,7 +148,7 @@ local function spring_modules(root)
   return out
 end
 
--- ---------- execução ----------
+-- ---------- execution ----------
 
 local BUILD_EFM = table.concat({
   "%E%f:%l: error: %m",
@@ -158,15 +158,15 @@ local BUILD_EFM = table.concat({
   "%-G%.%#",
 }, ",")
 
----Último buffer de código usado nos menus (sobrevive ao split de saída).
+---Last code buffer used by the menus (survives the output split).
 local last_code_buf = nil
 
 local function is_output_buf(buf)
   return buf ~= nil and vim.api.nvim_buf_is_valid(buf) and vim.b[buf].java_build_title ~= nil
 end
 
----Buffer de contexto do menu: se o foco está na saída do build, usa o último
----buffer de código (o split de saída não tem arquivo, então não tem projeto).
+---Menu context buffer: when focus is in the build output, use the last code
+---buffer (the output split has no file, hence no project).
 local function context_buf()
   local cur = vim.api.nvim_get_current_buf()
   if not is_output_buf(cur) then
@@ -204,7 +204,7 @@ local function open_output(title)
   return buf
 end
 
----Append no buffer de saída, mantendo a janela no fim quando visível.
+---Append to the output buffer, keeping the window at the end when visible.
 local function append(buf, lines)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) or #lines == 0 then
     return
@@ -217,7 +217,7 @@ local function append(buf, lines)
   end
 end
 
----Preenche o quickfix com erros de compilação do buffer de saída.
+---Fill the quickfix list with compilation errors from the output buffer.
 local function fill_quickfix(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then
     return
@@ -232,7 +232,7 @@ local function fill_quickfix(buf)
   end
   vim.fn.setqflist({}, " ", { title = "java build", items = valid })
   vim.cmd("botright copen")
-  ui.notify(("%d erro(s) de compilação no quickfix"):format(#valid), vim.log.levels.WARN)
+  ui.notify(("%d compilation error(s) in the quickfix list"):format(#valid), vim.log.levels.WARN)
 end
 
 local pending = { stdout = "", stderr = "" }
@@ -281,12 +281,12 @@ local function finish(code)
   )
 end
 
----Inicia um processo. `cmd` é uma lista; roda com setsid para poder parar o
----grupo inteiro (evita JVM órfã do spring-boot:run). `root` é o projeto de
----origem — o menu nunca trata esse processo como do projeto atual.
+---Start a process. `cmd` is a list; it runs with setsid so the whole group
+---can be stopped (avoids an orphan JVM from spring-boot:run). `root` is the
+---originating project — the menu never treats this process as the current one.
 local function start(kind, cmd, cwd, root)
   if state.running then
-    ui.notify("já existe um processo em execução — pare antes de iniciar outro", vim.log.levels.WARN)
+    ui.notify("a process is already running — stop it before starting another", vim.log.levels.WARN)
     return
   end
 
@@ -323,7 +323,7 @@ local function start(kind, cmd, cwd, root)
   })
 
   if job <= 0 then
-    ui.notify("não consegui iniciar: " .. table.concat(cmd, " "), vim.log.levels.ERROR)
+    ui.notify("could not start: " .. table.concat(cmd, " "), vim.log.levels.ERROR)
     return
   end
 
@@ -338,18 +338,18 @@ local function start(kind, cmd, cwd, root)
   state.running = true
   state.status = "running"
 
-  -- mantém o foco no código; o split de saída fica visível abaixo
+  -- keep focus in the code; the output split stays visible below
   if prev_win and vim.api.nvim_win_is_valid(prev_win) then
     pcall(vim.api.nvim_set_current_win, prev_win)
   end
 
   ui.notify(
-    ("%s iniciado (projeto %s)\n$ %s\nem %s"):format(kind, vim.fs.basename(state.root), table.concat(cmd, " "), cwd),
+    ("%s started (project %s)\n$ %s\nin %s"):format(kind, vim.fs.basename(state.root), table.concat(cmd, " "), cwd),
     vim.log.levels.INFO
   )
 end
 
----Mata a árvore de processos iniciada por este job (filhos primeiro).
+---Kill the process tree started by this job (children first).
 local function kill_tree(pid)
   if not pid or pid <= 0 then
     return
@@ -366,13 +366,13 @@ local function kill_tree(pid)
   pcall(vim.fn.system, { "kill", "-TERM", tostring(pid) })
 end
 
----Para o processo atual (e só a árvore dele). Quando o processo pertence a
----outro projeto, exige escolha explícita do usuário — nunca encerra em
----silêncio um job de projeto diferente do buffer atual.
+---Stop the current process (and only its tree). When the process belongs to
+---another project, require an explicit user choice — never silently kill a
+---job from a project other than the current buffer.
 ---@param confirmed boolean|nil
 function M.stop(confirmed)
   if not state.running or not state.job then
-    ui.notify("nenhum processo Java em execução", vim.log.levels.WARN)
+    ui.notify("no Java process is running", vim.log.levels.WARN)
     return
   end
   local current_root = project.root(context_buf())
@@ -381,15 +381,15 @@ function M.stop(confirmed)
     local origin = vim.fs.basename(state.root)
     ui.pick_one(
       {
-        ("não — manter o processo do projeto %s"):format(origin),
-        ("sim — encerrar o processo do projeto %s"):format(origin),
+        ("No — keep the %s project process"):format(origin),
+        ("Yes — stop the %s project process"):format(origin),
       },
-      "Java: Build — processo pertence a outro projeto",
+      "Java: Build — process belongs to another project",
       function(choice)
-        if choice and choice:find("^sim") then
+        if choice and choice:find("^Yes") then
           M.stop(true)
         elseif choice then
-          ui.notify(("processo do projeto %s mantido em execução"):format(origin), vim.log.levels.INFO)
+          ui.notify(("the %s project process was kept running"):format(origin), vim.log.levels.INFO)
         end
       end
     )
@@ -399,17 +399,17 @@ function M.stop(confirmed)
   kill_tree(pid)
   pcall(vim.fn.jobstop, state.job)
   ui.notify(
-    from_other_project and ("processo do projeto %s encerrado"):format(vim.fs.basename(state.root))
-      or "processo encerrado",
+    from_other_project and ("the %s project process was stopped"):format(vim.fs.basename(state.root))
+      or "process stopped",
     vim.log.levels.INFO
   )
 end
 
----Mostra a última saída (de qualquer projeto — a origem é identificada no menu).
+---Show the last output (from any project — the origin is identified in the menu).
 function M.show_output()
   local buf = state.last_output
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then
-    ui.notify("nenhuma saída anterior", vim.log.levels.WARN)
+    ui.notify("no previous output", vim.log.levels.WARN)
     return
   end
   vim.cmd("botright split")
@@ -419,9 +419,9 @@ end
 
 -- ---------- argumentos / comandos ----------
 
----Argumentos de escopo (módulo) para Maven/Gradle. Maven usa o caminho do
----módulo relativo ao agregador (`-pl services/api -am`); Gradle usa o caminho
----lógico do projeto (`:services:api:compile`), não o caminho de diretório.
+---Scope arguments (module) for Maven/Gradle. Maven uses the module path
+---relative to the aggregator (`-pl services/api -am`); Gradle uses the logical
+---project path (`:services:api:compile`), not the directory path.
 local function scope_args(tool, root, module, args)
   if not module or module == root then
     return args
@@ -444,13 +444,13 @@ local function scope_args(tool, root, module, args)
   return scoped
 end
 
----Executa args do build no root (com escopo de módulo).
+---Run build args at the root (with module scope).
 local function run_build(tool, root, module, args, label)
   local scoped = scope_args(tool.tool, root, module, args)
   local cmd = { tool.runner }
   vim.list_extend(cmd, scoped)
   last_builds[root] = table.concat(scoped, " ")
-  -- mesmo estado do :JCbuildLast do jc (string de argumentos por projeto)
+  -- same state as jc :JCbuildLast (argument string per project)
   local ok, err = jca.write_build_last(table.concat(scoped, " "))
   if not ok then
     ui.notify(err, vim.log.levels.WARN)
@@ -458,13 +458,13 @@ local function run_build(tool, root, module, args, label)
   start(label or args[1], cmd, root, root)
 end
 
----Classpath runtime + JDK do projeto via jdtls (cliente do buffer de origem).
+---Runtime classpath + project JDK via jdtls (source-buffer client).
 ---@param uri string
 ---@param bufnr number
 local function classpath_for(uri, bufnr, cb)
   local client = lsp.client_or_reason(bufnr)
   if not client then
-    return cb(nil, client or "jdtls não está anexado a este buffer")
+    return cb(nil, client or "jdtls is not attached to this buffer")
   end
 
   client:request("workspace/executeCommand", {
@@ -473,7 +473,7 @@ local function classpath_for(uri, bufnr, cb)
   }, function(err, result)
     vim.schedule(function()
       if err or type(result) ~= "table" or type(result.classpaths) ~= "table" then
-        return cb(nil, "não consegui resolver o classpath pelo jdtls")
+        return cb(nil, "could not resolve the classpath through jdtls")
       end
       local cp = vim.deepcopy(result.classpaths)
       if type(result.modulepaths) == "table" then
@@ -490,7 +490,7 @@ local function classpath_for(uri, bufnr, cb)
     command = "java.project.getSettings",
     arguments = { uri, { "org.eclipse.jdt.ls.core.vm.location" } },
   }, function(err, result)
-    -- guarda o jdk para o próximo start; se falhar, usa java do PATH
+    -- remember the JDK for the next start; on failure, use java from PATH
     if not err and type(result) == "table" then
       local vm = result["org.eclipse.jdt.ls.core.vm.location"]
       if type(vm) == "string" and vm ~= "" then
@@ -518,7 +518,7 @@ local function split_args(text)
   return vim.split(vim.trim(text), "%s+", { trimempty = true })
 end
 
--- ---------- operações ----------
+-- ---------- operations ----------
 
 local function ask_module(root, bufnr, cb)
   local modules = project.modules(root)
@@ -536,15 +536,15 @@ local function ask_module(root, bufnr, cb)
   end
 
   for _, mod in ipairs(ordered) do
-    local label = (mod == root and "projeto inteiro" or vim.fs.relpath(root, mod))
+    local label = (mod == root and "entire project" or vim.fs.relpath(root, mod))
     if mod == current then
-      label = label .. "  (módulo atual)"
+      label = label .. "  (current module)"
     end
     labels[#labels + 1] = label
     by_label[label] = mod
   end
 
-  ui.pick_one(labels, "Java: Build — módulo", function(choice)
+  ui.pick_one(labels, "Java: Build — module", function(choice)
     local mod = by_label[choice]
     if mod then
       cb(mod)
@@ -554,7 +554,7 @@ end
 
 local function do_goal(root, bufnr, tool, goal, label)
   if not tool.runner then
-    ui.notify(tool.reason or "ferramenta de build indisponível", vim.log.levels.WARN)
+    ui.notify(tool.reason or "build tool unavailable", vim.log.levels.WARN)
     return
   end
   ask_module(root, bufnr, function(module)
@@ -564,7 +564,7 @@ end
 
 local function do_choose_goal(root, bufnr, tool)
   if not tool.runner then
-    ui.notify(tool.reason or "ferramenta de build indisponível", vim.log.levels.WARN)
+    ui.notify(tool.reason or "build tool unavailable", vim.log.levels.WARN)
     return
   end
   local defaults = tool.tool == "maven" and "clean package" or "build"
@@ -583,8 +583,8 @@ local function do_choose_goal(root, bufnr, tool)
 end
 
 local function do_repeat(root, bufnr, tool)
-  -- prioridade para o registro desta sessão por RAIZ (nunca cruza projetos);
-  -- sem ele, cai no build-last do jc (chaveado pelo projeto do cwd)
+  -- prefer this session's record by ROOT (never crosses projects);
+  -- without it, fall back to jc build-last (keyed by the cwd project)
   local last = last_builds[root]
   if not last or last == "" then
     local err
@@ -594,11 +594,11 @@ local function do_repeat(root, bufnr, tool)
     end
   end
   if not last or last == "" then
-    ui.notify("nenhum build anterior neste projeto", vim.log.levels.WARN)
+    ui.notify("no previous build in this project", vim.log.levels.WARN)
     return
   end
   if not tool.runner then
-    ui.notify(tool.reason or "ferramenta de build indisponível", vim.log.levels.WARN)
+    ui.notify(tool.reason or "build tool unavailable", vim.log.levels.WARN)
     return
   end
   start("build", vim.list_extend({ tool.runner }, split_args(last)), root, root)
@@ -606,7 +606,7 @@ end
 
 local function run_main(root, bufnr, mains)
   if #mains == 0 then
-    ui.notify("nenhuma classe com public static void main encontrada", vim.log.levels.WARN)
+    ui.notify("no class with public static void main found", vim.log.levels.WARN)
     return
   end
 
@@ -623,20 +623,20 @@ local function run_main(root, bufnr, mains)
       return
     end
 
-    ui.ask("Java: Build — argumentos da aplicação: ", "", function(args)
+    ui.ask("Java: Build — application arguments: ", "", function(args)
       if args == nil then
         return
       end
       local uri = vim.uri_from_fname(entry.path)
       classpath_for(uri, bufnr, function(cp, err)
         if not cp then
-          ui.notify("Run Main indisponível: " .. tostring(err), vim.log.levels.ERROR)
+          ui.notify("Run Main unavailable: " .. tostring(err), vim.log.levels.ERROR)
           return
         end
 
         local java = java_bin()
         if not is_exec(java) then
-          ui.notify("java não encontrado (PATH/JAVA_HOME)", vim.log.levels.ERROR)
+          ui.notify("java not found (PATH/JAVA_HOME)", vim.log.levels.ERROR)
           return
         end
 
@@ -655,16 +655,16 @@ end
 
 local function run_spring(root, bufnr, spring)
   if #spring == 0 then
-    ui.notify("nenhum módulo Spring Boot detectado", vim.log.levels.WARN)
+    ui.notify("no Spring Boot module detected", vim.log.levels.WARN)
     return
   end
   local tool = build_tool(root)
   if not tool or tool.tool ~= "maven" then
-    ui.notify("Spring Boot run exige Maven (spring-boot:run)", vim.log.levels.WARN)
+    ui.notify("Spring Boot run requires Maven (spring-boot:run)", vim.log.levels.WARN)
     return
   end
   if not tool.runner then
-    ui.notify(tool.reason or "mvn indisponível", vim.log.levels.WARN)
+    ui.notify(tool.reason or "mvn unavailable", vim.log.levels.WARN)
     return
   end
 
@@ -677,11 +677,11 @@ local function run_spring(root, bufnr, spring)
 
   local function ask_and_run(module)
     local rel = vim.fs.relpath(root, module)
-    ui.ask("Java: Build — profile Spring (opcional): ", "", function(profile)
+    ui.ask("Java: Build — Spring profile (optional): ", "", function(profile)
       if profile == nil then
         return
       end
-      ui.ask("Java: Build — argumentos da aplicação (opcional): ", "", function(args)
+      ui.ask("Java: Build — application arguments (optional): ", "", function(args)
         if args == nil then
           return
         end
@@ -705,7 +705,7 @@ local function run_spring(root, bufnr, spring)
     ask_and_run(spring[1])
     return
   end
-  ui.pick_one(labels, "Java: Build — módulo Spring Boot", function(choice)
+  ui.pick_one(labels, "Java: Build — Spring Boot module", function(choice)
     local mod = by_label[choice]
     if mod then
       ask_and_run(mod)
@@ -715,12 +715,12 @@ end
 
 -- ---------- menu ----------
 
----Entrada do `<leader>jb`.
+---Entry point of `<leader>jb`.
 function M.build()
   local bufnr = context_buf()
   local root = project.root(bufnr)
   if not root then
-    ui.notify("nenhum projeto Maven/Gradle (pom.xml, build.gradle) a partir deste buffer", vim.log.levels.WARN)
+    ui.notify("no Maven/Gradle project (pom.xml, build.gradle) from this buffer", vim.log.levels.WARN)
     return
   end
 
@@ -730,23 +730,23 @@ function M.build()
   local springs = spring_modules(root)
   local java = java_bin()
   local can_build = tool ~= nil and tool.runner ~= nil
-  local build_reason = (tool and tool.reason) or "nenhuma ferramenta de build encontrada"
+  local build_reason = (tool and tool.reason) or "no build tool found"
 
   local entries = {
     {
       key = "run_main",
       label = "Run Main Class",
       enabled = attached and #mains > 0 and is_exec(java),
-      reason = (not attached and "jdtls não está anexado (classpath vem do jdtls)")
-        or (#mains == 0 and "nenhuma classe com public static void main")
-        or "java não encontrado",
+      reason = (not attached and "jdtls is not attached (classpath comes from jdtls)")
+        or (#mains == 0 and "no class with public static void main")
+        or "java not found",
     },
     {
       key = "run_spring",
       label = "Run Spring Boot",
       enabled = #springs > 0 and tool ~= nil and tool.tool == "maven" and tool.runner ~= nil,
-      reason = (#springs == 0 and "nenhum módulo Spring Boot detectado")
-        or (tool and tool.tool ~= "maven" and "spring-boot:run exige Maven")
+      reason = (#springs == 0 and "no Spring Boot module detected")
+        or (tool and tool.tool ~= "maven" and "spring-boot:run requires Maven")
         or build_reason,
     },
     { key = "compile", label = "Compile", enabled = can_build, reason = build_reason },
@@ -769,25 +769,25 @@ function M.build()
         end
         return last ~= nil and last ~= ""
       end)(),
-      reason = (not can_build and build_reason) or "nenhum build anterior neste projeto",
+      reason = (not can_build and build_reason) or "no previous build in this project",
     },
     {
       key = "stop",
-      label = state.running and state.root and ("Stop Running Process — projeto %s"):format(
+      label = state.running and state.root and ("Stop Running Process — project %s"):format(
         vim.fs.basename(state.root)
       ) or "Stop Running Process",
       enabled = state.running,
-      reason = (state.running and state.root ~= root and "processo de outro projeto — vai pedir confirmação")
-        or "nenhum processo em execução",
+      reason = (state.running and state.root ~= root and "process from another project — will ask for confirmation")
+        or "no process running",
     },
     {
       key = "output",
       label = state.last_output_root
           and vim.api.nvim_buf_is_valid(state.last_output or -1)
-          and ("Show Last Output — projeto %s"):format(vim.fs.basename(state.last_output_root))
+          and ("Show Last Output — project %s"):format(vim.fs.basename(state.last_output_root))
         or "Show Last Output",
       enabled = state.last_output ~= nil and vim.api.nvim_buf_is_valid(state.last_output),
-      reason = "nenhuma saída anterior",
+      reason = "no previous output",
     },
   }
 
@@ -820,7 +820,7 @@ function M.build()
   )
 end
 
--- expostos para testes
+-- exposed for tests
 M._state = state
 M._build_tool = build_tool
 M._main_classes = main_classes

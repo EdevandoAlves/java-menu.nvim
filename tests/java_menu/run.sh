@@ -76,6 +76,7 @@ FAST_SPECS=(
   capabilities_spec
   modules_spec
   setup_spec
+  generate_operations_spec
   jc_compat_spec
   debug_project_spec
   move_destination_label_spec
@@ -92,6 +93,7 @@ FAST_SPECS=(
 INTEGRATION_SPECS=(
   lsp_clients_spec
   refactor_lsp_spec
+  generate_lsp_spec
   jdtls_projects_spec
   build_isolation_spec
 )

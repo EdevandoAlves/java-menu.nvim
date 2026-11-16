@@ -47,7 +47,7 @@ local plan = {
 local problems = preview._revalidate(plan)
 local has_modified_problem = false
 for _, problem in ipairs(problems) do
-  if problem:find("buffer modificado não salvo", 1, true) then
+  if problem:find("unsaved modified buffer", 1, true) then
     has_modified_problem = true
   end
 end
@@ -57,7 +57,7 @@ assert(has_modified_problem, "revalidate não bloqueou buffer modificado: " .. v
 vim.bo[stale_buf].modified = false
 problems = preview._revalidate(plan)
 for _, problem in ipairs(problems) do
-  assert(not problem:find("buffer modificado não salvo", 1, true), "problema fantasma de buffer modificado")
+  assert(not problem:find("unsaved modified buffer", 1, true), "problema fantasma de buffer modificado")
 end
 
 -- cancelamento não aplica nada

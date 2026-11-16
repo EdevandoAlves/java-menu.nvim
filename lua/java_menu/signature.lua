@@ -1,8 +1,8 @@
 -- java_menu/signature.lua
--- Change Method Signature sobre a API do jdtls:
---   java/getChangeSignatureInfo  -> assinatura atual
---   java/getRefactorEdit (command="changeSignature", 8 argumentos)
--- O edit devolvido vai para java_menu.preview (nada é aplicado aqui).
+-- Change Method Signature over the jdtls API:
+--   java/getChangeSignatureInfo  -> current signature
+--   java/getRefactorEdit (command="changeSignature", 8 arguments)
+-- The returned edit goes to java_menu.preview (nothing is applied here).
 
 local ui = require("java_menu.ui")
 local lsp = require("java_menu.lsp")
@@ -53,7 +53,7 @@ local function changed(state)
   return not params_equal(state.params, copy_params(info.parameters))
 end
 
----Valor sugerido para as chamadas quando um parâmetro é adicionado.
+---Suggested value for existing calls when a parameter is added.
 local function suggested_default(typ)
   if typ == "boolean" then
     return "false"
@@ -74,18 +74,18 @@ local function valid_name(name)
   return name ~= "" and name:match("^[%a_$][%w_$]*$") ~= nil
 end
 
----Envia a nova assinatura ao jdtls e devolve o WorkspaceEdit (sem aplicar).
+---Send the new signature to jdtls and return the WorkspaceEdit (without applying).
 local function request_edit(state, bufnr, on_edit)
   local client, client_reason = lsp.client_or_reason(bufnr)
   if not client then
-    ui.notify(client_reason or "jdtls não está anexado a este buffer", vim.log.levels.ERROR)
+    ui.notify(client_reason or "jdtls is not attached to this buffer", vim.log.levels.ERROR)
     return
   end
   if not ui.same_buffer(bufnr) then
     return
   end
   if state.tick and vim.b[bufnr].changedtick ~= state.tick then
-    ui.notify("o buffer mudou durante a edição da assinatura — refaça a operação", vim.log.levels.WARN)
+    ui.notify("the buffer changed while editing the signature — run the operation again", vim.log.levels.WARN)
     return
   end
 
@@ -118,11 +118,11 @@ local function request_edit(state, bufnr, on_edit)
   }, function(err, result)
     vim.schedule(function()
       if err then
-        ui.notify("change signature recusada: " .. (err.message or vim.inspect(err)), vim.log.levels.ERROR)
+        ui.notify("change signature refused: " .. (err.message or vim.inspect(err)), vim.log.levels.ERROR)
         return
       end
       if not (result and result.edit) then
-        ui.notify("o jdtls não retornou alterações para essa assinatura", vim.log.levels.WARN)
+        ui.notify("jdtls returned no changes for this signature", vim.log.levels.WARN)
         return
       end
       on_edit(result.edit)
@@ -135,32 +135,32 @@ local function ask_param(state, on_done)
   for i, p in ipairs(state.params) do
     entries[#entries + 1] = { label = ("%d. %s %s"):format(i, p.type, p.name), key = tostring(i) }
   end
-  ui.menu(entries, "Java: Signature — parâmetro", on_done)
+  ui.menu(entries, "Java: Signature — parameter", on_done)
 end
 
 local function edit_param(state, index, reopen)
   local p = state.params[index]
   local entries = {
-    { label = ("Renomear (atual: %s)"):format(p.name), key = "rename" },
-    { label = ("Mudar tipo (atual: %s)"):format(p.type), key = "type" },
-    { label = "Mover para cima", key = "up", enabled = index > 1, reason = "já é o primeiro" },
-    { label = "Mover para baixo", key = "down", enabled = index < #state.params, reason = "já é o último" },
-    { label = "Remover", key = "remove" },
+    { label = ("Rename (current: %s)"):format(p.name), key = "rename" },
+    { label = ("Change type (current: %s)"):format(p.type), key = "type" },
+    { label = "Move up", key = "up", enabled = index > 1, reason = "already first" },
+    { label = "Move down", key = "down", enabled = index < #state.params, reason = "already last" },
+    { label = "Remove", key = "remove" },
   }
   ui.menu(entries, ("Java: Signature — %s %s"):format(p.type, p.name), function(entry)
     if entry.key == "rename" then
-      ui.ask("Java: Signature — novo nome do parâmetro: ", p.name, function(name)
+      ui.ask("Java: Signature — new parameter name: ", p.name, function(name)
         if name == nil then
           return reopen()
         end
         name = vim.trim(name)
         if not valid_name(name) then
-          ui.notify("nome inválido: " .. name, vim.log.levels.WARN)
+          ui.notify("invalid name: " .. name, vim.log.levels.WARN)
           return reopen()
         end
         for i, other in ipairs(state.params) do
           if i ~= index and other.name == name then
-            ui.notify("já existe parâmetro chamado " .. name, vim.log.levels.WARN)
+            ui.notify("a parameter named " .. name .. " already exists", vim.log.levels.WARN)
             return reopen()
           end
         end
@@ -168,13 +168,13 @@ local function edit_param(state, index, reopen)
         reopen()
       end)
     elseif entry.key == "type" then
-      ui.ask("Java: Signature — novo tipo: ", p.type, function(typ)
+      ui.ask("Java: Signature — new type: ", p.type, function(typ)
         if typ == nil then
           return reopen()
         end
         typ = vim.trim(typ)
         if typ == "" then
-          ui.notify("tipo vazio", vim.log.levels.WARN)
+          ui.notify("empty type", vim.log.levels.WARN)
           return reopen()
         end
         p.type = typ
@@ -195,22 +195,22 @@ end
 
 local function open_menu(state, bufnr, on_edit)
   local entries = {
-    { label = "Editar parâmetro…", key = "param", enabled = #state.params > 0, reason = "método sem parâmetros" },
-    { label = "Adicionar parâmetro…", key = "add" },
-    { label = "Renomear método…", key = "method_name" },
-    { label = "Mudar tipo de retorno…", key = "return_type" },
-    { label = "Mudar visibilidade…", key = "visibility" },
+    { label = "Edit parameter…", key = "param", enabled = #state.params > 0, reason = "method has no parameters" },
+    { label = "Add parameter…", key = "add" },
+    { label = "Rename method…", key = "method_name" },
+    { label = "Change return type…", key = "return_type" },
+    { label = "Change visibility…", key = "visibility" },
     {
-      label = "Delegar assinatura antiga (@Deprecated): " .. (state.delegate and "sim" or "não"),
+      label = "Delegate old signature (@Deprecated): " .. (state.delegate and "yes" or "no"),
       key = "delegate",
     },
     {
-      label = "✔ Aplicar mudança de assinatura",
+      label = "✔ Apply signature change",
       key = "apply",
       enabled = changed(state),
-      reason = "assinatura inalterada",
+      reason = "signature unchanged",
     },
-    { label = "✖ Cancelar", key = "cancel" },
+    { label = "✖ Cancel", key = "cancel" },
   }
 
   ui.menu(entries, "Java: Signature — " .. signature_text(state), function(entry)
@@ -226,22 +226,22 @@ local function open_menu(state, bufnr, on_edit)
         end
       end)
     elseif entry.key == "add" then
-      ui.ask("Java: Signature — novo parâmetro (tipo nome): ", "", function(value)
+      ui.ask("Java: Signature — new parameter (type name): ", "", function(value)
         if value == nil then
           return reopen()
         end
         local typ, name = vim.trim(value):match("^(.-)%s+([%w_$]+)$")
         if not typ or typ == "" or not valid_name(name) then
-          ui.notify("use o formato: tipo nome", vim.log.levels.WARN)
+          ui.notify("use the format: type name", vim.log.levels.WARN)
           return reopen()
         end
         for _, other in ipairs(state.params) do
           if other.name == name then
-            ui.notify("já existe parâmetro chamado " .. name, vim.log.levels.WARN)
+            ui.notify("a parameter named " .. name .. " already exists", vim.log.levels.WARN)
             return reopen()
           end
         end
-        ui.ask("Java: Signature — valor nas chamadas existentes: ", suggested_default(typ), function(def)
+        ui.ask("Java: Signature — value in existing calls: ", suggested_default(typ), function(def)
           if def == nil then
             return reopen()
           end
@@ -259,40 +259,36 @@ local function open_menu(state, bufnr, on_edit)
         end)
       end)
     elseif entry.key == "method_name" then
-      ui.ask("Java: Signature — novo nome do método: ", state.method_name, function(name)
+      ui.ask("Java: Signature — new method name: ", state.method_name, function(name)
         if name == nil then
           return reopen()
         end
         name = vim.trim(name)
         if not valid_name(name) then
-          ui.notify("nome inválido: " .. name, vim.log.levels.WARN)
+          ui.notify("invalid name: " .. name, vim.log.levels.WARN)
           return reopen()
         end
         state.method_name = name
         reopen()
       end)
     elseif entry.key == "return_type" then
-      ui.ask("Java: Signature — novo tipo de retorno: ", state.return_type, function(typ)
+      ui.ask("Java: Signature — new return type: ", state.return_type, function(typ)
         if typ == nil then
           return reopen()
         end
         typ = vim.trim(typ)
         if typ == "" then
-          ui.notify("tipo vazio", vim.log.levels.WARN)
+          ui.notify("empty type", vim.log.levels.WARN)
           return reopen()
         end
         state.return_type = typ
         reopen()
       end)
     elseif entry.key == "visibility" then
-      ui.pick_one(
-        { "public", "protected", "private", "(default)" },
-        "Java: Signature — visibilidade",
-        function(choice)
-          state.modifier = choice == "(default)" and "" or choice
-          reopen()
-        end
-      )
+      ui.pick_one({ "public", "protected", "private", "(default)" }, "Java: Signature — visibility", function(choice)
+        state.modifier = choice == "(default)" and "" or choice
+        reopen()
+      end)
     elseif entry.key == "delegate" then
       state.delegate = not state.delegate
       reopen()
@@ -302,13 +298,13 @@ local function open_menu(state, bufnr, on_edit)
   end)
 end
 
----Fluxo completo: info -> menu de edição -> java/getRefactorEdit -> on_edit(edit).
+---Full flow: info -> edit menu -> java/getRefactorEdit -> on_edit(edit).
 ---@param bufnr number
 ---@param on_edit fun(edit: table)
 function M.change_signature(bufnr, on_edit)
   local client, client_reason = lsp.client_or_reason(bufnr)
   if not client then
-    ui.notify(client_reason or "jdtls não está anexado a este buffer", vim.log.levels.ERROR)
+    ui.notify(client_reason or "jdtls is not attached to this buffer", vim.log.levels.ERROR)
     return
   end
   if not ui.same_buffer(bufnr) then
@@ -322,12 +318,12 @@ function M.change_signature(bufnr, on_edit)
   client:request("java/getChangeSignatureInfo", context, function(err, info)
     vim.schedule(function()
       if err then
-        ui.notify("não consegui ler a assinatura: " .. (err.message or vim.inspect(err)), vim.log.levels.ERROR)
+        ui.notify("could not read the signature: " .. (err.message or vim.inspect(err)), vim.log.levels.ERROR)
         return
       end
       if not info or info.errorMessage then
         ui.notify(
-          "change signature indisponível: " .. tostring(info and info.errorMessage or "sem método na posição"),
+          "change signature unavailable: " .. tostring(info and info.errorMessage or "no method at the cursor"),
           vim.log.levels.WARN
         )
         return
@@ -336,7 +332,7 @@ function M.change_signature(bufnr, on_edit)
         return
       end
       if vim.b[bufnr].changedtick ~= tick then
-        ui.notify("o buffer mudou desde a abertura do menu — refaça o Change Signature", vim.log.levels.WARN)
+        ui.notify("the buffer changed since the menu was opened — run Change Signature again", vim.log.levels.WARN)
         return
       end
 
@@ -356,7 +352,7 @@ function M.change_signature(bufnr, on_edit)
   end, bufnr)
 end
 
--- expostos para testes
+-- exposed for tests
 M._changed = changed
 M._signature_text = signature_text
 

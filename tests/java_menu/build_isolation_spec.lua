@@ -114,12 +114,12 @@ build.build()
 local stop_entry = entry("stop")
 assert(stop_entry.enabled, "Stop deveria aparecer com processo ativo (de outro projeto)")
 assert(stop_entry.label:find("alpha", 1, true), "Stop não identifica a origem: " .. stop_entry.label)
-assert(stop_entry.reason:find("outro projeto", 1, true), "Stop não avisa que é de outro projeto")
+assert(stop_entry.reason:find("another project", 1, true), "Stop não avisa que é de outro projeto")
 local output_entry = entry("output")
 assert(output_entry.label:find("alpha", 1, true), "Show Last Output não identifica a origem")
 menu_cb(stop_entry)
-assert(last_pick_prompt:find("outro projeto", 1, true), "Stop entre projetos deveria pedir confirmação")
-pick_script = { "não" }
+assert(last_pick_prompt:find("another project", 1, true), "Stop entre projetos deveria pedir confirmação")
+pick_script = { "No" }
 -- a escolha "não" acontece dentro do pick_one; reabre o fluxo
 build.build()
 menu_cb(entry("stop"))
@@ -127,7 +127,7 @@ assert(build._state.running, "processo de A foi encerrado sem escolha explícita
 assert(pid_alive(pid_a), "processo de A morreu sem confirmação")
 
 -- 3. escolha explícita "sim" encerra o processo de A
-pick_script = { "sim" }
+pick_script = { "Yes" }
 build.build()
 menu_cb(entry("stop"))
 assert(
@@ -137,7 +137,7 @@ assert(
   "processo de A não encerrou após confirmação"
 )
 assert(not pid_alive(pid_a), "árvore do processo de A sobreviveu ao Stop")
-assert(has_notice("alpha encerrado"), "encerramento entre projetos não avisou a origem")
+assert(has_notice("alpha project process was stopped"), "encerramento entre projetos não avisou a origem")
 
 -- 4. processo externo (não iniciado pelo menu) nunca é encerrado
 local external = vim.fn.jobstart({ "sleep", "30" })
@@ -151,7 +151,7 @@ assert(
   end),
   "segundo build em A não iniciou"
 )
-pick_script = { "sim" }
+pick_script = { "Yes" }
 build.build()
 menu_cb(entry("stop"))
 assert(
@@ -168,7 +168,7 @@ open_main(root_b .. "/src/main/java/com/iso/beta/Main.java")
 build.build()
 local repeat_entry = entry("repeat")
 assert(repeat_entry.enabled == false, "Repeat deveria estar desabilitado em B sem build prévio")
-assert(repeat_entry.reason:find("nenhum build anterior", 1, true), "motivo do repeat divergiu")
+assert(repeat_entry.reason:find("no previous build", 1, true), "motivo do repeat divergiu")
 -- build em B registra o last de B
 menu_cb(entry("compile"))
 assert(
@@ -177,7 +177,7 @@ assert(
   end),
   "build de B não iniciou"
 )
-pick_script = { "sim" }
+pick_script = { "Yes" }
 build.build()
 menu_cb(entry("stop"))
 assert(

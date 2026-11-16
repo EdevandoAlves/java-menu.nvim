@@ -109,7 +109,7 @@ package.loaded["jc.jdtls"] = {
 local bad_parts = jca.replace_import_api()
 local bad_fqns, bad_err = bad_parts.filter_type_symbols({}, "List")
 assert(
-  bad_fqns == nil and bad_err:find("inesperado", 1, true),
+  bad_fqns == nil and bad_err:find("unexpected", 1, true),
   "contrato de retorno não validado: " .. tostring(bad_err)
 )
 package.loaded["jc.jdtls"] = nil
@@ -123,12 +123,12 @@ package.loaded["jc.test"] = {
   end,
 }
 local _, pkg_err = jca.test_discovery_api().package_tests("/x")
-assert(pkg_err and pkg_err:find("inesperado", 1, true), "contrato do _package_tests não validado")
+assert(pkg_err and pkg_err:find("unexpected", 1, true), "contrato do _package_tests não validado")
 package.loaded["jc.test"] = nil
 
 package.loaded["jc.import_style"] = { order = { 42 } }
 local _, order_err = jca.import_style()
-assert(order_err and order_err:find("não-string", 1, true), "order não-string não validada")
+assert(order_err and order_err:find("non-string", 1, true), "order não-string não validada")
 package.loaded["jc.import_style"] = nil
 
 package.loaded["jc.settings"] = {
@@ -138,7 +138,7 @@ package.loaded["jc.settings"] = {
   write_project = function() end,
 }
 local _, settings_err = jca.read_build_last()
-assert(settings_err and settings_err:find("inesperado", 1, true), "build-last não-string não validado")
+assert(settings_err and settings_err:find("unexpected", 1, true), "build-last não-string não validado")
 package.loaded["jc.settings"] = nil
 
 -- ---------- 5. erro em API interna (mock) ----------
@@ -156,7 +156,7 @@ package.loaded["jc.jdtls"] = {
 local err_parts = jca.replace_import_api()
 local _, boom = err_parts.filter_type_symbols({}, "List")
 assert(
-  boom and boom:find("boom", 1, true) and boom:find("falhou", 1, true),
+  boom and boom:find("boom", 1, true) and boom:find("failed", 1, true),
   "erro interno sem mensagem clara: " .. tostring(boom)
 )
 package.loaded["jc.jdtls"] = nil
@@ -169,7 +169,7 @@ package.loaded["jc.settings"] = {
 }
 local _, disk_err = jca.read_build_last()
 assert(
-  disk_err and disk_err:find("disk", 1, true) and disk_err:find("falhou", 1, true),
+  disk_err and disk_err:find("disk", 1, true) and disk_err:find("failed", 1, true),
   "erro do jc.settings sem mensagem clara"
 )
 package.loaded["jc.settings"] = nil

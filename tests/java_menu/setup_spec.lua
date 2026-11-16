@@ -75,7 +75,7 @@ vim.keymap.set("n", prefix .. "n", function() end, { desc = "meu mapa pessoal" }
 notices = {}
 jm.setup({ prefix = prefix })
 assert(
-  last_notice():find("conflito", 1, true) ~= nil and last_notice():find(prefix .. "n", 1, true) ~= nil,
+  last_notice():find("conflict", 1, true) ~= nil and last_notice():find(prefix .. "n", 1, true) ~= nil,
   "conflito não informado: " .. last_notice()
 )
 local mine = vim.fn.maparg(prefix .. "n", "n", false, true)
@@ -105,7 +105,7 @@ vim.cmd("JavaMenu")
 assert(last_notice():find("JavaMenu <", 1, true) ~= nil, ":JavaMenu sem args não orientou o uso")
 local ok_trig, err_trig = pcall(jm.trigger, "inexistente")
 assert(
-  not ok_trig and tostring(err_trig):find("ação desconhecida", 1, true),
+  not ok_trig and tostring(err_trig):find("unknown action", 1, true),
   "trigger de ação desconhecida não falhou claramente"
 )
 
@@ -113,7 +113,7 @@ assert(
 
 local ok, err = pcall(jm.setup, { prefix = 42 })
 assert(
-  not ok and tostring(err):find("prefix deve ser string", 1, true),
+  not ok and tostring(err):find("prefix must be a string", 1, true),
   "prefix não-string não rejeitado: " .. tostring(err)
 )
 
@@ -131,7 +131,7 @@ if jc_loaded ~= nil then
 end
 assert(not ok, "setup sem jc.nvim deveria falhar")
 assert(
-  tostring(err):find("dependência obrigatória", 1, true) ~= nil and tostring(err):find("jc.nvim", 1, true) ~= nil,
+  tostring(err):find("required dependency", 1, true) ~= nil and tostring(err):find("jc.nvim", 1, true) ~= nil,
   "erro sem jc.nvim não é claro: " .. tostring(err)
 )
 

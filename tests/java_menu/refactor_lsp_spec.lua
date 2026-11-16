@@ -25,6 +25,14 @@ end
 assert(vim.fn.filereadable(jdtls_bin) == 1, "jdtls não está disponível")
 
 local root, widget_file = fixtures.maven_project("refactor-reg", "com.demo.ref", "Widget")
+-- package de destino real para o Move Class (precisa existir/indexar)
+local dest_dir = root .. "/src/main/java/com/demo/dest"
+vim.fn.mkdir(dest_dir, "p")
+vim.fn.writefile({
+  "package com.demo.dest;",
+  "",
+  "public class Placeholder {}",
+}, dest_dir .. "/Placeholder.java")
 -- referência cruzada: Main importa Widget e cria uma instância
 local main_file = root .. "/src/main/java/com/demo/ref/Main.java"
 vim.fn.writefile(
@@ -47,6 +55,10 @@ public class Main {
 
 local function read(path)
   return table.concat(vim.fn.readfile(path), "\n")
+end
+
+local function text()
+  return table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
 end
 
 local function open(path)
@@ -96,18 +108,18 @@ ui.pick_one = function(items, prompt, cb)
         return
       end
     end
-  elseif prompt:find("mover", 1, true) then
+  elseif prompt:find("move", 1, true) then
     for _, item in ipairs(items) do
       if
         item:find(destination_pattern, 1, true)
-        and not item:find("indisponível", 1, true)
-        and not item:find("já é o package atual", 1, true)
+        and not item:find("unavailable", 1, true)
+        and not item:find("already the current package", 1, true)
       then
         cb(item)
         return
       end
     end
-  elseif prompt == "Java: Preview — alterações" then
+  elseif prompt == "Java: Preview — changes" then
     preview_opened = true
     for _, item in ipairs(items) do
       if item:find(preview_choice, 1, true) then
@@ -230,14 +242,14 @@ cursor_on_class(widget_file, "Widget")
 notices = {}
 menu_choice = "Rename Symbol"
 ask_value = "Unsaved"
-preview_choice = "✔ Aplicar alterações"
+preview_choice = "✔ Apply changes"
 preview_opened = false
 refactor.refactor()
 fixtures.wait_for(30000, function()
-  return preview_opened and has_notice("não apliquei")
+  return preview_opened and has_notice("not applied")
 end)
 assert(preview_opened, "preview do rename bloqueado não abriu")
-assert(has_notice("não apliquei"), "bloqueio do buffer modificado não apareceu: " .. vim.inspect(notices))
+assert(has_notice("not applied"), "bloqueio do buffer modificado não apareceu: " .. vim.inspect(notices))
 assert(vim.fn.filereadable(blocked_target) == 0, "bloqueio criou o destino")
 assert(read(widget_file):find("class Widget", 1, true) ~= nil, "bloqueio alterou a origem")
 vim.bo[stale].modified = false
@@ -261,13 +273,17 @@ end)
 assert(reattached, "o buffer renomeado não herdou o cliente JDTLS")
 vim.cmd("silent wa")
 assert(read(renamed_file):find("class WidgetRenamed", 1, true) ~= nil, "rename não persistiu após :wa")
+-- deixa o jdtls reconciliar Main.java antes do move (o move precisa editar a referência)
+vim.wait(2500, function()
+  return false
+end, 100)
 
 -- 3. Move Class abre destinos por source root e o cancelamento não altera nada
 cursor_on_class(renamed_file, "WidgetRenamed")
 notices = {}
 menu_choice = "Move Class"
 destination_pattern = "[src/main/java]"
-preview_choice = "✖ Cancelar"
+preview_choice = "✖ Cancel"
 preview_opened = false
 local before = read(renamed_file)
 refactor.refactor()
@@ -275,9 +291,260 @@ fixtures.wait_for(30000, function()
   return preview_opened
 end)
 assert(preview_opened, "preview do Move Class não abriu")
-assert(has_notice("refatoração cancelada"), "cancelamento do Move não avisou")
+assert(has_notice("refactoring cancelled"), "cancelamento do Move não avisou")
 assert(read(renamed_file) == before, "cancelamento do Move alterou a origem")
 assert(vim.fn.filereadable(renamed_file) == 1, "cancelamento do Move removeu a origem")
+
+-- 4. Move Class aplicado: package/diretório/declaração/referências corretos
+local moved_file = dest_dir .. "/WidgetRenamed.java"
+cursor_on_class(renamed_file, "WidgetRenamed")
+notices = {}
+menu_choice = "Move Class"
+destination_pattern = "com.demo.dest"
+preview_choice = "✔ Apply changes"
+preview_opened = false
+refactor.refactor()
+assert(
+  fixtures.wait_for(30000, function()
+    return preview_opened and vim.fn.filereadable(moved_file) == 1
+  end),
+  "Move Class não aplicou o destino; notices: " .. vim.inspect(notices)
+)
+assert(not has_notice("preview blocked"), "prévia bloqueou um move válido: " .. vim.inspect(notices))
+vim.cmd("silent wa")
+assert(vim.fn.filereadable(renamed_file) == 0, "Move deixou a origem em disco")
+local moved_text = read(moved_file)
+assert(moved_text:find("package com.demo.dest;", 1, true) ~= nil, "package não foi atualizado:\n" .. moved_text)
+assert(moved_text:find("class WidgetRenamed", 1, true) ~= nil, "declaração da classe sumiu:\n" .. moved_text)
+local main_text = read(renamed_main)
+assert(
+  main_text:find("import com.demo.dest.WidgetRenamed;", 1, true) ~= nil,
+  "referência/import não foi atualizado:\n" .. main_text
+)
+
+-- compilação Java real de todo o projeto após o move
+local java_files = vim.fn.glob(root .. "/src/main/java/**/*.java", false, true)
+assert(#java_files > 0, "nenhum fonte Java para compilar após o move")
+vim.fn.mkdir(root .. "/target/classes", "p")
+local compile_out = vim.fn.system(vim.list_extend({
+  "javac",
+  "--release",
+  "21",
+  "-d",
+  root .. "/target/classes",
+}, java_files))
+assert(vim.v.shell_error == 0, "javac falhou após Move Class:\n" .. compile_out)
+
+-- 5. Extract Constant real: cenário elegível, mesmo caminho do menu Visual
+local const_file = root .. "/src/main/java/com/demo/ref/ConstUse.java"
+vim.fn.writefile({
+  "package com.demo.ref;",
+  "",
+  "public class ConstUse {",
+  "    public int minutesPerDay() {",
+  "        return 24 * 60;",
+  "    }",
+  "}",
+}, const_file)
+open(const_file)
+jdtls.start_or_attach({
+  cmd = { jdtls_bin, "-data", root .. "-data" },
+  root_dir = root,
+  capabilities = lsp.capabilities(),
+})
+assert(
+  fixtures.wait_for(20000, function()
+    return lsp.client(vim.fn.bufnr(const_file)) ~= nil
+  end),
+  "ConstUse.java não anexou ao JDTLS"
+)
+vim.wait(3000, function()
+  return false
+end, 50)
+local const_ctx = {
+  bufnr = vim.api.nvim_get_current_buf(),
+  mode = "v",
+  start_line = 4,
+  start_col = 15,
+  end_line = 4,
+  end_col = 21,
+  tick = vim.b[vim.api.nvim_get_current_buf()].changedtick,
+}
+refactor._run_extract(const_ctx, "extract_constant")
+assert(
+  fixtures.wait_for(20000, function()
+    local current = text()
+    return current:find("private static final int INT = 24 * 60;", 1, true) ~= nil
+      and current:find("return INT;", 1, true) ~= nil
+  end),
+  "Extract Constant não aplicou a refatoração; buffer:\n" .. text()
+)
+vim.cmd("silent write")
+
+-- 6. Static Import real: o quick assist do jdtls exige range do membro
+local static_file = root .. "/src/main/java/com/demo/ref/StaticUse.java"
+vim.fn.writefile({
+  "package com.demo.ref;",
+  "",
+  "public class StaticUse {",
+  "    public int max(int a, int b) {",
+  "        return Math.max(a, b);",
+  "    }",
+  "}",
+}, static_file)
+open(static_file)
+jdtls.start_or_attach({
+  cmd = { jdtls_bin, "-data", root .. "-data" },
+  root_dir = root,
+  capabilities = lsp.capabilities(),
+})
+assert(
+  fixtures.wait_for(20000, function()
+    return lsp.client(vim.fn.bufnr(static_file)) ~= nil
+  end),
+  "StaticUse.java não anexou ao JDTLS"
+)
+vim.wait(4000, function()
+  return false
+end, 50)
+vim.api.nvim_win_set_cursor(0, { 5, 20 }) -- sobre `max`
+local debug_range =
+  refactor._identifier_range(vim.api.nvim_get_current_buf(), lsp.client(vim.api.nvim_get_current_buf()).offset_encoding)
+refactor._static_import(true, vim.api.nvim_get_current_buf())
+assert(
+  fixtures.wait_for(20000, function()
+    local current = text()
+    return current:find("import static java.lang.Math.max;", 1, true) ~= nil
+      and current:find("return max(a, b);", 1, true) ~= nil
+  end),
+  "Static Import não aplicou o import/uso; range="
+    .. vim.inspect(debug_range)
+    .. " buffer="
+    .. vim.inspect(vim.api.nvim_buf_get_lines(0, 0, -1, false))
+)
+vim.cmd("silent write")
+
+-- cursor sobre o qualificador (`Math`) também resolve o membro
+local static_file2 = root .. "/src/main/java/com/demo/ref/StaticUse2.java"
+vim.fn.writefile({
+  "package com.demo.ref;",
+  "",
+  "public class StaticUse2 {",
+  "    public int max(int a, int b) {",
+  "        return Math.max(a, b);",
+  "    }",
+  "}",
+}, static_file2)
+open(static_file2)
+jdtls.start_or_attach({
+  cmd = { jdtls_bin, "-data", root .. "-data" },
+  root_dir = root,
+  capabilities = lsp.capabilities(),
+})
+assert(
+  fixtures.wait_for(20000, function()
+    return lsp.client(vim.fn.bufnr(static_file2)) ~= nil
+  end),
+  "StaticUse2.java não anexou ao JDTLS"
+)
+vim.wait(3000, function()
+  return false
+end, 50)
+vim.api.nvim_win_set_cursor(0, { 5, 15 })
+refactor._static_import(true, vim.api.nvim_get_current_buf())
+assert(
+  fixtures.wait_for(20000, function()
+    local current = text()
+    return current:find("import static java.lang.Math.max;", 1, true) ~= nil
+      and current:find("return max(a, b);", 1, true) ~= nil
+  end),
+  "Static Import com cursor no qualificador não aplicou"
+)
+vim.cmd("silent write")
+
+-- 7. Change Method Signature real continua funcionando
+local sig = root .. "/src/main/java/com/demo/ref/Sig.java"
+local sig_use = root .. "/src/main/java/com/demo/ref/SigUse.java"
+vim.fn.writefile({
+  "package com.demo.ref;",
+  "",
+  "public class Sig {",
+  "    public int calc(int a, int b) {",
+  "        return a + b;",
+  "    }",
+  "}",
+}, sig)
+vim.fn.writefile({
+  "package com.demo.ref;",
+  "",
+  "public class SigUse {",
+  "    public int use() {",
+  "        return new Sig().calc(1, 2);",
+  "    }",
+  "}",
+}, sig_use)
+open(sig)
+jdtls.start_or_attach({
+  cmd = { jdtls_bin, "-data", root .. "-data" },
+  root_dir = root,
+  capabilities = lsp.capabilities(),
+})
+assert(
+  fixtures.wait_for(20000, function()
+    return lsp.client(vim.fn.bufnr(sig)) ~= nil
+  end),
+  "Sig.java não anexou ao JDTLS"
+)
+vim.wait(3000, function()
+  return false
+end, 50)
+vim.api.nvim_win_set_cursor(0, { 4, 15 }) -- `calc`
+
+local signature = require("java_menu.signature")
+local menu_calls = 0
+local asks = { "int c", "0" }
+ui.menu = function(entries, _, cb)
+  menu_calls = menu_calls + 1
+  for _, item in ipairs(entries) do
+    if menu_calls == 1 and item.key == "add" then
+      cb(item)
+      return
+    elseif menu_calls > 1 and item.key == "apply" then
+      cb(item)
+      return
+    end
+  end
+end
+ui.ask = function(_, _, cb)
+  local value = table.remove(asks, 1)
+  cb(value)
+end
+local sig_edit
+signature.change_signature(vim.api.nvim_get_current_buf(), function(edit)
+  sig_edit = edit
+end)
+assert(
+  fixtures.wait_for(20000, function()
+    return sig_edit ~= nil
+  end),
+  "Change Signature não devolveu edit"
+)
+vim.lsp.util.apply_workspace_edit(sig_edit, lsp.client(vim.fn.bufnr(sig)).offset_encoding)
+vim.cmd("silent wa")
+assert(text():find("calc(int a, int b, int c)", 1, true) ~= nil, "assinatura não mudou:\n" .. text())
+assert(read(sig_use):find("calc(1, 2, 0)", 1, true) ~= nil, "chamada não foi atualizada:\n" .. read(sig_use))
+
+-- 8. compilação final do projeto após todas as refatorações
+local all_java = vim.fn.glob(root .. "/src/main/java/**/*.java", false, true)
+vim.fn.mkdir(root .. "/target/classes", "p")
+local final_out = vim.fn.system(vim.list_extend({
+  "javac",
+  "--release",
+  "21",
+  "-d",
+  root .. "/target/classes",
+}, all_java))
+assert(vim.v.shell_error == 0, "javac falhou após as refatorações:\n" .. final_out)
 
 print("refactor_lsp_spec: OK")
 vim.cmd("qa!")

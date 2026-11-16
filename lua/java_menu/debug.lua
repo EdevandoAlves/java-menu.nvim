@@ -1,7 +1,7 @@
 -- java_menu/debug.lua
 -- Debug Java via nvim-dap + java-debug (jdtls).
--- Não cria adaptador nem UI própria: reaproveita o adaptador registrado pelo
--- usuário junto ao nvim-jdtls (LspAttach) e reutiliza nvim-dap.
+-- Does not create its own adapter or UI: reuses the adapter registered by the
+-- user with nvim-jdtls (LspAttach) and reuses nvim-dap.
 
 local ui = require("java_menu.ui")
 local lsp = require("java_menu.lsp")
@@ -48,21 +48,21 @@ local function launch_configs()
   return out
 end
 
--- ---------- projeto do buffer (M4: main de projeto errado) ----------
+-- ---------- buffer project (wrong-project main) ----------
 
 local function real(path)
   local r = vim.uv.fs_realpath(path)
   return r and vim.fs.normalize(r) or vim.fs.normalize(path)
 end
 
----`path` está dentro da subárvore de `parent`?
+---Is `path` inside the subtree of `parent`?
 local function subtree(parent, path)
   parent, path = real(parent), real(path)
   return parent == path or path:sub(1, #parent + 1) == parent .. "/"
 end
 
----Raízes consideradas "deste projeto": a raiz detectada pelo buffer mais as
----raízes de clientes jdtls da mesma árvore (agregador/módulo).
+---Roots considered "this project": the buffer-detected root plus the roots of
+---jdtls clients in the same tree (aggregator/module).
 ---@param bufnr number|nil
 ---@return string[]
 local function current_roots(bufnr)
@@ -91,10 +91,10 @@ local function current_roots(bufnr)
   return roots
 end
 
----Classifica uma launch config: "own" (deste projeto), "other" (outro projeto)
----ou "ambiguous" (sem metadados de projeto decisivos). Usa cwd, classPaths e
----modulePaths; projectName sozinho não prova pertencimento (dois projetos
----podem ter o mesmo nome) e o nome da classe nunca é usado como critério.
+---Classify a launch config: "own" (this project), "other" (another project)
+---or "ambiguous" (no decisive project metadata). Uses cwd, classPaths and
+---modulePaths; projectName alone does not prove ownership (two projects may
+---share a name) and the class name is never used as a criterion.
 ---@param config table
 ---@param roots string[]
 ---@return string "own"|"other"|"ambiguous"
@@ -127,7 +127,7 @@ local function classify_config(config, roots)
   return "ambiguous"
 end
 
----Launch configs separadas por pertencimento ao projeto do buffer.
+---Launch configs split by ownership of the buffer project.
 ---@param bufnr number|nil
 ---@return table[] own, table[] other, table[] ambiguous
 local function project_configs(bufnr)
@@ -146,7 +146,7 @@ local function project_configs(bufnr)
   return own, other, ambiguous
 end
 
--- ---------- buffer de contexto ----------
+-- ---------- context buffer ----------
 
 local DEBUG_FILETYPES = {
   ["dap-repl"] = true,
@@ -160,7 +160,7 @@ local DEBUG_FILETYPES = {
 
 local last_code_buf
 
----Buffer de código por trás do REPL/painéis do DAP (o menu pode ser aberto de lá).
+---Code buffer behind the DAP REPL/panels (the menu may be opened from there).
 local function context_buf()
   local cur = vim.api.nvim_get_current_buf()
   if not DEBUG_FILETYPES[vim.bo[cur].filetype] then
@@ -180,11 +180,11 @@ local function context_buf()
   return cur
 end
 
--- ---------- operações ----------
+-- ---------- operations ----------
 
 local function debug_main()
   if session() then
-    ui.notify("já existe uma sessão de debug ativa — encerre antes de iniciar outra", vim.log.levels.WARN)
+    ui.notify("a debug session is already active — stop it before starting another", vim.log.levels.WARN)
     return
   end
 
@@ -194,28 +194,25 @@ local function debug_main()
     if #other > 0 then
       ui.notify(
         #other
-          .. " main class(es) descoberta(s), mas de outro projeto — nada foi iniciado; abra um arquivo .java deste projeto",
+          .. " main class(es) discovered, but from another project — nothing was started; open a .java file from this project",
         vim.log.levels.WARN
       )
     elseif #ambiguous > 0 then
       ui.notify(
         #ambiguous
-          .. " configuração(ões) de launch sem metadados de projeto (ambíguas) — nada foi iniciado; abra um arquivo do projeto com o jdtls anexado e deixe o jdtls rediscover as main classes",
+          .. " launch configuration(s) without project metadata (ambiguous) — nothing was started; open a project file with jdtls attached and let jdtls rediscover the main classes",
         vim.log.levels.WARN
       )
     else
       ui.notify(
-        "nenhuma main class descoberta pelo jdtls — abra um arquivo .java do projeto com o jdtls anexado e reabra o menu",
+        "no main class discovered by jdtls — open a project .java file with jdtls attached and reopen the menu",
         vim.log.levels.WARN
       )
     end
     return
   end
   if #ambiguous > 0 then
-    ui.notify(
-      #ambiguous .. " configuração(ões) sem metadados de projeto foram ignoradas por segurança",
-      vim.log.levels.INFO
-    )
+    ui.notify(#ambiguous .. " configuration(s) without project metadata were ignored for safety", vim.log.levels.INFO)
   end
 
   local labels, by_label = {}, {}
@@ -230,7 +227,7 @@ local function debug_main()
       return
     end
     if session() then
-      ui.notify("já existe uma sessão de debug ativa", vim.log.levels.WARN)
+      ui.notify("a debug session is already active", vim.log.levels.WARN)
       return
     end
     dap().run(config)
@@ -239,17 +236,17 @@ end
 
 local function debug_test(kind)
   if session() then
-    ui.notify("já existe uma sessão de debug ativa — encerre antes de iniciar outra", vim.log.levels.WARN)
+    ui.notify("a debug session is already active — stop it before starting another", vim.log.levels.WARN)
     return
   end
   local ok, jdtls_dap = pcall(require, "jdtls.dap")
   if not ok then
-    ui.notify("jdtls.dap indisponível", vim.log.levels.ERROR)
+    ui.notify("jdtls.dap unavailable", vim.log.levels.ERROR)
     return
   end
   local fn = kind == "nearest" and jdtls_dap.test_nearest_method or jdtls_dap.test_class
   if type(fn) ~= "function" then
-    ui.notify("debug de teste não suportado por esta versão do nvim-jdtls", vim.log.levels.WARN)
+    ui.notify("test debugging is not supported by this nvim-jdtls version", vim.log.levels.WARN)
     return
   end
   pcall(fn, {})
@@ -257,7 +254,7 @@ end
 
 local function attach_jvm()
   if session() then
-    ui.notify("já existe uma sessão de debug ativa — encerre antes de anexar", vim.log.levels.WARN)
+    ui.notify("a debug session is already active — stop it before attaching", vim.log.levels.WARN)
     return
   end
 
@@ -269,13 +266,13 @@ local function attach_jvm()
     if host == "" then
       host = "127.0.0.1"
     end
-    ui.ask("Java: Debug — porta JDWP: ", "5005", function(port)
+    ui.ask("Java: Debug — JDWP port: ", "5005", function(port)
       if port == nil then
         return
       end
       local number = tonumber(vim.trim(port))
       if not number or number <= 0 or number > 65535 then
-        ui.notify("porta inválida: " .. tostring(port), vim.log.levels.WARN)
+        ui.notify("invalid port: " .. tostring(port), vim.log.levels.WARN)
         return
       end
       dap().run({
@@ -294,7 +291,7 @@ local function toggle_breakpoint(condition)
     dap().toggle_breakpoint()
     return
   end
-  ui.ask("Java: Debug — condição do breakpoint: ", "", function(value)
+  ui.ask("Java: Debug — breakpoint condition: ", "", function(value)
     if value == nil then
       return
     end
@@ -310,13 +307,13 @@ end
 local function stop_session()
   local sess = session()
   if not sess then
-    ui.notify("nenhuma sessão de debug ativa", vim.log.levels.WARN)
+    ui.notify("no active debug session", vim.log.levels.WARN)
     return
   end
   if is_attach(sess) then
-    -- JVM externa: apenas desconecta, nunca termina o processo
+    -- external JVM: only disconnect, never terminate the process
     dap().disconnect({ terminateDebuggee = false })
-    ui.notify("desconectado da JVM (o processo externo continua rodando)", vim.log.levels.INFO)
+    ui.notify("disconnected from the JVM (the external process keeps running)", vim.log.levels.INFO)
     return
   end
   dap().terminate({})
@@ -325,7 +322,7 @@ end
 local function float_elem(name)
   local ui_mod = dapui()
   if not ui_mod then
-    ui.notify("nvim-dap-ui não está instalado", vim.log.levels.WARN)
+    ui.notify("nvim-dap-ui is not installed", vim.log.levels.WARN)
     return
   end
   pcall(ui_mod.float_element, name)
@@ -333,7 +330,7 @@ end
 
 -- ---------- menu ----------
 
----Entrada do `<leader>jd`.
+---Entry point of `<leader>jd`.
 function M.debug()
   local bufnr = context_buf()
   local sess = session()
@@ -344,22 +341,22 @@ function M.debug()
 
   local function session_reason()
     if not ready then
-      return "java-debug não carregado (bundle não está no cliente jdtls — reinicie o Neovim)"
+      return "java-debug is not loaded (bundle is not in the jdtls client — restart Neovim)"
     end
     if not sess then
-      return "nenhuma sessão de debug ativa"
+      return "no active debug session"
     end
   end
 
   local function test_reason()
     if not ready then
-      return "java-debug não carregado (reinicie o Neovim)"
+      return "java-debug is not loaded (restart Neovim)"
     end
     if not attached then
-      return "jdtls não está anexado (o debug de teste usa o java-test do jdtls)"
+      return "jdtls is not attached (test debugging uses jdtls java-test)"
     end
     if not is_java then
-      return "abra o arquivo .java do teste"
+      return "open the test .java file"
     end
   end
 
@@ -368,18 +365,18 @@ function M.debug()
       key = "main",
       label = "Debug Main Class",
       enabled = ready and not sess and #project_configs(bufnr) > 0,
-      reason = (not ready and "java-debug não carregado (reinicie o Neovim)")
-        or (sess and "sessão de debug ativa")
-        or (function()
+      reason = (not ready and "java-debug is not loaded (restart Neovim)") or (sess and "active debug session") or (
+        function()
           local own, other, ambiguous = project_configs(bufnr)
           if #own == 0 and #other > 0 then
-            return "main class descoberta só em outro projeto"
+            return "main class discovered only in another project"
           end
           if #own == 0 and #ambiguous > 0 then
-            return "configuração(ões) de launch sem metadados de projeto"
+            return "launch configuration(s) without project metadata"
           end
-          return "nenhuma main class descoberta pelo jdtls"
-        end)(),
+          return "no main class discovered by jdtls"
+        end
+      )(),
     },
     {
       key = "test_nearest",
@@ -397,7 +394,7 @@ function M.debug()
       key = "attach",
       label = "Attach JVM (JDWP, loopback)",
       enabled = ready and not sess,
-      reason = (not ready and "java-debug não carregado (reinicie o Neovim)") or "sessão de debug ativa",
+      reason = (not ready and "java-debug is not loaded (restart Neovim)") or "active debug session",
     },
     { key = "toggle_bp", label = "Toggle Breakpoint", enabled = true },
     { key = "cond_bp", label = "Conditional Breakpoint", enabled = true },
@@ -415,14 +412,14 @@ function M.debug()
       key = "vars",
       label = "Inspect Variables",
       enabled = sess ~= nil and has_ui,
-      reason = (sess == nil and session_reason()) or "nvim-dap-ui não instalado",
+      reason = (sess == nil and session_reason()) or "nvim-dap-ui not installed",
     },
     { key = "repl", label = "Open Debug REPL", enabled = sess ~= nil, reason = session_reason() },
     {
       key = "stack",
       label = "Show Call Stack",
       enabled = sess ~= nil and has_ui,
-      reason = (sess == nil and session_reason()) or "nvim-dap-ui não instalado",
+      reason = (sess == nil and session_reason()) or "nvim-dap-ui not installed",
     },
     {
       key = "stop",
@@ -468,7 +465,7 @@ function M.debug()
   end)
 end
 
--- expostos para testes
+-- exposed for tests
 M._context_buf = context_buf
 M._launch_configs = launch_configs
 M._project_configs = project_configs

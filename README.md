@@ -1,4 +1,4 @@
-  # java-menu.nvim
+# java-menu.nvim
 
 **A contextual Java workflow interface for Neovim, built on top of [jc.nvim](https://github.com/artur-shaik/jc.nvim).**
 
@@ -28,10 +28,10 @@ java-menu.nvim is a menu layer for Java development in Neovim. Instead of rememb
 
 Under the hood, the Java work itself is done by jc.nvim and by the jdtls language server you already run. java-menu.nvim organizes those capabilities, adds a few workflows of its own — most notably a **preview-and-apply flow for WorkspaceEdit refactorings** (rename, move, change signature) with cancellation and safety checks — and stays out of the way otherwise.
 
-There is no screenshot here yet, so here is what using it looks like:
+A quick tour:
 
-1. Press `<leader>jg` in a class with fields. The Generate menu lists Constructor, Getter, Setter, Getter + Setter, `toString()`, `hashCode()`/`equals()`, Default Constructor and Abstract Methods. Unavailable entries (say, Abstract Methods in a concrete class) show why instead of failing.
-2. Pick `Constructor`. jc.nvim shows its usual field picker; the generated code lands in your buffer, with checks against duplicates already present in the class.
+1. Press `<leader>jg` in a class with fields. The Generate menu lists Constructor (Select Fields), All-Args Constructor, No-Args Constructor, Getter, Setter, Getter + Setter, `toString()`, `hashCode()`/`equals()` and Abstract Methods. Unavailable entries (say, Abstract Methods in a concrete class) show why instead of failing.
+2. Choose a constructor flow. **Constructor (Select Fields)** opens the multi-field picker; **All-Args Constructor** generates every eligible field immediately; **No-Args Constructor** reuses the previous default-constructor implementation and is blocked when a final field still needs initialization. Duplicate constructors are detected before insertion.
 3. Press `<leader>jr` and pick `Rename`. After jdtls computes the rename, a review menu lists every affected file with a diff-style preview. You can inspect each file, **Apply**, or **Cancel** — cancelling changes nothing.
 
 ## Relationship with jc.nvim
@@ -58,7 +58,7 @@ If you are happy driving jc.nvim's commands (`:JCgenerateConstructor`, `:JCimpor
 ![Create a Java class with java-menu.nvim](assets/class.gif)
 
 - **New** — wizard for Class, Abstract Class, Interface, Enum, Record, Annotation, Exception, Class with main, Singleton, Serializable and jc.nvim's template library (JUnit 5, Spring stereotypes, JPA entity, …). Project-aware package and source-root resolution, `extends`/`implements` search through jdtls when attached, fields with per-kind editing, and availability detection (JUnit/Spring/JPA) from the build file. Basic class creation works **without jdtls**.
-- **Generate** — constructors (field selection), default constructor, getters/setters, `toString()`, `hashCode()`/`equals()`, unimplemented abstract methods. Interactive selection via jc.nvim, with duplicate detection (an existing equivalent constructor or accessor set is offered for reuse/replacement instead of blindly appended). Requires one jdtls client.
+- **Generate** — Constructor (Select Fields), All-Args Constructor and No-Args Constructor, getters/setters, `toString()`, `hashCode()`/`equals()`, unimplemented abstract methods. All-Args consumes jdtls' eligible field list without a picker; No-Args keeps the previous default-constructor implementation and refuses to create an invalid constructor when a final field is uninitialized. Interactive selection via jc.nvim, with duplicate detection (an existing equivalent constructor or accessor set is offered for reuse/replacement instead of blindly appended). Requires one jdtls client.
 - **Refactor** — extract variable (also all occurrences), extract constant, extract method (visual mode), static import (also enum constants), flip call arguments, rename symbol, move class, and change signature. Rename, Move Class and Change Signature results go through the preview workflow before anything is written. The menu also lists Rename Package and Move Package, but both are permanently disabled: current jdtls offers no supported path for them (rename answers "not supported" for packages, and there is no `moveKind` for package moves) — the entries show that reason instead of pretending to work.
 - **Imports** — organize (smart, remembering your choices via jc.nvim), organize with candidate choice, add missing, remove unused, organize without reordering, replace import (pick among same-named types), import style presets, expand wildcard imports.
 - **Build / Run** — run a main class (classpath from jdtls), run a Spring Boot application, compile, package, clean, install, or pick a custom goal. Detects `mvnw`/`mvn`/`gradlew`/`gradle` per project (wrapper preferred), runs from the reactor root, scopes Maven runs with `-pl <module> -am` and Gradle runs with `:module:task`. Build output lives in its own buffer; repeat/stop/output are per project; stopping another project's build asks first.
@@ -188,7 +188,7 @@ Registered globally by `setup()` (not only in Java buffers). `<prefix>` is confi
 | Mode | Key | Action | Requirements |
 | --- | --- | --- | --- |
 | n | `<leader>jn` | New — class/interface/enum/record wizard | works without jdtls; type search needs jdtls |
-| n | `<leader>jg` | Generate — constructors, accessors, toString, equals/hashCode, abstract methods | jdtls attached |
+| n | `<leader>jg` | Generate — select/all-args/no-args constructors, accessors, toString, equals/hashCode, abstract methods | jdtls attached |
 | n / x | `<leader>jr` | Refactor — rename, move, extract, static import, flip args, change signature | jdtls attached (menu explains per entry) |
 | n | `<leader>ji` | Imports — organize, add/remove, replace, style, expand wildcards | jdtls attached |
 | n | `<leader>jb` | Build / Run — run main/spring, compile, package, goal chooser | Maven/Gradle on PATH or wrapper |
@@ -233,12 +233,14 @@ These keymaps belong to java-menu.nvim. jc.nvim ships its own separate command/m
 The repository ships a reproducible test suite (no framework; every spec runs in its own clean headless Neovim session, so no state carries between runs). It is not dependency-free: the fast specs need jc.nvim on the runtimepath, and the integration specs need a real jdtls binary, Maven, and nvim-dap with the java-debug bundle — the runner wires these up from your existing lazy.nvim plugin directory:
 
 ```sh
-tests/java_menu/run.sh fast         # 12 fast specs — no real server needed
-tests/java_menu/run.sh integration  # 4 specs with real JDTLS, DAP and Maven
+tests/java_menu/run.sh fast         # 13 fast specs — no real server needed
+tests/java_menu/run.sh integration  # 5 specs with real JDTLS, DAP and Maven
 tests/java_menu/run.sh all
 ```
 
-The integration suite attaches real jdtls clients to temporary Maven projects, performs real renames and generate-constructor calls, attaches nvim-dap, and runs a real `mvn -pl <module> -am compile`. Details, prerequisites, and failure interpretation are documented in [`tests/java_menu/README.md`](tests/java_menu/README.md).
+The integration suite attaches real jdtls clients to temporary Maven projects, performs real renames and generate-constructor calls, attaches nvim-dap, and runs a real `mvn -pl <module> -am compile`. Prerequisites and failure interpretation are documented in the runner and the spec headers.
+
+Current validation after the stability fixes: 13/13 fast specs and 5/5 integration specs pass locally, including real JDTLS generation of `toString()`, `equals()`/`hashCode()` and all three constructor flows, Move Class between Maven packages, Static Import, Extract Constant, Rename Symbol, Change Method Signature and the preview apply/cancel path.
 
 ## Credits
 

@@ -1,14 +1,14 @@
 -- java_menu/lsp.lua
--- Seleção do cliente JDTLS associado ao buffer de origem.
+-- JDTLS client selection for the source buffer.
 --
--- O jc.nvim resolve o cliente globalmente (`jc.lsp.get_jdtls_client()`), o que
--- funciona bem com um projeto por sessão, mas é ambíguo com dois projetos Java
--- independentes abertos ao mesmo tempo. Aqui o Java Menu escolhe o cliente
--- pelo buffer e usa APIs do Neovim; nenhum servidor é iniciado ou reconfigurado.
+-- jc.nvim resolves the client globally (`jc.lsp.get_jdtls_client()`), which is
+-- fine with one project per session but ambiguous with two independent Java
+-- projects open at once. The Java Menu selects the client by buffer and uses
+-- Neovim APIs; no server is started or reconfigured here.
 
 local M = {}
 
----Cliente JDTLS anexado ao buffer (nil quando não há cliente associado).
+---JDTLS client attached to the buffer (nil when there is no client).
 ---@param bufnr number|nil
 ---@return vim.lsp.Client|nil
 function M.client(bufnr)
@@ -20,32 +20,32 @@ function M.client(bufnr)
   return clients[1]
 end
 
----Cliente associado ao buffer + motivo legível quando não há cliente.
+---Client attached to the buffer plus a readable reason when there is none.
 ---@param bufnr number|nil
 ---@return vim.lsp.Client|nil client
 ---@return string|nil reason
 function M.client_or_reason(bufnr)
   bufnr = bufnr and bufnr > 0 and bufnr or vim.api.nvim_get_current_buf()
   if not vim.api.nvim_buf_is_valid(bufnr) then
-    return nil, "o buffer alvo não existe mais"
+    return nil, "the target buffer no longer exists"
   end
   local clients = vim.lsp.get_clients({ name = "jdtls", bufnr = bufnr })
   if #clients == 0 then
-    return nil, "jdtls não está anexado a este buffer"
+    return nil, "jdtls is not attached to this buffer"
   end
   return clients[1], nil
 end
 
----Encoding do cliente, com o padrão do nvim-jdtls quando indisponível.
+---Client encoding, with the nvim-jdtls default when unavailable.
 ---@param client vim.lsp.Client|nil
 ---@return string
 function M.encoding(client)
   return (client and client.offset_encoding) or "utf-16"
 end
 
----Capabilities do cliente LSP: usa as do blink.cmp quando o módulo está
----disponível (mescladas sobre as nativas); sem blink, usa só as nativas.
----Nada é instalado aqui e o completion de outras linguagens não é alterado.
+---LSP capabilities: use blink.cmp's when available (merged over the native
+---ones); without blink, native only. Nothing is installed here and completion
+---for other languages is untouched.
 ---@return table
 function M.capabilities()
   local capabilities = vim.lsp.protocol.make_client_capabilities()
@@ -56,12 +56,12 @@ function M.capabilities()
   return capabilities
 end
 
----Motivo para bloquear APIs do jc que resolvem o cliente globalmente.
----O jc chama `jc.lsp.get_jdtls_client()`/`executeCommand()` sem bufnr; com dois
----projetos Java abertos a escolha é ambígua. APIs desejadas no jc.nvim:
----`get_jdtls_client(bufnr)`, `jdtls_request(bufnr, ...)` já direcionado e
+---Reason to block jc APIs that resolve the client globally.
+---jc calls `jc.lsp.get_jdtls_client()`/`executeCommand()` without a bufnr; with
+---two Java projects open the choice is ambiguous. Desired upstream APIs:
+---`get_jdtls_client(bufnr)`, `jdtls_request(bufnr, ...)` already targeted, and
 ---`executeCommand(command, callback, { bufnr = bufnr })`.
----@param op string|nil rótulo da operação para a mensagem
+---@param op string|nil label of the operation for the message
 ---@return string|nil reason
 function M.jc_global_reason(op)
   local count = #vim.lsp.get_clients({ name = "jdtls" })
@@ -69,13 +69,13 @@ function M.jc_global_reason(op)
     return nil
   end
   local what = op and (" (" .. op .. ")") or ""
-  return ("operação do jc.nvim indisponível com %d projetos Java abertos%s: o jc resolve o cliente jdtls globalmente e não aceita bufnr/cliente nesta API"):format(
+  return ("jc.nvim operation unavailable with %d Java projects open%s: jc resolves the jdtls client globally and does not accept a bufnr/client in this API"):format(
     count,
     what
   )
 end
 
----Número de clientes JDTLS da sessão (para testes).
+---Number of JDTLS clients in the session (for tests).
 ---@return integer
 function M.global_count()
   return #vim.lsp.get_clients({ name = "jdtls" })

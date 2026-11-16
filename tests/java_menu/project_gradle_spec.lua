@@ -104,7 +104,7 @@ assert(vim.tbl_contains(rels_dynamic, "keepme"), "include estático perdido junt
 assert(not vim.tbl_contains(rels_dynamic, "dyn"), "literal de include dinâmico virou módulo")
 assert(not vim.tbl_contains(rels_dynamic, "moved"), "projectDir interpolado virou módulo")
 local note = project.discovery_limitation(dynamic)
-assert(note ~= nil and note:find("parcial", 1, true), "descoberta dinâmica deveria ser parcial: " .. tostring(note))
+assert(note ~= nil and note:find("partial", 1, true), "descoberta dinâmica deveria ser parcial: " .. tostring(note))
 assert(note:find("Gradle", 1, true), "nota não menciona Gradle: " .. note)
 
 -- 7. caminho lógico × caminho físico (consumidor de Build)

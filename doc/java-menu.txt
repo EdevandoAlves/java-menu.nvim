@@ -173,10 +173,13 @@ the build file. Basic class creation works without jdtls.
 
                                                               *java-menu-generate*
 Generate ~
-Constructor (field selection), default constructor, getters/setters,
-`toString()`, `hashCode()`/`equals()`, unimplemented abstract methods —
-via jc.nvim, with duplicate detection (an existing equivalent is offered
-for reuse/replacement instead of appended blindly).
+Constructor (Select Fields), All-Args Constructor and No-Args Constructor,
+getters/setters, `toString()`, `hashCode()`/`equals()`, unimplemented
+abstract methods — via jc.nvim, with duplicate detection (an existing
+equivalent is offered for reuse/replacement instead of appended blindly).
+All-Args uses jdtls' eligible field list without opening a picker; No-Args
+reuses the previous Default Constructor implementation and is blocked when
+a final field still requires initialization.
 
                                                               *java-menu-refactor*
 Refactor ~

@@ -162,7 +162,7 @@ end
 imports.imports()
 imports_menu_cb({ key = "organize_smart", label = "Organize Imports (smart)" })
 assert(
-  compat_has("indisponível com 2 projetos"),
+  compat_has("unavailable with 2 Java projects"),
   "bloqueio de ambiguidade não ocorreu: " .. table.concat(compat_notices, "; ")
 )
 -- o mesmo guard protege o Generate (runner de generate.lua)

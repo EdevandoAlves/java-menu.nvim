@@ -1,6 +1,6 @@
 -- java_menu/tests.lua
 -- <leader>jt: testes JUnit via neotest + adaptador do jc.nvim.
--- Nada de runner próprio: as operações delegam para as APIs públicas do jc
+-- No custom runner: operations delegate to jc public APIs
 -- (jc.test.*) e do neotest; o classpath/JDK continuam vindo do jdtls.
 
 local ui = require("java_menu.ui")
@@ -24,12 +24,12 @@ local function jc_test()
   end
 end
 
----FQN aproximado de um arquivo de teste (src/test/java/<pkg>/X.java).
+---Approximate FQN of a test file (src/test/java/<pkg>/X.java).
 local function test_fqn(path)
   return path:gsub(".*[/\\]src[/\\]test[/\\]java[/\\]", ""):gsub("%.java$", ""):gsub("[/\\]", ".")
 end
 
----Arquivos de teste do projeto (src/test/java), com FQN aproximado.
+---Project test files (src/test/java), with approximate FQNs.
 local function test_files(root)
   local files = vim.fn.glob(root .. "/**/src/test/java/**/*.java", true, true)
   local out = {}
@@ -42,11 +42,11 @@ local function test_files(root)
   return out
 end
 
----Roda um arquivo de teste pelo neotest usando o adaptador do jc.
+---Run a test file through neotest using the jc adapter.
 local function run_file(path)
   local nt = neotest()
   if not nt then
-    ui.notify("neotest não está disponível", vim.log.levels.ERROR)
+    ui.notify("neotest is not available", vim.log.levels.ERROR)
     return
   end
   local ok_target, target = pcall(require, "jc.neotest.target")
@@ -57,8 +57,8 @@ local function run_file(path)
   end)
 end
 
----Run Nearest; sem teste pareado, oferece os testes do package via Snacks
----(o fallback interno do jc usava vim.ui.select).
+---Run Nearest; without a paired test, offers the package tests through Snacks
+---(jc's internal fallback used vim.ui.select).
 local function run_nearest()
   local jc = jc_test()
   local path = vim.fn.expand("%:p")
@@ -85,7 +85,7 @@ local function run_nearest()
           labels[#labels + 1] = label
           by_label[label] = file
         end
-        ui.pick_one(labels, "Java: Tests — sem teste pareado (rodar do package)", function(choice)
+        ui.pick_one(labels, "Java: Tests — no paired test (run from package)", function(choice)
           local file = by_label[choice]
           if file then
             run_file(file)
@@ -94,7 +94,7 @@ local function run_nearest()
         return
       end
     elseif api_err then
-      -- versão do jc sem as internas de descoberta: segue para run_at_cursor
+      -- jc version without discovery internals: continue to run_at_cursor
       ui.notify(api_err, vim.log.levels.WARN)
     end
   end
@@ -107,7 +107,7 @@ end
 local function pick_test(root)
   local items = test_files(root)
   if #items == 0 then
-    ui.notify("nenhuma classe de teste em src/test/java", vim.log.levels.WARN)
+    ui.notify("no test class in src/test/java", vim.log.levels.WARN)
     return
   end
 
@@ -117,7 +117,7 @@ local function pick_test(root)
     by_label[item.label] = item
   end
 
-  ui.pick_one(labels, "Java: Tests — rodar teste", function(choice)
+  ui.pick_one(labels, "Java: Tests — run test", function(choice)
     local item = by_label[choice]
     if item then
       run_file(item.path)
@@ -125,12 +125,12 @@ local function pick_test(root)
   end)
 end
 
----Entrada do `<leader>jt`.
+---Entry point of `<leader>jt`.
 function M.tests()
   local bufnr = vim.api.nvim_get_current_buf()
   local root = project.root(bufnr)
   if not root then
-    ui.notify("nenhum projeto Maven/Gradle (pom.xml, build.gradle) a partir deste buffer", vim.log.levels.WARN)
+    ui.notify("no Maven/Gradle project (pom.xml, build.gradle) from this buffer", vim.log.levels.WARN)
     return
   end
 
@@ -142,14 +142,14 @@ function M.tests()
 
   if is_java and vim.bo[bufnr].modified then
     ui.notify(
-      "este buffer tem alterações não salvas: a descoberta de testes lê o arquivo do disco, então nomes/novos testes podem não aparecer até salvar",
+      "this buffer has unsaved changes: test discovery reads the file from disk, so new test names may not appear until you save",
       vim.log.levels.WARN
     )
   end
 
-  local no_neotest = "neotest não instalado"
-  local no_jdtls = "jdtls não está anexado (classpath de teste vem do jdtls)"
-  local no_jc = "jc.nvim não está carregado"
+  local no_neotest = "neotest is not installed"
+  local no_jdtls = "jdtls is not attached (test classpath comes from jdtls)"
+  local no_jc = "jc.nvim is not loaded"
 
   local function run_reason()
     if not nt then
@@ -182,17 +182,17 @@ function M.tests()
       key = "nearest",
       label = "Run Nearest Test",
       enabled = run_enabled and is_java,
-      reason = run_reason() or "abra um arquivo .java de teste",
+      reason = run_reason() or "open a test .java file",
     },
     {
       key = "file",
       label = "Run Test File",
       enabled = run_enabled and is_java,
-      reason = run_reason() or "abra um arquivo .java",
+      reason = run_reason() or "open a .java file",
     },
     {
       key = "suite",
-      label = "Run Test Suite" .. (multimodule and "  (multimódulo: enraíza no módulo atual)" or ""),
+      label = "Run Test Suite" .. (multimodule and "  (multi-module: roots at the current module)" or ""),
       enabled = run_enabled,
       reason = run_reason(),
     },
@@ -228,7 +228,7 @@ function M.tests()
     },
     {
       key = "precompile",
-      label = "Toggle Precompile (atual: " .. (precompile and "ON — maven/gradle" or "OFF — só jdtls") .. ")",
+      label = "Toggle Precompile (current: " .. (precompile and "ON — maven/gradle" or "OFF — jdtls only") .. ")",
       enabled = jc ~= nil,
       reason = no_jc,
     },
@@ -236,13 +236,13 @@ function M.tests()
       key = "goto_test",
       label = "Go to Test",
       enabled = goto_test_available and is_java,
-      reason = (not goto_test_available and "API do jc indisponível") or "abra um arquivo .java",
+      reason = (not goto_test_available and "jc API unavailable") or "open a .java file",
     },
   }
 
   ui.menu(entries, "Java: Tests", function(entry)
-    -- runs usam classpath/commands do jc/neotest, que resolvem o cliente
-    -- globalmente; stop/summary/output/goto_test não iniciam request no cliente
+    -- runs use jc/neotest classpath/commands, which resolve the client
+    -- globally; stop/summary/output/goto_test do not start a client request
     local run_keys = { nearest = true, file = true, suite = true, pick = true, last = true }
     if run_keys[entry.key] then
       local jc_guard = lsp.jc_global_reason("Tests")
@@ -258,7 +258,7 @@ function M.tests()
     elseif entry.key == "suite" then
       if multimodule then
         ui.notify(
-          "suite em multimódulo: o jc/neotest enraíza no módulo atual — use Pick Test ou Run Test File para os outros módulos",
+          "multi-module suite: jc/neotest roots at the current module — use Pick Test or Run Test File for other modules",
           vim.log.levels.WARN
         )
       end
@@ -281,7 +281,7 @@ function M.tests()
   end)
 end
 
--- expostos para testes
+-- exposed for tests
 M._test_files = test_files
 M._run_file = run_file
 

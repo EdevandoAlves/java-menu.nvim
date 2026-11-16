@@ -196,11 +196,11 @@ debug_menu.debug()
 main_entry = entry("main")
 assert(main_entry.enabled == false, "Debug Main deveria estar desabilitado sem configs do projeto")
 assert(
-  main_entry.reason:find("sem metadados de projeto", 1, true),
+  main_entry.reason:find("without project metadata", 1, true),
   "motivo da ambiguidade ausente: " .. tostring(main_entry.reason)
 )
 menu_cb(main_entry)
-assert(has_notice("nada foi iniciado"), "configuração ambígua não avisou: " .. vim.inspect(notices))
+assert(has_notice("nothing was started"), "configuração ambígua não avisou: " .. vim.inspect(notices))
 assert(#launched == 0, "configuração ambígua foi iniciada")
 
 -- H. Debug JUnit e Attach sem regressões (entradas e fluxo intactos)

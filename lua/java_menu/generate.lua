@@ -1,12 +1,12 @@
 -- java_menu/generate.lua
--- <leader>jg: menu Generate com seleção múltipla central (Snacks).
--- A geração do código Java continua sendo do jc.nvim/jdtls
--- (require("jc.jdtls").generate_*); este módulo só coleta os candidatos,
--- apresenta a seleção e checa duplicados.
+-- <leader>jg: Generate menu with central multi-selection (Snacks).
+-- Java code generation stays with jc.nvim/jdtls
+-- (require("jc.jdtls").generate_*); this module only collects candidates,
+-- presents the selection and checks duplicates.
 --
--- Nota: o seletor de campos do jc.nvim é um split de scratch buffer onde se
--- apagam linhas. Substituímos apenas essa UI por Snacks e reaproveitamos as
--- funções públicas do jc, que aceitam a lista de campos já escolhida.
+-- Note: jc.nvim's field picker is a scratch-buffer split where lines are
+-- deleted. Only that UI is replaced by Snacks; the public jc functions, which
+-- accept an already-selected field list, are reused.
 
 local ui = require("java_menu.ui")
 local lsp = require("java_menu.lsp")
@@ -16,21 +16,21 @@ local M = {}
 
 local notify = ui.notify
 
--- ---------- infraestrutura ----------
+-- ---------- infrastructure ----------
 
 local function jdtls_attached(bufnr)
   return ui.jdtls_attached(bufnr)
 end
 
----Executa `fn` com o buffer alvo como corrente (as funções do jc usam o
----buffer 0) e devolve o foco para onde o usuário estava. Se `tick` for dado,
----recusa a operação quando o buffer mudou desde o início do menu.
+---Run `fn` with the target buffer as current (jc functions use buffer 0) and
+---restore focus afterwards. When `tick` is given, refuse the operation if the
+---buffer changed since the menu was opened.
 local function in_buffer(bufnr, fn, tick)
   if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
     return
   end
   if tick and vim.b[bufnr].changedtick ~= tick then
-    notify("o buffer mudou durante a operação — refaça o Generate", vim.log.levels.WARN)
+    notify("the buffer changed during the operation — run Generate again", vim.log.levels.WARN)
     return
   end
 
@@ -71,7 +71,7 @@ local function range_params(bufnr, client)
   return vim.lsp.util.make_range_params(0, encoding)
 end
 
--- ---------- dados da classe (jdtls) ----------
+-- ---------- class data (jdtls) ----------
 
 local CLASS_KINDS = { [5] = true, [10] = true, [11] = true, [23] = true } -- Class, Enum, Interface, Struct
 local FIELD, METHOD, CONSTRUCTOR = 8, 6, 9
@@ -98,7 +98,7 @@ local function has_method(methods, name)
   return false
 end
 
----A classe declara um construtor sem parâmetros?
+---Does the class declare a no-args constructor?
 local function has_default_constructor(node, ctors)
   local class = node and node.name or ""
   for _, ctor in ipairs(ctors or {}) do
@@ -109,7 +109,7 @@ local function has_default_constructor(node, ctors)
   return false
 end
 
----Erasa genéricos: Map<String, List<Long>> -> Map
+---Erase generics: Map<String, List<Long>> -> Map
 local function erase_generics(t)
   local prev
   repeat
@@ -119,7 +119,7 @@ local function erase_generics(t)
   return (t:gsub("%s+", ""))
 end
 
----Construtor com os mesmos tipos (na ordem) já existe?
+---Does a constructor with the same types (in order) already exist?
 local function constructor_exists(node, ctors, fields)
   local types = {}
   for _, field in ipairs(fields) do
@@ -134,8 +134,8 @@ local function constructor_exists(node, ctors, fields)
   return false
 end
 
----"pending" (há método abstrato a implementar), "none" (diagnósticos
----publicados e nada pendente) ou "unknown" (jdtls ainda não publicou nada).
+---"pending" (an abstract method must be implemented), "none" (diagnostics
+---published and nothing pending) or "unknown" (jdtls has not published yet).
 local function abstract_state(bufnr)
   local diagnostics = vim.diagnostic.get(bufnr)
   if #diagnostics == 0 then
@@ -154,7 +154,7 @@ local function abstract_state(bufnr)
   return "none"
 end
 
----Coleta símbolos, acessores pendentes e status de construtores.
+---Collect symbols, pending accessors and constructor status.
 ---@param bufnr number
 ---@param cb fun(state: table)
 local function load_state(bufnr, cb)
@@ -162,6 +162,7 @@ local function load_state(bufnr, cb)
     bufnr = bufnr,
     tick = vim.b[bufnr].changedtick,
     fields = {},
+    field_nodes = {},
     methods = {},
     ctors = {},
     accessors = {},
@@ -170,7 +171,7 @@ local function load_state(bufnr, cb)
   }
   local client, reason = lsp.client_or_reason(bufnr)
   if not client then
-    notify(reason or "jdtls não está anexado a este buffer", vim.log.levels.WARN)
+    notify(reason or "jdtls is not attached to this buffer", vim.log.levels.WARN)
     cb(state)
     return
   end
@@ -197,6 +198,7 @@ local function load_state(bufnr, cb)
             state.ctors[#state.ctors + 1] = child
           elseif child.kind == FIELD then
             state.fields[#state.fields + 1] = { name = child.name }
+            state.field_nodes[child.name] = child
           end
         end
       else
@@ -231,10 +233,10 @@ local function load_state(bufnr, cb)
   end)
 end
 
--- ---------- seleção (Snacks) ----------
+-- ---------- selection (Snacks) ----------
 
----Seleção central com múltipla escolha (Space/Tab alternam; Enter sem seleção
----usa o item sob o cursor). Delegate para o componente compartilhado.
+---Central multi-choice selection (Space/Tab toggle; Enter without a
+---selection uses the item under the cursor). Delegates to the shared component.
 ---@param items table[] { text, data, idx }
 ---@param opts { title: string, allow_empty: boolean|nil }
 ---@param on_confirm fun(selected: table[])
@@ -249,14 +251,14 @@ end
 local pick_one = ui.pick_one
 
 local function confirm_replace(what, on_yes)
-  pick_one({ "Substituir " .. what, "Cancelar" }, "Java: Generate — " .. what .. " já existe", function(choice)
-    if choice == "Substituir " .. what then
+  pick_one({ "Replace " .. what, "Cancel" }, "Java: Generate — " .. what .. " already exists", function(choice)
+    if choice == "Replace " .. what then
       on_yes()
     end
   end)
 end
 
--- ---------- operações ----------
+-- ---------- operations ----------
 
 local function field_items(fields, suffix)
   local items = {}
@@ -270,9 +272,56 @@ local function field_items(fields, suffix)
   return items
 end
 
-local function constructor(state, default)
+---Constructor-eligible fields, in the order returned by jdtls.
+---@param state table
+---@return table[]
+local function constructor_fields(state)
+  return vim.tbl_filter(function(field)
+    return field.isStatic ~= true
+  end, state.ctor_fields or {})
+end
+
+---Final fields without an initializer must be assigned by every constructor;
+---an empty No-Args constructor would break compilation. The jdtls status lists
+---only those fields (initialized ones are left out), so we recognize `final`
+---in the field declaration.
+---@param state table
+---@return boolean
+local function has_pending_final_field(state)
+  local lines = vim.api.nvim_buf_get_lines(state.bufnr, 0, -1, false)
+  for _, field in ipairs(constructor_fields(state)) do
+    local node = state.field_nodes and state.field_nodes[field.name]
+    local range = node and (node.selectionRange or node.range)
+    if range then
+      local line = lines[range.start.line + 1] or ""
+      local prefix = line:sub(1, range.start.character)
+      if prefix:match("%f[%w]final%f[%W]") then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function generate_constructor(state, fields)
+  in_buffer(state.bufnr, function()
+    with_indent(state.bufnr, function()
+      require("jc.jdtls").generate_constructor(fields, {
+        default_constructor = false,
+        constructors = state.constructors,
+      })
+    end)
+  end, state.tick)
+end
+
+---@param mode string "select"|"all"|"none"
+local function constructor(state, mode)
   local bufnr = state.bufnr
-  if default then
+  if mode == "none" then
+    if has_pending_final_field(state) then
+      notify("there is a final field without an initializer; use a constructor with parameters", vim.log.levels.WARN)
+      return
+    end
     in_buffer(bufnr, function()
       with_indent(bufnr, function()
         require("jc.jdtls").generate_constructor({}, { default_constructor = true, constructors = state.constructors })
@@ -281,13 +330,22 @@ local function constructor(state, default)
     return
   end
 
-  local fields = state.ctor_fields
+  local fields = constructor_fields(state)
   if #fields == 0 then
-    notify("a classe não tem atributos para o construtor", vim.log.levels.WARN)
+    notify("the class has no fields for a constructor", vim.log.levels.WARN)
     return
   end
 
-  pick_multi(field_items(fields), { title = "Java: Generate — Constructor (selecione os campos)" }, function(selected)
+  if mode == "all" then
+    if constructor_exists(state.node, state.ctors, fields) then
+      notify("a constructor with all these parameters already exists", vim.log.levels.WARN)
+      return
+    end
+    generate_constructor(state, fields)
+    return
+  end
+
+  pick_multi(field_items(fields), { title = "Java: Generate — Constructor (select fields)" }, function(selected)
     if #selected == 0 then
       return
     end
@@ -296,17 +354,10 @@ local function constructor(state, default)
       chosen[#chosen + 1] = item.data
     end
     if constructor_exists(state.node, state.ctors, chosen) then
-      notify("já existe um construtor com esses parâmetros", vim.log.levels.WARN)
+      notify("a constructor with these parameters already exists", vim.log.levels.WARN)
       return
     end
-    in_buffer(bufnr, function()
-      with_indent(bufnr, function()
-        require("jc.jdtls").generate_constructor(chosen, {
-          default_constructor = false,
-          constructors = state.constructors,
-        })
-      end)
-    end, state.tick)
+    generate_constructor(state, chosen)
   end)
 end
 
@@ -337,10 +388,9 @@ local function accessors(state, mode)
         },
       }
     elseif mode == "set" and not can_set then
-      items[#items + 1] =
-        { text = text .. "  (indisponível: campo final ou setter existente)", idx = i, disabled = true }
+      items[#items + 1] = { text = text .. "  (unavailable: final field or existing setter)", idx = i, disabled = true }
     elseif mode == "get" and not can_get then
-      items[#items + 1] = { text = text .. "  (indisponível: getter existente)", idx = i, disabled = true }
+      items[#items + 1] = { text = text .. "  (unavailable: existing getter)", idx = i, disabled = true }
     end
   end
 
@@ -349,18 +399,18 @@ local function accessors(state, mode)
   end, items)
 
   if #available == 0 then
-    notify("nenhum campo disponível para " .. (mode == "both" and "getter/setter" or mode), vim.log.levels.WARN)
+    notify("no fields available for " .. (mode == "both" and "getter/setter" or mode), vim.log.levels.WARN)
     return
   end
 
   local title = "Java: Generate — "
     .. (mode == "both" and "Getter + Setter" or (mode == "get" and "Getter" or "Setter"))
 
-  pick_multi(items, { title = title .. " (selecione os campos)" }, function(selected)
+  pick_multi(items, { title = title .. " (select fields)" }, function(selected)
     local chosen = {}
     for _, item in ipairs(selected) do
       if item.disabled then
-        notify("campo sem acessor disponível na seleção", vim.log.levels.WARN)
+        notify("selected field has no available accessor", vim.log.levels.WARN)
       else
         chosen[#chosen + 1] = item.data
       end
@@ -385,10 +435,15 @@ local TOSTRING_STYLES = {
 
 local function tostring_op(state)
   local bufnr = state.bufnr
+  local client = state.client
+  if not client then
+    notify("jdtls is not attached to this buffer", vim.log.levels.WARN)
+    return
+  end
   in_buffer(bufnr, function()
-    client:request("java/checkToStringStatus", range_params(bufnr, state.client), function(err, resp)
+    client:request("java/checkToStringStatus", range_params(bufnr, client), function(err, resp)
       if not resp then
-        notify("checkToStringStatus falhou: " .. vim.inspect(err), vim.log.levels.WARN)
+        notify("checkToStringStatus failed: " .. vim.inspect(err), vim.log.levels.WARN)
         return
       end
 
@@ -397,40 +452,41 @@ local function tostring_op(state)
       end, resp.fields or {})
 
       if #fields == 0 then
-        notify("a classe não tem atributos para o toString()", vim.log.levels.WARN)
+        notify("the class has no fields for toString()", vim.log.levels.WARN)
         return
       end
 
-      pick_multi(
-        field_items(fields),
-        { title = "Java: Generate — toString() (selecione os campos)" },
-        function(selected)
-          if #selected == 0 then
-            return
-          end
-          local chosen = {}
-          for _, item in ipairs(selected) do
-            chosen[#chosen + 1] = item.data
-          end
-          pick_one(TOSTRING_STYLES, "Java: Generate — estilo do toString()", function(style)
-            in_buffer(bufnr, function()
-              with_indent(bufnr, function()
-                require("jc.jdtls").generate_toString(chosen, { code_style = style })
-              end)
-            end, state.tick)
-          end)
+      pick_multi(field_items(fields), { title = "Java: Generate — toString() (select fields)" }, function(selected)
+        if #selected == 0 then
+          return
         end
-      )
+        local chosen = {}
+        for _, item in ipairs(selected) do
+          chosen[#chosen + 1] = item.data
+        end
+        pick_one(TOSTRING_STYLES, ":toString() style", function(style)
+          in_buffer(bufnr, function()
+            with_indent(bufnr, function()
+              require("jc.jdtls").generate_toString(chosen, { code_style = style })
+            end)
+          end, state.tick)
+        end)
+      end)
     end)
   end)
 end
 
 local function equals_hashcode(state)
   local bufnr = state.bufnr
+  local client = state.client
+  if not client then
+    notify("jdtls is not attached to this buffer", vim.log.levels.WARN)
+    return
+  end
   in_buffer(bufnr, function()
-    client:request("java/checkHashCodeEqualsStatus", range_params(bufnr, state.client), function(err, resp)
+    client:request("java/checkHashCodeEqualsStatus", range_params(bufnr, client), function(err, resp)
       if not resp then
-        notify("checkHashCodeEqualsStatus falhou: " .. vim.inspect(err), vim.log.levels.WARN)
+        notify("checkHashCodeEqualsStatus failed: " .. vim.inspect(err), vim.log.levels.WARN)
         return
       end
 
@@ -439,14 +495,14 @@ local function equals_hashcode(state)
       end, resp.fields or {})
 
       if #fields == 0 then
-        notify("a classe não tem atributos para equals()/hashCode()", vim.log.levels.WARN)
+        notify("the class has no fields for equals()/hashCode()", vim.log.levels.WARN)
         return
       end
 
       local function choose()
         pick_multi(
           field_items(fields),
-          { title = "Java: Generate — equals() + hashCode() (selecione os campos)" },
+          { title = "Java: Generate — equals() + hashCode() (select fields)" },
           function(selected)
             if #selected == 0 then
               return
@@ -486,8 +542,11 @@ end
 local function operations(state)
   local methods = state.methods or {}
   local can = jdtls_attached(state.bufnr) and state.node ~= nil
-  local has_fields = #(state.ctor_fields or {}) > 0
+  local fields = constructor_fields(state)
+  local has_fields = #fields > 0
+  local full_constructor = has_fields and constructor_exists(state.node, state.ctors, fields)
   local has_any_field = #(state.fields or {}) > 0
+  local final_field_pending = has_pending_final_field(state)
 
   local getter, setter, both = false, false, false
   for _, entry in ipairs(state.accessors or {}) do
@@ -504,66 +563,78 @@ local function operations(state)
 
   local function reason(extra)
     if not jdtls_attached(state.bufnr) then
-      return "jdtls não está anexado a este buffer"
+      return "jdtls is not attached to this buffer"
     end
     if not state.node then
-      return "nenhuma classe Java reconhecida no buffer"
+      return "no recognized Java class in the buffer"
     end
-    return extra or "indisponível"
+    return extra or "unavailable"
   end
 
   return {
     {
       key = "constructor",
-      label = "Constructor",
+      label = "Constructor (Select Fields)",
       enabled = can and has_fields,
-      reason = reason("classe sem atributos para construtor"),
+      reason = reason("class has no fields for a constructor"),
     },
     {
-      key = "default_constructor",
-      label = "Default Constructor",
-      enabled = can and not has_default_constructor(state.node, state.ctors),
-      reason = has_default_constructor(state.node, state.ctors) and "já existe um construtor sem parâmetros"
-        or reason("indisponível"),
+      key = "all_args",
+      label = "All-Args Constructor",
+      enabled = can and has_fields and not full_constructor,
+      reason = full_constructor and "a constructor with all these parameters already exists"
+        or reason("class has no fields for a constructor"),
     },
-    { key = "getter", label = "Getter", enabled = can and getter, reason = reason("nenhum campo sem getter") },
+    {
+      key = "no_args",
+      label = "No-Args Constructor",
+      enabled = can and not has_default_constructor(state.node, state.ctors) and not final_field_pending,
+      reason = has_default_constructor(state.node, state.ctors) and "a no-args constructor already exists"
+        or (final_field_pending and "there is a final field without an initializer; use a constructor with parameters")
+        or reason("unavailable"),
+    },
+    { key = "getter", label = "Getter", enabled = can and getter, reason = reason("no field without a getter") },
     {
       key = "setter",
       label = "Setter",
       enabled = can and setter,
-      reason = reason("nenhum campo sem setter (final ou já tem)"),
+      reason = reason("no field without a setter (final or already present)"),
     },
-    { key = "both", label = "Getter + Setter", enabled = can and both, reason = reason("nenhum campo disponível") },
+    { key = "both", label = "Getter + Setter", enabled = can and both, reason = reason("no fields available") },
     {
       key = "tostring",
       label = "toString()",
       enabled = can and has_any_field and not has_method(methods, "toString"),
-      reason = has_method(methods, "toString") and "toString() já existe na classe" or reason("classe sem atributos"),
+      reason = has_method(methods, "toString") and "toString() already exists in the class"
+        or reason("class has no fields"),
     },
     {
       key = "equals_hashcode",
       label = "equals() + hashCode()",
       enabled = can and has_any_field,
-      reason = reason("classe sem atributos"),
+      reason = reason("class has no fields"),
     },
     {
       key = "abstract_methods",
       label = "Implement Abstract Methods",
-      -- diagnósticos chegam em ondas: só marcamos "nada pendente" quando o
-      -- jdtls está ocioso; caso contrário deixamos tentar (o jc avisa se não
-      -- houver nada a implementar)
+      -- diagnostics arrive in waves: only report "nothing pending" when jdtls
+      -- is idle; otherwise let the attempt run (jc warns when there is nothing
+      -- to implement)
       enabled = can and (abstract_state(state.bufnr) ~= "none" or jca.jdtls_busy()),
-      reason = can and "nenhum método abstrato pendente" or reason("indisponível"),
+      reason = can and "no pending abstract methods" or reason("unavailable"),
     },
   }
 end
 
 local RUNNERS = {
   constructor = function(state)
-    constructor(state, false)
+    constructor(state, "select")
   end,
-  default_constructor = function(state)
-    constructor(state, true)
+  all_args = function(state)
+    constructor(state, "all")
+  end,
+  no_args = function(state)
+    constructor(state, "none")
   end,
   getter = function(state)
     accessors(state, "get")
@@ -579,11 +650,11 @@ local RUNNERS = {
   abstract_methods = abstract_methods,
 }
 
----Entrada do `<leader>jg`.
+---Entry point of `<leader>jg`.
 function M.generate()
   local bufnr = vim.api.nvim_get_current_buf()
   if vim.bo[bufnr].filetype ~= "java" then
-    notify("Generate exige um buffer de classe Java", vim.log.levels.WARN)
+    notify("Generate requires a Java class buffer", vim.log.levels.WARN)
     return
   end
 
@@ -597,7 +668,7 @@ function M.generate()
       return
     end
     if not jdtls_attached(bufnr) then
-      notify("jdtls não está anexado a este buffer — geração desabilitada", vim.log.levels.WARN)
+      notify("jdtls is not attached to this buffer — generation disabled", vim.log.levels.WARN)
     end
 
     ui.menu(operations(state), "Java: Generate", function(entry)
@@ -609,8 +680,10 @@ function M.generate()
   end)
 end
 
--- expostos para testes
+-- exposed for tests
 M._operations = operations
 M._load_state = load_state
+M._constructor_fields = constructor_fields
+M._has_pending_final_field = has_pending_final_field
 
 return M

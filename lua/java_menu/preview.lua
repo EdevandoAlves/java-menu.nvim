@@ -1,10 +1,11 @@
 -- java_menu/preview.lua
--- Prévia e aplicação de WorkspaceEdit (rename/move) sem tocar em nada antes
--- da aprovação do usuário.
+-- WorkspaceEdit preview and application (rename/move) without touching
+-- anything before the user approves.
 --
--- Fluxo: normalize(edit) -> plan -> review (menu + diffs) -> apply
--- A prévia é calculada em buffers temporários (nunca no buffer real nem no
--- disco). A aplicação revalida ticks/conteúdo e só então altera buffers/arquivos.
+-- Flow: normalize(edit) -> plan -> review (menu + diffs) -> apply
+-- The preview is computed in temporary buffers (never in the real buffer or
+-- on disk). Application revalidates ticks/content and only then changes
+-- buffers/files.
 
 local ui = require("java_menu.ui")
 
@@ -12,8 +13,8 @@ local M = {}
 
 -- ---------- helpers ----------
 
----Normaliza com realpath quando possível; para caminho ainda inexistente,
----resolve o diretório real e mantém o basename (rename destino).
+---Normalize with realpath when possible; for a path that does not exist yet,
+---resolve the real directory and keep the basename (rename destination).
 ---@param path string
 ---@return string
 local function real_path(path)
@@ -29,7 +30,7 @@ local function real_path(path)
   return vim.fs.normalize(path)
 end
 
----Limite real de diretório: `/tmp/proj` não aceita `/tmp/proj2`.
+---Real directory boundary: `/tmp/proj` does not contain `/tmp/proj2`.
 ---@param root string
 ---@param path string
 ---@return boolean
@@ -49,7 +50,7 @@ local function inside_project(root, path)
   return real_path:sub(1, #real_root + #sep) == real_root .. sep
 end
 
----Buffer modificado apontando para `path`, mesmo quando o arquivo não existe.
+---Modified buffer pointing at `path`, even when the file does not exist.
 ---@param path string
 ---@return integer|nil
 local function modified_buffer_for(path)
@@ -72,26 +73,26 @@ local function relpath(root, path)
   return vim.fs.relpath(root, path) or path
 end
 
----Compara o documento indicado pelo servidor com o conteúdo usado no plano.
----A prévia não acompanha `OptionalVersionedTextDocumentIdentifier`; ela é
----calculada do estado atual. Portanto, só exige consistência entre os edits
----do mesmo URI.
+---Compare the document named by the server with the content used in the plan.
+---The preview does not track `OptionalVersionedTextDocumentIdentifier`; it is
+---computed from the current state. It therefore only requires consistency
+---between edits for the same URI.
 ---@param text_document table|nil
 ---@return string|nil reason
 local function document_version_error(text_document, _)
   if type(text_document) ~= "table" or type(text_document.uri) ~= "string" then
-    return "TextDocumentEdit sem textDocument.uri"
+    return "TextDocumentEdit without textDocument.uri"
   end
   return nil
 end
 
----Conteúdo do documento para validar na reaplicação: tick do buffer atual ou
----conteúdo do arquivo, o que foi usado na prévia.
+---Document content to validate on reapplication: current buffer tick or file
+---content, whichever the preview used.
 ---@param text_document table|nil
 ---@return string|nil reason
 local function document_content_error(text_document, plan)
   if type(text_document) ~= "table" or type(text_document.uri) ~= "string" then
-    return "TextDocumentEdit sem textDocument.uri"
+    return "TextDocumentEdit without textDocument.uri"
   end
   local path = path_of(text_document.uri)
   local file
@@ -102,26 +103,26 @@ local function document_content_error(text_document, plan)
     end
   end
   if not file then
-    return "documento sem prévia: " .. relpath(plan.root, path)
+    return "document without preview: " .. relpath(plan.root, path)
   end
   if file.bufnr and vim.api.nvim_buf_is_valid(file.bufnr) then
     if vim.b[file.bufnr].changedtick ~= file.tick then
-      return "buffer alterado desde a prévia: " .. relpath(plan.root, file.source_path or file.path)
+      return "buffer changed since the preview: " .. relpath(plan.root, file.source_path or file.path)
     end
     local now = vim.fn.readfile(file.source_path or file.path)
     if table.concat(now, "\n") ~= table.concat(file.before, "\n") then
-      return "arquivo alterado desde a prévia: " .. relpath(plan.root, file.source_path or file.path)
+      return "file changed since the preview: " .. relpath(plan.root, file.source_path or file.path)
     end
     return
   end
   local now = vim.fn.filereadable(file.source_path or file.path) == 1 and vim.fn.readfile(file.source_path or file.path)
     or nil
   if not now or table.concat(now, "\n") ~= table.concat(file.before, "\n") then
-    return "arquivo alterado desde a prévia: " .. relpath(plan.root, file.source_path or file.path)
+    return "file changed since the preview: " .. relpath(plan.root, file.source_path or file.path)
   end
 end
 
----Conteúdo atual do documento: buffer (se carregado) ou arquivo.
+---Current document content: buffer (if loaded) or file.
 ---@return string[]|nil lines, number|nil bufnr, number|nil tick
 local function current_lines(path)
   local buf = vim.fn.bufnr(path)
@@ -134,7 +135,7 @@ local function current_lines(path)
   return nil, nil, nil
 end
 
----Aplica text edits num buffer descartável e devolve as linhas resultantes.
+---Apply text edits to a scratch buffer and return the resulting lines.
 local function after_lines(lines, edits, encoding)
   local scratch = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(scratch, 0, -1, false, lines)
@@ -150,7 +151,7 @@ local function after_lines(lines, edits, encoding)
   return result
 end
 
----Diff unificado + contagem de linhas.
+---Unified diff + line counts.
 local function make_diff(before, after, root, path)
   local unified = vim.diff(table.concat(before, "\n") .. "\n", table.concat(after, "\n") .. "\n", {
     result_type = "unified",
@@ -177,30 +178,30 @@ local function make_diff(before, after, root, path)
   return vim.list_extend(header, lines), added, removed
 end
 
--- ---------- normalização ----------
+-- ---------- normalization ----------
 
----Normaliza um WorkspaceEdit em uma lista ordenada de operações.
----Operação desconhecida (ou campo inesperado) bloqueia tudo.
+---Normalize a WorkspaceEdit into an ordered operation list.
+---An unknown operation (or unexpected field) blocks everything.
 ---@param edit table
 ---@param opts { encoding: string, root: string }
----@return table|nil plan ou nil + motivo
+---@return table|nil plan or nil + reason
 function M.plan(edit, opts)
   if type(edit) ~= "table" then
-    return nil, "WorkspaceEdit vazio"
+    return nil, "empty WorkspaceEdit"
   end
   if edit.command ~= nil then
-    return nil, "o servidor pediu um comando adicional (efeito colateral não previsto)"
+    return nil, "the server requested an additional command (unexpected side effect)"
   end
 
   local ops = {}
 
   local function push_edit(uri, edits, version)
     if type(uri) ~= "string" or type(edits) ~= "table" then
-      return "TextDocumentEdit inválido"
+      return "invalid TextDocumentEdit"
     end
     for _, edit_item in ipairs(edits) do
       if type(edit_item) ~= "table" or not edit_item.range or edit_item.newText == nil then
-        return "TextEdit inválido (sem range/newText)"
+        return "invalid TextEdit (missing range/newText)"
       end
     end
     ops[#ops + 1] = {
@@ -216,7 +217,7 @@ function M.plan(edit, opts)
   if type(document_changes) == "table" and #document_changes > 0 then
     for _, change in ipairs(document_changes) do
       if type(change) ~= "table" then
-        return nil, "documentChanges com entrada inválida"
+        return nil, "documentChanges contains an invalid entry"
       end
       if change.kind == "create" then
         ops[#ops + 1] = { kind = "create", uri = change.uri, path = path_of(change.uri) }
@@ -244,7 +245,7 @@ function M.plan(edit, opts)
           return nil, err2
         end
       else
-        return nil, "operação não suportada no WorkspaceEdit: " .. tostring(change.kind)
+        return nil, "operation not supported in WorkspaceEdit: " .. tostring(change.kind)
       end
     end
   elseif type(edit.changes) == "table" and next(edit.changes) ~= nil then
@@ -258,11 +259,11 @@ function M.plan(edit, opts)
       return a.path < b.path
     end)
   else
-    return nil, "WorkspaceEdit sem changes/documentChanges"
+    return nil, "WorkspaceEdit without changes/documentChanges"
   end
 
-  -- destinos de rename: um edit pode apontar para o caminho novo, que ainda
-  -- não existe no disco (o jdtls manda o edit antes do RenameFile)
+  -- rename targets: an edit may point to the new path, which does not exist
+  -- does not exist on disk yet (jdtls sends the edit before RenameFile)
   local rename_targets = {}
   local rename_sources = {}
   for _, op in ipairs(ops) do
@@ -272,51 +273,51 @@ function M.plan(edit, opts)
     end
   end
 
-  -- um documento só pode ter uma origem consistente no plano
+  -- a document can have only one consistent source in the plan
   local document_sources = {}
   for _, op in ipairs(ops) do
     if op.kind == "rename" then
       for _, path in ipairs({ op.old_path, op.new_path }) do
         local other = document_sources[path]
         if other and other ~= op.old_path then
-          return nil, "sequência inválida: " .. path .. " participa de mais de um rename"
+          return nil, "invalid sequence: " .. path .. " participates in more than one rename"
         end
         document_sources[path] = op.old_path
       end
     end
   end
 
-  -- conflitos diretos no mesmo destino
+  -- direct conflicts at the same destination
   local document_targets = {}
   for _, op in ipairs(ops) do
     if op.kind == "rename" then
       local old = document_targets[op.new_path]
       if old then
-        return nil, "sequência inválida: " .. op.new_path .. " é destino de outro rename (" .. old .. ")"
+        return nil, "invalid sequence: " .. op.new_path .. " is the target of another rename (" .. old .. ")"
       end
       document_targets[op.new_path] = op.old_path
     elseif op.kind == "create" then
       local old = document_targets[op.path]
       if old then
-        return nil, "sequência inválida: " .. op.path .. " é destino de " .. old
+        return nil, "invalid sequence: " .. op.path .. " is the target of " .. old
       end
       document_targets[op.path] = "create"
     end
   end
 
-  -- destinos de rename não podem coincidir com create/delete anterior
-  -- (o JDTLS atual não emite essas cadeias; se emitir, bloqueamos)
+  -- rename targets cannot coincide with an earlier create/delete
+  -- (current JDTLS does not emit these chains; if it does, block them)
   for _, op in ipairs(ops) do
     if op.kind == "create" and (rename_targets[op.path] or rename_sources[op.path]) then
-      return nil, "sequência inválida: create em caminho participante de rename: " .. op.path
+      return nil, "invalid sequence: create on a path involved in a rename: " .. op.path
     end
     if op.kind == "delete" and (rename_targets[op.path] or rename_sources[op.path]) then
-      return nil, "sequência inválida: delete em caminho participante de rename: " .. op.path
+      return nil, "invalid sequence: delete on a path involved in a rename: " .. op.path
     end
   end
 
-  -- arquivos criados antes de um TextDocumentEdit: a prévia parte de arquivo
-  -- vazio, porque `CreateFile` ainda não existe no disco durante o plano
+  -- files created before a TextDocumentEdit: the preview starts from an empty
+  -- file because `CreateFile` does not exist on disk during planning
   local created_paths = {}
   for _, op in ipairs(ops) do
     if op.kind == "create" then
@@ -324,7 +325,7 @@ function M.plan(edit, opts)
     end
   end
 
-  -- arquivos com edits: calcula antes/depois sem tocar em nada
+  -- files with edits: compute before/after without touching anything
   local files = {}
   local seen_documents = {}
   local seen_sources = {}
@@ -333,10 +334,10 @@ function M.plan(edit, opts)
     if op.kind == "rename" then
       renamed_away[op.old_path] = true
     elseif op.kind == "edit" then
-      -- edit num caminho que um rename ANTERIOR já tirou de cena: o documento
-      -- não existe mais nesse endereço (LSP aplica na ordem emitida)
+      -- edit on a path that an EARLIER rename already removed: the document
+      -- no longer exists at that address (LSP applies in emitted order)
       if renamed_away[op.path] then
-        return nil, "sequência inválida: edits para o caminho antigo depois do rename: " .. op.path
+        return nil, "invalid sequence: edits for the old path after the rename: " .. op.path
       end
       local source_path = op.path
       if vim.fn.filereadable(op.path) == 0 and rename_targets[op.path] then
@@ -351,23 +352,23 @@ function M.plan(edit, opts)
       else
         before, bufnr, tick = current_lines(source_path)
         if not before then
-          return nil, "documento não encontrado: " .. op.path
+          return nil, "document not found: " .. op.path
         end
       end
       if seen_documents[op.path] and seen_documents[op.path] ~= source_path then
-        return nil, "edits para " .. op.path .. " apontam para documentos de origem diferentes"
+        return nil, "edits for " .. op.path .. " point to documents with different sources"
       end
-      -- um segundo TextDocumentEdit para o mesmo documento teria ranges já
-      -- deslocados pelo primeiro; a prévia não modela isso, então bloqueia
+      -- a second TextDocumentEdit for the same document would have ranges
+      -- shifted by the first; the preview does not model that, so block it
       if seen_sources[source_path] then
         return nil,
-          "sequência inválida: mais de um TextDocumentEdit para o documento: " .. relpath(opts.root, source_path)
+          "invalid sequence: more than one TextDocumentEdit for the document: " .. relpath(opts.root, source_path)
       end
       seen_documents[op.path] = source_path
       seen_sources[source_path] = true
       local after, err = after_lines(before, op.edits, opts.encoding)
       if not after then
-        return nil, "falha ao calcular a prévia de " .. op.path .. ": " .. err
+        return nil, "failed to compute the preview for " .. op.path .. ": " .. err
       end
       op.after_lines = after
       local diff, added, removed = make_diff(before, after, opts.root, op.path)
@@ -409,7 +410,7 @@ local function op_label(plan, op)
   end
 end
 
----Abre o diff (somente leitura) num split; `on_close` roda ao fechar.
+---Open the diff (read-only) in a split; `on_close` runs when it closes.
 local function show_diff(plan, file, on_close)
   local prev_win = vim.api.nvim_get_current_win()
   local buf = vim.api.nvim_create_buf(false, true)
@@ -432,11 +433,11 @@ local function show_diff(plan, file, on_close)
     on_close()
   end
 
-  vim.keymap.set("n", "q", close, { buffer = buf, desc = "Fechar prévia" })
-  vim.keymap.set("n", "<Esc>", close, { buffer = buf, desc = "Fechar prévia" })
+  vim.keymap.set("n", "q", close, { buffer = buf, desc = "Close preview" })
+  vim.keymap.set("n", "<Esc>", close, { buffer = buf, desc = "Close preview" })
 end
 
----Menu de revisão. Loop até Aplicar ou cancelar.
+---Review menu. Loops until Apply or Cancel.
 ---@param plan table
 ---@param on_done fun(applied: boolean)
 function M.review(plan, on_done)
@@ -452,31 +453,33 @@ function M.review(plan, on_done)
           label = op_label(plan, op),
           key = "fileop",
           enabled = false,
-          reason = "operação de arquivo (executada só na confirmação)",
+          reason = "file operation (applied only on confirmation)",
         }
       end
     end
-    entries[#entries + 1] = { label = "✔ Aplicar alterações", key = "apply", enabled = true }
+    entries[#entries + 1] = { label = "✔ Apply changes", key = "apply", enabled = true }
     entries[#entries + 1] = { label = "✖ Cancelar", key = "cancel", enabled = true }
 
-    ui.menu(entries, "Java: Preview — alterações", function(entry)
+    ui.menu(entries, "Java: Preview — changes", function(entry)
       if entry.key == "cancel" then
-        ui.notify("refatoração cancelada; nada foi alterado", vim.log.levels.INFO)
+        ui.notify("refactoring cancelled; nothing was changed", vim.log.levels.INFO)
         on_done(false)
         return
       end
       if entry.key == "apply" then
         local result, problems = M.apply(plan)
         if not result then
-          ui.notify("não apliquei: " .. table.concat(problems, "; "), vim.log.levels.ERROR)
+          ui.notify("not applied: " .. table.concat(problems, "; "), vim.log.levels.ERROR)
           return
         end
         if result.error then
           ui.notify(
-            "aplicação parcial: "
+            "partial application: "
               .. result.error
               .. (
-                result.applied and #result.applied > 0 and (" | já aplicado: " .. table.concat(result.applied, ", "))
+                result.applied
+                  and #result.applied > 0
+                  and (" | already applied: " .. table.concat(result.applied, ", "))
                 or ""
               ),
             vim.log.levels.ERROR
@@ -486,7 +489,7 @@ function M.review(plan, on_done)
         end
         local parts = {}
         if #plan.files > 0 then
-          parts[#parts + 1] = string.format("%d arquivo(s) com buffer modificado (use :wa para salvar)", #plan.files)
+          parts[#parts + 1] = string.format("%d file(s) with modified buffer (use :wa to save)", #plan.files)
         end
         local fileops = 0
         for _, op in ipairs(plan.ops) do
@@ -495,13 +498,13 @@ function M.review(plan, on_done)
           end
         end
         if fileops > 0 then
-          parts[#parts + 1] = string.format("%d operação(ões) de arquivo aplicada(s)", fileops)
+          parts[#parts + 1] = string.format("%d file operation(s) applied", fileops)
         end
-        ui.notify("aplicado: " .. table.concat(parts, " · "))
+        ui.notify("applied: " .. table.concat(parts, " · "))
         on_done(true)
         return
       end
-      -- arquivo: mostra o diff e volta ao menu
+      -- file: show the diff and return to the menu
       show_diff(plan, entry.file, open)
     end)
   end
@@ -509,7 +512,7 @@ function M.review(plan, on_done)
   open()
 end
 
--- ---------- aplicação ----------
+-- ---------- application ----------
 
 local function resolve_renames(plan)
   local map = {}
@@ -532,16 +535,16 @@ local function revalidate(plan)
     end
     if file.bufnr and vim.api.nvim_buf_is_valid(file.bufnr) then
       if vim.b[file.bufnr].changedtick ~= file.tick then
-        problems[#problems + 1] = "buffer alterado desde a prévia: " .. relpath(plan.root, path)
+        problems[#problems + 1] = "buffer changed since the preview: " .. relpath(plan.root, path)
       end
     elseif file.created and vim.fn.filereadable(file.source_path or file.path) == 0 then
-      -- CreateFile ainda não existe no disco antes da aplicação
+      -- CreateFile does not exist on disk before application
     else
       local now = vim.fn.filereadable(file.source_path or file.path) == 1
           and vim.fn.readfile(file.source_path or file.path)
         or nil
       if not now or table.concat(now, "\n") ~= table.concat(file.before, "\n") then
-        problems[#problems + 1] = "arquivo alterado desde a prévia: " .. relpath(plan.root, path)
+        problems[#problems + 1] = "file changed since the preview: " .. relpath(plan.root, path)
       end
     end
   end
@@ -549,44 +552,45 @@ local function revalidate(plan)
   for _, op in ipairs(plan.ops) do
     if op.kind == "rename" then
       if vim.fn.filereadable(op.old_path) == 0 then
-        problems[#problems + 1] = "origem não existe: " .. relpath(plan.root, op.old_path)
+        problems[#problems + 1] = "source does not exist: " .. relpath(plan.root, op.old_path)
       end
       if vim.fn.filereadable(op.new_path) == 1 then
-        problems[#problems + 1] = "destino já existe: " .. relpath(plan.root, op.new_path)
+        problems[#problems + 1] = "destination already exists: " .. relpath(plan.root, op.new_path)
       end
       if vim.fn.isdirectory(vim.fs.dirname(op.new_path)) == 0 then
-        problems[#problems + 1] = "diretório destino não existe: " .. relpath(plan.root, vim.fs.dirname(op.new_path))
+        problems[#problems + 1] = "destination directory does not exist: "
+          .. relpath(plan.root, vim.fs.dirname(op.new_path))
       end
       local stale = modified_buffer_for(op.new_path)
       if stale then
-        problems[#problems + 1] = "o destino tem buffer modificado não salvo: "
+        problems[#problems + 1] = "the destination has an unsaved modified buffer: "
           .. relpath(plan.root, op.new_path)
-          .. " — feche/salve esse buffer antes de aplicar"
+          .. " — close/save this buffer before applying"
       end
     elseif op.kind == "create" then
       if vim.fn.filereadable(op.path) == 1 then
-        problems[#problems + 1] = "arquivo já existe: " .. relpath(plan.root, op.path)
+        problems[#problems + 1] = "file already exists: " .. relpath(plan.root, op.path)
       end
       local stale = modified_buffer_for(op.path)
       if stale then
-        problems[#problems + 1] = "o destino tem buffer modificado não salvo: "
+        problems[#problems + 1] = "the destination has an unsaved modified buffer: "
           .. relpath(plan.root, op.path)
-          .. " — feche/salve esse buffer antes de aplicar"
+          .. " — close/save this buffer before applying"
       end
     elseif op.kind == "delete" then
       if vim.fn.filereadable(op.path) == 0 then
-        problems[#problems + 1] = "arquivo não existe: " .. relpath(plan.root, op.path)
+        problems[#problems + 1] = "file does not exist: " .. relpath(plan.root, op.path)
       end
       local stale = modified_buffer_for(op.path)
       if stale then
-        problems[#problems + 1] = "o arquivo tem buffer modificado não salvo: "
+        problems[#problems + 1] = "the file has an unsaved modified buffer: "
           .. relpath(plan.root, op.path)
-          .. " — feche/salve esse buffer antes de aplicar"
+          .. " — close/save this buffer before applying"
       end
     end
   end
 
-  -- tudo dentro do projeto
+  -- everything inside the project
   for _, op in ipairs(plan.ops) do
     local paths = {}
     if op.kind == "rename" then
@@ -596,7 +600,7 @@ local function revalidate(plan)
     end
     for _, path in ipairs(paths) do
       if not inside_project(plan.root, path) then
-        problems[#problems + 1] = "fora do projeto: " .. path
+        problems[#problems + 1] = "outside the project: " .. path
       end
     end
   end
@@ -613,7 +617,7 @@ local function buffer_for(path)
   return buf
 end
 
----Conteúdo final calculado na prévia para o documento que está sendo renomeado.
+---Final content computed by the preview for the document being renamed.
 local function after_for(plan, old_path)
   for _, file in ipairs(plan.files or {}) do
     if file.source_path == old_path then
@@ -624,10 +628,10 @@ end
 
 local function apply_op(op, plan, renamed, applied_documents)
   if op.kind == "edit" then
-    -- se um RenameFile anterior já materializou o conteúdo previsto para este
-    -- caminho, o TextDocumentEdit subsequente já está incluído no buffer
+    -- if an earlier RenameFile already materialized the content planned for
+    -- this path, the subsequent TextDocumentEdit is already in the buffer
     if applied_documents[op.path] then
-      return "edits já incluídos no rename: " .. relpath(plan.root, op.path)
+      return "edits already included in the rename: " .. relpath(plan.root, op.path)
     end
     local path = renamed[op.path] or op.source_path or op.path
     local buf = buffer_for(path)
@@ -646,21 +650,21 @@ local function apply_op(op, plan, renamed, applied_documents)
       error("rename falhou: " .. tostring(rc), 0)
     end
     if rc ~= 0 or vim.fn.filereadable(op.old_path) == 1 then
-      error("rename falhou (permissão?): " .. relpath(plan.root, op.old_path), 0)
+      error("rename failed (permission?): " .. relpath(plan.root, op.old_path), 0)
     end
     renamed[op.old_path] = op.new_path
 
-    -- Alinha o buffer ao novo caminho sem gravar nada: recarrega o arquivo
-    -- movido e reaplica em memória o conteúdo calculado na prévia. Assim o
-    -- `:wa` do usuário grava sem pedir confirmação (b_mtime correto) e nada é
-    -- salvo automaticamente.
+    -- Align the buffer with the new path without writing anything: reload the file
+    -- moved file and reapplies the preview content in memory. The user's
+    -- `:wa` then writes without a prompt (correct b_mtime) and nothing is
+    -- saved automatically.
     local old_buf = vim.fn.bufnr(op.old_path)
     local old_loaded = old_buf ~= -1 and vim.api.nvim_buf_is_loaded(old_buf)
     local after = after_for(plan, op.old_path)
     local win = old_loaded and vim.fn.bufwinid(old_buf) or -1
     local was_current = old_loaded and vim.api.nvim_get_current_buf() == old_buf
-    -- o novo buffer precisa herdar os clientes LSP do buffer antigo,
-    -- senão o JDTLS perde o documento após RenameFile/Move
+    -- the new buffer must inherit the old buffer's LSP clients,
+    -- otherwise JDTLS loses the document after RenameFile/Move
     local old_clients = old_loaded and vim.lsp.get_clients({ bufnr = old_buf }) or {}
 
     local stale = vim.fn.bufnr(op.new_path)
@@ -717,12 +721,12 @@ local function apply_op(op, plan, renamed, applied_documents)
     end
     return "delete " .. relpath(plan.root, op.path)
   end
-  error("operação desconhecida: " .. tostring(op.kind), 0)
+  error("unknown operation: " .. tostring(op.kind), 0)
 end
 
----Aplica o plano preservando a ordem recebida. A prévia é a única fonte de
----conteúdo; cada TextDocumentEdit é revalidado contra o documento do plano.
----Nunca escreve buffers automaticamente (`:wa` é do usuário).
+---Apply the plan preserving the received order. The preview is the only
+---content source; every TextDocumentEdit is revalidated against the planned
+---document. Buffers are never written automatically (`:wa` belongs to the user).
 ---@return table|nil result, string[]|nil problems
 function M.apply(plan)
   local problems = revalidate(plan)
@@ -744,7 +748,7 @@ function M.apply(plan)
       if source and source ~= (op.source_path or op.path) then
         return {
           applied = applied,
-          error = "sequência inválida: edits para o mesmo documento têm origens diferentes",
+          error = "invalid sequence: edits for the same document have different sources",
         }
       end
       seen_documents[op.path] = op.source_path or op.path
@@ -759,7 +763,7 @@ function M.apply(plan)
   return { applied = applied }
 end
 
--- expostos para testes
+-- exposed for tests
 M._revalidate = revalidate
 M._show_diff = show_diff
 M._inside_project = inside_project

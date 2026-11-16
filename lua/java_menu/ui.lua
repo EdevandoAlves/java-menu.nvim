@@ -1,6 +1,6 @@
 -- java_menu/ui.lua
--- Componentes de UI compartilhados pelos menus Java (snacks, sem tocar em
--- vim.ui.select/input globais).
+-- Shared UI components for the Java menus (Snacks when available, without
+-- replacing the global vim.ui.select/input functions).
 
 local M = {}
 
@@ -15,8 +15,8 @@ function M.snacks()
   end
 end
 
----Seleção central simples. Sem Snacks, mantém a operação funcional pelo
----vim.ui.select (sem substituir a função global).
+---Single-choice picker. Without Snacks the operation still works through
+---vim.ui.select, without replacing the global function.
 function M.pick_one(items, prompt, on_choice)
   local mod = M.snacks()
   if not mod then
@@ -34,16 +34,16 @@ function M.pick_one(items, prompt, on_choice)
   end)
 end
 
----Seleção múltipla (Snacks): Space/Tab alterna, Enter confirma.
----Nada selecionado devolve {} (etapa opcional pode ser pulada).
----Itens podem ser strings ou `{ text = "…", value = … }`; o callback recebe os
----valores (ou o próprio texto).
+---Multi-choice picker (Snacks): Space/Tab toggles, Enter confirms.
+---Nothing selected returns {} (optional steps can be skipped).
+---Items may be strings or `{ text = "…", value = … }`; the callback receives
+---the values (or the text itself).
 ---@param items (string|{text:string, value:any})[]
 ---@param prompt string
 ---@param on_confirm fun(selected:any[])
 ---@param opts { fallback: boolean|nil, help: boolean|nil }|nil
---- fallback = Enter sem seleção usa o item sob o cursor
---- help = mostra a linha curta de teclas no título (padrão: true)
+--- fallback = Enter with no selection uses the item under the cursor
+--- help = show the short key hint in the title (default: true)
 function M.pick_many(items, prompt, on_confirm, opts)
   opts = opts or {}
 
@@ -58,8 +58,8 @@ function M.pick_many(items, prompt, on_confirm, opts)
 
   local mod = M.snacks()
   if not mod or type(mod.picker.pick) ~= "function" then
-    -- fallback sem Snacks: lista separada por vírgula
-    vim.ui.input({ prompt = prompt .. " (separados por vírgula; vazio = nenhum): " }, function(value)
+    -- no-Snacks fallback: comma-separated list
+    vim.ui.input({ prompt = prompt .. " (comma-separated; empty = none): " }, function(value)
       if value == nil then
         return
       end
@@ -83,17 +83,18 @@ function M.pick_many(items, prompt, on_confirm, opts)
   mod.picker.pick({
     title = title,
     source = "java_menu_multi",
-    -- mesma moldura dos seletores simples, sem preview de dados internos
+    -- same frame as the single pickers, without internal data preview
     layout = { preset = "select", preview = false },
     finder = function()
       return vim.deepcopy(entries)
     end,
-    -- "text" devolve chunks de highlight; uma string quebraria o render
+    -- "text" returns highlight chunks; a plain string would break rendering
     format = "text",
     win = {
       input = {
         keys = {
-          -- Tab marca sem tirar o foco da busca; Space fica livre para a busca
+          -- Tab marks without leaving the search field; Space stays available
+          -- for filtering
           ["<Tab>"] = { "select_and_next", mode = { "n", "i" } },
         },
       },
@@ -123,7 +124,7 @@ function M.pick_many(items, prompt, on_confirm, opts)
   })
 end
 
----Entrada central de texto (Snacks), com fallback para vim.ui.input.
+---Central text input (Snacks), with vim.ui.input fallback.
 function M.ask(prompt, default, on_confirm)
   local mod = M.snacks()
   if mod and mod.input and type(mod.input.input) == "function" then
@@ -132,7 +133,7 @@ function M.ask(prompt, default, on_confirm)
   return vim.ui.input({ prompt = prompt, default = default or "" }, on_confirm)
 end
 
----Menu central com estados disponíveis/indisponíveis.
+---Central menu with available/unavailable states.
 ---@param entries table[] { key, label, enabled, reason }
 ---@param prompt string
 ---@param on_choice fun(entry: table)
@@ -140,9 +141,9 @@ function M.menu(entries, prompt, on_choice)
   local labels, by_label = {}, {}
   for _, entry in ipairs(entries) do
     local text = entry.label
-    -- só é indisponível quando dito explicitamente (enabled == false)
+    -- only mark unavailable when explicitly requested (enabled == false)
     if entry.enabled == false then
-      text = text .. "  (indisponível: " .. (entry.reason or "sem motivo") .. ")"
+      text = text .. "  (unavailable: " .. (entry.reason or "no reason") .. ")"
     end
     labels[#labels + 1] = text
     by_label[text] = entry
@@ -154,7 +155,7 @@ function M.menu(entries, prompt, on_choice)
       return
     end
     if entry.enabled == false then
-      M.notify(entry.reason or "operação indisponível", vim.log.levels.WARN)
+      M.notify(entry.reason or "operation unavailable", vim.log.levels.WARN)
       return
     end
     on_choice(entry)
@@ -165,13 +166,13 @@ function M.jdtls_attached(bufnr)
   return #vim.lsp.get_clients({ name = "jdtls", bufnr = bufnr }) > 0
 end
 
----Parser treesitter da linguagem disponível?
+---Is a Tree-sitter parser for the language available?
 function M.has_parser(bufnr, lang)
   local ok, parser = pcall(vim.treesitter.get_parser, bufnr, lang)
   return ok and parser ~= nil
 end
 
----Unidade de indentação do arquivo (primeira linha indentada).
+---Indentation unit of the file (first indented line).
 local function detect_indent(bufnr)
   for _, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, 200, false)) do
     local spaces = line:match("^( +)%S")
@@ -182,8 +183,8 @@ local function detect_indent(bufnr)
   return vim.bo[bufnr].shiftwidth > 0 and vim.bo[bufnr].shiftwidth or 4
 end
 
----Alinha o shiftwidth à indentação real do arquivo durante `fn` e restaura
----depois (o jdtls formata o código gerado/refatorado com esse valor).
+---Match shiftwidth to the file's real indentation during `fn` and restore it
+---afterwards (jdtls formats generated/refactored code with this value).
 function M.with_indent(bufnr, fn)
   local sw, ts, et = vim.bo[bufnr].shiftwidth, vim.bo[bufnr].tabstop, vim.bo[bufnr].expandtab
   local unit = detect_indent(bufnr)
@@ -197,14 +198,14 @@ function M.with_indent(bufnr, fn)
   end
 end
 
----O buffer alvo ainda é o buffer atual? (evita agir no arquivo errado)
+---Is the target buffer still the current one? (avoids acting on the wrong file)
 function M.same_buffer(bufnr)
   if not (bufnr and vim.api.nvim_buf_is_valid(bufnr)) then
-    M.notify("o buffer alvo não existe mais", vim.log.levels.WARN)
+    M.notify("the target buffer no longer exists", vim.log.levels.WARN)
     return false
   end
   if vim.api.nvim_get_current_buf() ~= bufnr then
-    M.notify("o buffer mudou desde a abertura do menu — refaça a operação", vim.log.levels.WARN)
+    M.notify("the buffer changed since the menu was opened — run the operation again", vim.log.levels.WARN)
     return false
   end
   return true

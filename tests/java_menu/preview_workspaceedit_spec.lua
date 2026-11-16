@@ -218,7 +218,7 @@ do
   local result = apply_and_persist(plan, root)
   -- o segundo op é no-op: o conteúdo já foi materializado pelo rename
   assert(
-    result.applied[2]:find("já incluídos", 1, true),
+    result.applied[2]:find("already included", 1, true),
     "edit pós-rename deveria ser no-op: " .. vim.inspect(result.applied)
   )
   assert(vim.fn.filereadable(old) == 0, "origem não removida")
@@ -310,7 +310,7 @@ do
   -- os ranges do segundo já estariam deslocados pelo primeiro
   local dup =
     { documentChanges = { tde(doc, { text_edit(0, 4, 0, 9, "sum") }), tde(doc, { text_edit(1, 14, 1, 19, "sum") }) } }
-  assert_plan_blocked(dup, root, "mais de um TextDocumentEdit")
+  assert_plan_blocked(dup, root, "more than one TextDocumentEdit")
   assert(read(doc) == expected, "bloqueio alterou o documento")
 
   -- E3: offsets UTF-16 com emoji (2 unidades UTF-16, 4 bytes)
@@ -371,17 +371,17 @@ do
   assert_plan_blocked(
     { documentChanges = { { kind = "copy", oldUri = uri(doc), newUri = uri(root .. "/src/Copy.java") } } },
     root,
-    "operação não suportada"
+    "operation not supported"
   )
   assert_plan_blocked(
     { command = "java.applyWorkspaceEdit", documentChanges = { tde(doc, { text_edit(0, 0, 0, 0, "x") }) } },
     root,
-    "comando adicional"
+    "additional command"
   )
   assert_plan_blocked(
     { documentChanges = { { edits = { text_edit(0, 0, 0, 0, "x") } } } },
     root,
-    "operação não suportada"
+    "operation not supported"
   )
   assert(read(doc) == untouched, "operação desconhecida alterou arquivos")
   assert(vim.fn.filereadable(root .. "/src/Copy.java") == 0, "operação desconhecida criou arquivo")
@@ -400,27 +400,27 @@ do
   assert_plan_blocked(
     { documentChanges = { rename_op(a, b), tde(a, { text_edit(0, 0, 0, 0, "x") }) } },
     root,
-    "depois do rename"
+    "after the rename"
   )
   -- cadeia de renames (Beta participaria de dois)
-  assert_plan_blocked({ documentChanges = { rename_op(a, b), rename_op(b, c) } }, root, "mais de um rename")
+  assert_plan_blocked({ documentChanges = { rename_op(a, b), rename_op(b, c) } }, root, "more than one rename")
   -- dois renames para o mesmo destino (a origem Beta participa dos dois)
-  assert_plan_blocked({ documentChanges = { rename_op(a, b), rename_op(c, b) } }, root, "mais de um rename")
+  assert_plan_blocked({ documentChanges = { rename_op(a, b), rename_op(c, b) } }, root, "more than one rename")
   -- delete da origem de um rename
-  assert_plan_blocked({ documentChanges = { rename_op(a, b), delete_op(a) } }, root, "participante de rename")
+  assert_plan_blocked({ documentChanges = { rename_op(a, b), delete_op(a) } }, root, "involved in a rename")
   -- create no destino/origem de um rename (colisão de destinos ou participante)
-  assert_plan_blocked({ documentChanges = { rename_op(a, b), create_op(b) } }, root, "é destino de")
+  assert_plan_blocked({ documentChanges = { rename_op(a, b), create_op(b) } }, root, "is the target of")
   -- TextDocumentEdit para documento inexistente sem origem
   assert_plan_blocked(
     { documentChanges = { tde(root .. "/src/Missing.java", { text_edit(0, 0, 0, 0, "x") }) } },
     root,
-    "documento não encontrado"
+    "document not found"
   )
   -- TextDocumentEdit sem textDocument.uri
   assert_plan_blocked(
     { documentChanges = { { textDocument = { version = 7 }, edits = { text_edit(0, 0, 0, 0, "x") } } } },
     root,
-    "sem textDocument.uri"
+    "without textDocument.uri"
   )
   assert(read(a) == original, "sequência inválida alterou arquivos")
   assert(vim.fn.filereadable(b) == 0 and vim.fn.filereadable(c) == 0, "sequência inválida criou arquivos")
@@ -437,14 +437,14 @@ do
   local plan =
     plan_for({ documentChanges = { tde(occupied, widget_edits("WidgetRenamed")), rename_op(old, occupied) } }, root)
   assert(type(plan) == "table", "destino existente deveria bloquear no apply, não no plan")
-  assert_apply_blocked(plan, "destino já existe")
+  assert_apply_blocked(plan, "destination already exists")
   assert(read(old) == WIDGET, "origem alterada em apply bloqueado")
   assert(read(occupied) == "class Occupied {}", "destino sobrescrito em apply bloqueado")
 
   -- create em caminho existente
   local plan2 = plan_for({ documentChanges = { create_op(occupied) } }, root)
   assert(type(plan2) == "table", "create em existente deveria bloquear no apply")
-  assert_apply_blocked(plan2, "arquivo já existe")
+  assert_apply_blocked(plan2, "file already exists")
   assert(read(occupied) == "class Occupied {}", "create sobrescreveu arquivo existente")
 end
 
@@ -461,7 +461,7 @@ do
 
   local plan = plan_for({ documentChanges = { tde(new, widget_edits("WidgetRenamed")), rename_op(old, new) } }, root)
   assert(type(plan) == "table", "buffer modificado no destino deveria bloquear no apply")
-  assert_apply_blocked(plan, "buffer modificado não salvo")
+  assert_apply_blocked(plan, "unsaved modified buffer")
   assert(read(old) == WIDGET, "origem alterada em apply bloqueado")
   assert(vim.fn.filereadable(new) == 0, "apply bloqueado criou o destino")
 
@@ -473,7 +473,7 @@ do
   local stale2 = vim.fn.bufadd(fresh)
   vim.api.nvim_buf_set_lines(stale2, 0, -1, false, { "trabalho não salvo" })
   local plan2 = plan_for({ documentChanges = { create_op(fresh) } }, root)
-  assert_apply_blocked(plan2, "buffer modificado não salvo")
+  assert_apply_blocked(plan2, "unsaved modified buffer")
   assert(vim.fn.filereadable(fresh) == 0, "apply bloqueado criou o destino")
   vim.bo[stale2].modified = false
   vim.api.nvim_buf_delete(stale2, { force = true })
@@ -489,7 +489,7 @@ do
   local plan = plan_for({ documentChanges = { tde(new, widget_edits("WidgetRenamed")), rename_op(old, new) } }, root)
   -- o arquivo muda depois da prévia (concorrência)
   write_file(old, WIDGET:gsub("class Widget", "class WidgetTouched"))
-  assert_apply_blocked(plan, "arquivo alterado desde a prévia")
+  assert_apply_blocked(plan, "file changed since the preview")
   assert(read(old):find("class WidgetTouched", 1, true), "apply bloqueado alterou a origem")
   assert(vim.fn.filereadable(new) == 0, "apply bloqueado renomeou")
 
@@ -500,7 +500,7 @@ do
   local doc_buf = vim.api.nvim_get_current_buf()
   local plan2 = plan_for({ documentChanges = { tde(doc, { text_edit(0, 4, 0, 5, "b") }) } }, root)
   vim.api.nvim_buf_set_lines(doc_buf, 0, -1, false, { "int a = 2;" })
-  assert_apply_blocked(plan2, "buffer alterado desde a prévia")
+  assert_apply_blocked(plan2, "buffer changed since the preview")
   -- o arquivo em disco continua intacto; a mudança foi só no buffer
   assert(read(doc) == "int a = 1;", "apply bloqueado alterou o documento")
   vim.bo[doc_buf].modified = false
@@ -526,7 +526,7 @@ do
     done, applied = true, value
   end)
   assert(done and applied == false, "cancelamento deveria devolver false")
-  assert(has_notice("refatoração cancelada; nada foi alterado"), "cancelamento não avisou: " .. vim.inspect(notices))
+  assert(has_notice("refactoring cancelled; nothing was changed"), "cancelamento não avisou: " .. vim.inspect(notices))
   assert(read(old) == WIDGET, "cancelamento alterou a origem")
   assert(vim.fn.filereadable(new) == 0, "cancelamento criou o destino")
   assert(#vim.api.nvim_list_bufs() == buf_count, "cancelamento criou buffers")
@@ -542,7 +542,7 @@ do
     done, applied = true, value
   end)
   assert(done and applied == true, "aplicar pelo menu deveria devolver true")
-  assert(has_notice("aplicado:"), "aplicação pelo menu não avisou: " .. vim.inspect(notices))
+  assert(has_notice("applied:"), "aplicação pelo menu não avisou: " .. vim.inspect(notices))
   assert(vim.fn.filereadable(old) == 0, "apply pelo menu não removeu a origem")
   local buf = vim.fn.bufnr(new)
   assert(buf ~= -1 and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].modified, "apply pelo menu sem buffer pendente")
