@@ -4,3 +4,6 @@ doc/tags
 # Lua coverage / linting artifacts
 luacov.report.out
 luacov.stats.out
+
+# Local planning notes (kept local, not published)
+ROADMAP.md
