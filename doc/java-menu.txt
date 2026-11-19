@@ -212,13 +212,30 @@ root, scopes Maven with `-pl <module> -am` and Gradle with
 at a time: starting another build — including Repeat — is refused until
 you stop. Repeat/Stop/Output are keyed by project root, and stopping a
 process that belongs to another project asks "keep / terminate" first.
+Run Settings stores JVM and application arguments per project and offers
+Spring profiles discovered from application-* files. Restart Last Process
+relaunches the project's recorded command. Run Main and Spring load the
+project-root .env by default when present; toggle it in Run Settings.
+The parser accepts simple KEY=VALUE lines without shell execution. Literal
+values are redacted from captured output, but encoded, transformed or
+separately printed fragments cannot be detected; short values can redact
+ordinary output. Arguments are stored locally: put secrets in .env instead.
+Restart refuses automatic termination if the process group cannot be verified.
+Background processes left after normal exit can outlive Java Menu's stop
+controls. Arguments that jc.nvim cannot replay faithfully stay in Java
+Menu's repeat history only. Short .env values may cause unrelated arguments
+to be excluded from saved history.
 
                                                                   *java-menu-tests*
 Tests ~
 Run nearest/file/suite/pick through neotest with jc.nvim's adapter
 (classpath from jdtls), re-run last, stop, summary/output, optional
-precompile, jump to a paired test class. Without neotest the menu says so
-instead of breaking.
+precompile, and navigate in either direction between a class and its test.
+Matches prefer the current module and support *Test, *Tests, *IT and Test*
+names. Ambiguous matches are offered for selection; a missing test can be
+created after confirmation. The test picker prioritizes the current module
+and package. Open a project file before using the menu from an output buffer.
+Without neotest the menu says so instead of breaking.
 
                                                                   *java-menu-debug*
 Debug ~

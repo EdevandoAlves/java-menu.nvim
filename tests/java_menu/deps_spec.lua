@@ -681,14 +681,14 @@ assert(target.build_file == real_root .. "/pom.xml", "build_file divergiu: " .. 
 assert(target.is_kotlin_dsl == false and target.catalog_file == nil)
 assert(#target.modules == 1, "esperava um módulo: " .. #target.modules)
 
-local available, available_reason = deps._available(buf)
+local available, available_reason = deps.available(buf)
 assert(available == true and available_reason == nil, "projeto Maven deveria permitir Dependencies")
 
 local empty_dir = tempdir("empty")
 local prev_cwd = vim.uv.cwd()
 vim.cmd.cd(vim.fn.fnameescape(empty_dir))
 local empty_buf = vim.api.nvim_create_buf(false, true)
-local unavailable, unavailable_reason = deps._available(empty_buf)
+local unavailable, unavailable_reason = deps.available(empty_buf)
 assert(unavailable == false, "diretório vazio deveria desabilitar Dependencies")
 assert(
   unavailable_reason and unavailable_reason:find("no Maven/Gradle project", 1, true),

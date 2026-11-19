@@ -7,6 +7,7 @@ local ui = require("java_menu.ui")
 local project = require("java_menu.project")
 local lsp = require("java_menu.lsp")
 local jca = require("java_menu.jc")
+local run_config = require("java_menu.run_config")
 
 local M = {}
 
@@ -21,6 +22,13 @@ local LIFECYCLE = {
 ---@class BuildState
 local state = {
   job = nil,
+  pid = nil,
+  pgid = nil,
+  pgid_start_ticks = nil,
+  pgid_reason = nil,
+  draining_pgid = nil,
+  draining_start_ticks = nil,
+  drain_timer = nil,
   buf = nil,
   kind = nil,
   cmd = nil,
@@ -30,12 +38,24 @@ local state = {
   status = "idle",
   last_output = nil,
   last_output_root = nil,
+  seq = 0,
+  redactions = {},
+  after_exit = nil,
+  restarting = false,
+  stopping = false,
 }
+
+M._stop_grace_ms = 1000
+M._restart_timeout_ms = 5000
+M._background_grace_ms = 500
 
 ---Last build arguments per project (repeat never crosses projects).
 ---jc.settings persists by cwd project name; here the key is the resolved
 ---buffer root, so repeat never runs A's args in B.
 local last_builds = {}
+
+---Last executed command per project (keyed by canonical root, without secrets).
+local last_runs = {}
 
 -- ---------- project helpers ----------
 
@@ -237,27 +257,292 @@ end
 
 local pending = { stdout = "", stderr = "" }
 
-local function feed(buf, stream, data)
-  if type(data) ~= "table" then
+local function feed(seq, buf, stream, data, redactions)
+  if type(data) ~= "table" or seq ~= state.seq then
     return
   end
   local text = pending[stream] .. table.concat(data, "\n")
   local lines = vim.split(text, "\n", { plain = true })
   pending[stream] = table.remove(lines) or ""
+  lines = run_config.redact_lines(lines, redactions)
   vim.schedule(function()
-    append(buf, lines)
+    if seq == state.seq then
+      append(buf, lines)
+    end
   end)
 end
 
-local function finish(code)
+local function read_proc_info(pid)
+  if not pid or pid <= 0 then
+    return nil
+  end
+  local stat_path = ("/proc/%d/stat"):format(pid)
+  local fd = vim.uv.fs_open(stat_path, "r", 0)
+  if fd then
+    local data = vim.uv.fs_read(fd, 4096, 0)
+    vim.uv.fs_close(fd)
+    if type(data) == "string" then
+      local rest = data:match("^%d+%s+%(.*%)%s+(.+)$")
+      if rest then
+        local fields = vim.split(vim.trim(rest), "%s+")
+        local pgid = tonumber(fields[3])
+        local start_ticks = tonumber(fields[20])
+        if pgid then
+          return { pgid = pgid, start_ticks = start_ticks, state = fields[1] }
+        end
+      end
+    end
+  end
+  local ok, out = pcall(vim.fn.systemlist, { "ps", "-o", "pgid=", "-p", tostring(pid) })
+  if ok and type(out) == "table" and out[1] then
+    local pgid = tonumber(vim.trim(out[1]))
+    if pgid then
+      return { pgid = pgid, start_ticks = nil, state = nil }
+    end
+  end
+  return nil
+end
+
+local function verify_own_pgid(pid)
+  if type(pid) ~= "number" or pid <= 1 then
+    return nil, nil, "invalid process PID"
+  end
+  local my = read_proc_info(vim.uv.os_getpid())
+  if not my then
+    return nil, nil, "could not read editor process group"
+  end
+  local info = read_proc_info(pid)
+  if not info then
+    return nil, nil, "could not read child process group (/proc and ps unavailable)"
+  end
+  if info.pgid == my.pgid then
+    return nil, nil, ("child shares editor process group (%d)"):format(info.pgid)
+  end
+  if info.pgid ~= pid then
+    return nil, nil, ("child pgid (%d) differs from pid (%d)"):format(info.pgid, pid)
+  end
+  return info.pgid, info.start_ticks, nil
+end
+
+local function group_alive(pgid, leader_start_ticks)
+  if type(pgid) ~= "number" or pgid <= 1 then
+    return false
+  end
+  local my = read_proc_info(vim.uv.os_getpid())
+  if my and my.pgid == pgid then
+    return false
+  end
+  -- If the leader PID now belongs to a different start time, the original
+  -- process group already exited and the OS recycled the PID.
+  local leader = read_proc_info(pgid)
+  if leader and leader_start_ticks and leader.start_ticks and leader.start_ticks ~= leader_start_ticks then
+    return false
+  end
+  if type(vim.uv.kill) == "function" then
+    local ok, _, code = vim.uv.kill(-pgid, 0)
+    return ok == 0 or (not ok and code ~= "ESRCH")
+  end
+  vim.fn.system({ "kill", "-0", "-" .. tostring(pgid) })
+  return vim.v.shell_error == 0
+end
+
+local function signal_group(pgid, leader_start_ticks, sig)
+  if not group_alive(pgid, leader_start_ticks) then
+    return false
+  end
+  if type(vim.uv.kill) == "function" then
+    local ok, _, code = vim.uv.kill(-pgid, sig)
+    return ok == 0 or (not ok and code ~= "ESRCH")
+  end
+  local flag = sig == "sigkill" and "-KILL" or "-TERM"
+  vim.fn.system({ "kill", flag, "-" .. tostring(pgid) })
+  return vim.v.shell_error == 0
+end
+
+local function is_draining()
+  if not state.draining_pgid then
+    return false
+  end
+  if group_alive(state.draining_pgid, state.draining_start_ticks) then
+    return true
+  end
+  state.draining_pgid = nil
+  state.draining_start_ticks = nil
+  return false
+end
+
+local function stop_drain_timer()
+  if state.drain_timer then
+    pcall(function()
+      state.drain_timer:stop()
+      state.drain_timer:close()
+    end)
+    state.drain_timer = nil
+  end
+end
+
+local function redact_cmd_list(cmd, redactions)
+  local out = {}
+  for i, arg in ipairs(cmd) do
+    out[i] = run_config.redact(arg, redactions)
+  end
+  return out
+end
+
+---Kill the process tree started by this job (children first).
+local function kill_tree(pid, sig)
+  if not pid or pid <= 0 then
+    return
+  end
+  local ok, children = pcall(vim.fn.systemlist, { "pgrep", "-P", tostring(pid) })
+  if ok then
+    for _, child in ipairs(children or {}) do
+      local child_pid = tonumber(child)
+      if child_pid then
+        kill_tree(child_pid, sig)
+      end
+    end
+  end
+  pcall(vim.fn.system, { "kill", "-" .. (sig or "TERM"), tostring(pid) })
+end
+
+---Safely terminate the running job or draining process group.
+local function terminate_active(sig)
+  sig = sig or "sigterm"
+  local pgid = state.pgid or state.draining_pgid
+  local start_ticks = state.pgid and state.pgid_start_ticks or state.draining_start_ticks
+  if pgid then
+    signal_group(pgid, start_ticks, sig)
+  end
+  local job = state.job
+  if job then
+    if not pgid then
+      local ok_pid, pid = pcall(vim.fn.jobpid, job)
+      if ok_pid and pid and pid > 0 then
+        kill_tree(pid, sig == "sigkill" and "KILL" or "TERM")
+      end
+    end
+    if sig == "sigterm" then
+      pcall(vim.fn.jobstop, job)
+    end
+  end
+end
+
+local function start_drain_monitor(seq, pgid, start_ticks, opts)
+  stop_drain_timer()
+  opts = opts or {}
+  local timer = vim.uv.new_timer()
+  if not timer then
+    if opts.background and not state.stopping and not state.restarting then
+      state.draining_pgid = nil
+      state.draining_start_ticks = nil
+      state.pgid_reason = nil
+    end
+    return
+  end
+  state.drain_timer = timer
+  local start_ms = vim.uv.now()
+  local sigkill_sent = false
+
+  timer:start(
+    50,
+    50,
+    vim.schedule_wrap(function()
+      if state.seq ~= seq then
+        stop_drain_timer()
+        return
+      end
+
+      local active_pgid = pgid or state.draining_pgid or state.pgid
+      local active_ticks = start_ticks or state.draining_start_ticks or state.pgid_start_ticks
+      local still_running = state.running
+      local still_alive = active_pgid ~= nil and group_alive(active_pgid, active_ticks)
+
+      if not still_running and not still_alive then
+        stop_drain_timer()
+        state.pgid = nil
+        state.pgid_start_ticks = nil
+        state.pgid_reason = nil
+        state.draining_pgid = nil
+        state.draining_start_ticks = nil
+        state.stopping = false
+        if state.restarting and state.after_exit then
+          local cb = state.after_exit
+          state.after_exit = nil
+          state.restarting = false
+          cb()
+        end
+        return
+      end
+
+      local elapsed = vim.uv.now() - start_ms
+
+      -- Ordinary leader exit with surviving background group: monitor briefly
+      -- without killing, then release the build lock so future runs are not
+      -- blocked indefinitely (stop/restart still enforces full group drain).
+      if opts.background and not state.stopping and not state.restarting then
+        local bg_grace_ms = M._background_grace_ms or 500
+        if elapsed >= bg_grace_ms then
+          stop_drain_timer()
+          state.draining_pgid = nil
+          state.draining_start_ticks = nil
+          state.pgid_reason = nil
+          ui.notify(
+            ("process exited (%s) with surviving background group (pgid %s) — released from build lock without killing"):format(
+              tostring(opts.exit_code),
+              tostring(active_pgid)
+            ),
+            vim.log.levels.WARN
+          )
+        end
+        return
+      end
+
+      local grace_ms = M._stop_grace_ms or 1000
+      local timeout_ms = M._restart_timeout_ms or 5000
+
+      if not sigkill_sent and elapsed >= grace_ms then
+        sigkill_sent = true
+        if active_pgid then
+          signal_group(active_pgid, active_ticks, "sigkill")
+        elseif state.pid then
+          kill_tree(state.pid, "KILL")
+        end
+      end
+
+      if elapsed >= timeout_ms then
+        stop_drain_timer()
+        local was_restarting = state.restarting
+        state.restarting = false
+        state.after_exit = nil
+        state.stopping = false
+        if was_restarting then
+          ui.notify("previous process did not exit in time — restart cancelled", vim.log.levels.WARN)
+        end
+      end
+    end)
+  )
+end
+
+local function finish(seq, code, redactions)
+  if seq ~= state.seq then
+    return
+  end
   local buf = state.buf
+  local pgid = state.pgid
+  local start_ticks = state.pgid_start_ticks
+
   state.running = false
   state.job = nil
+  state.pid = nil
+  state.cmd = nil
+  state.pgid = nil
+  state.pgid_start_ticks = nil
   state.status = code == 0 and "success" or "failed"
 
   for _, stream in ipairs({ "stdout", "stderr" }) do
     if pending[stream] ~= "" then
-      append(buf, { pending[stream] })
+      append(buf, { run_config.redact(pending[stream], redactions) })
       pending[stream] = ""
     end
   end
@@ -275,29 +560,106 @@ local function finish(code)
     fill_quickfix(buf)
   end
 
+  local msg = ("[%s] %s — exit %s"):format(state.kind or "build", state.status, tostring(code))
   ui.notify(
-    ("[%s] %s — exit %s"):format(state.kind or "build", state.status, tostring(code)),
+    run_config.redact(msg, redactions),
     state.status == "success" and vim.log.levels.INFO or vim.log.levels.ERROR
   )
+
+  state.redactions = {}
+
+  if pgid and group_alive(pgid, start_ticks) then
+    state.draining_pgid = pgid
+    state.draining_start_ticks = start_ticks
+    if not state.drain_timer then
+      if state.stopping or state.restarting then
+        start_drain_monitor(seq, pgid, start_ticks)
+      else
+        start_drain_monitor(seq, pgid, start_ticks, {
+          background = true,
+          exit_code = code,
+        })
+      end
+    end
+    return
+  end
+
+  stop_drain_timer()
+  state.pgid_reason = nil
+  state.draining_pgid = nil
+  state.draining_start_ticks = nil
+  state.stopping = false
+  local cb = state.after_exit
+  state.after_exit = nil
+  state.restarting = false
+  if cb then
+    cb()
+  end
 end
 
----Start a process. `cmd` is a list; it runs with setsid so the whole group
----can be stopped (avoids an orphan JVM from spring-boot:run). `root` is the
----originating project — the menu never treats this process as the current one.
-local function start(kind, cmd, cwd, root)
+---Start a process. `cmd` is a list; `root` is the originating project — the
+---menu never treats this process as the current one.
+---When `opts.use_env` is true, loads optional `root/.env` into `jobstart` env
+---without logging, notifying, displaying, or persisting secret values.
+---@param kind string
+---@param cmd string[]
+---@param cwd string
+---@param root string|nil
+---@param opts { use_env: boolean|nil, _secret_warned: boolean|nil, user_args: string[]|nil, build_args: string[]|nil }|nil
+local function start(kind, cmd, cwd, root, opts)
+  opts = opts or {}
   if state.running then
     ui.notify("a process is already running — stop it before starting another", vim.log.levels.WARN)
     return
   end
+  if is_draining() then
+    ui.notify("previous process group is still exiting — wait before starting another", vim.log.levels.WARN)
+    return
+  end
 
+  local project_root = root or cwd
+  local canon_root = run_config.canonical(project_root)
+  local env_res = run_config.load_env(canon_root)
+  local env_map = nil
+  local env_keys = {}
+  local redactions = {}
+
+  if opts.use_env then
+    for _, warn in ipairs(env_res.warnings) do
+      ui.notify(warn, vim.log.levels.WARN)
+    end
+  end
+  if env_res.exists and next(env_res.env) ~= nil then
+    redactions = run_config.collect_redactions(env_res.env)
+    if opts.use_env then
+      env_map = env_res.env
+      env_keys = env_res.keys
+    end
+  end
+
+  local user_args = opts.user_args
+  if user_args == nil then
+    user_args = {}
+    for i = 2, #cmd do
+      user_args[#user_args + 1] = cmd[i]
+    end
+  end
+  local cmd_has_secret = env_res.exists and run_config.overlaps_env(user_args, env_res.env)
+  local cmd_display = run_config.redact(table.concat(cmd, " "), redactions)
   local buf = open_output(kind)
-  append(buf, {
-    ("$ %s"):format(table.concat(cmd, " ")),
+  local header = {
+    ("$ %s"):format(cmd_display),
     ("cwd: %s"):format(cwd),
-    "",
-  })
+  }
+  if opts.use_env and #env_keys > 0 then
+    header[#header + 1] = ("env: .env loaded (%d variable(s), values hidden)"):format(#env_keys)
+  end
+  header[#header + 1] = ""
+  append(buf, header)
 
   local full = cmd
+  state.seq = state.seq + 1
+  local seq = state.seq
   pending.stdout, pending.stderr = "", ""
   local prev_win = vim.api.nvim_get_current_win() ---@type integer|nil
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
@@ -305,38 +667,92 @@ local function start(kind, cmd, cwd, root)
       prev_win = win
     end
   end
-  local job = vim.fn.jobstart(full, {
+
+  local job_opts = {
     cwd = cwd,
     stdout_buffered = false,
     stderr_buffered = false,
     on_stdout = function(_, data)
-      feed(buf, "stdout", data)
+      feed(seq, buf, "stdout", data, redactions)
     end,
     on_stderr = function(_, data)
-      feed(buf, "stderr", data)
+      feed(seq, buf, "stderr", data, redactions)
     end,
     on_exit = function(_, code)
       vim.schedule(function()
-        finish(code)
+        finish(seq, code, redactions)
       end)
     end,
-  })
+  }
+  if env_map then
+    job_opts.env = env_map
+  end
+
+  local job = vim.fn.jobstart(full, job_opts)
 
   if job <= 0 then
-    ui.notify("could not start: " .. table.concat(cmd, " "), vim.log.levels.ERROR)
+    ui.notify("could not start: " .. cmd_display, vim.log.levels.ERROR)
     return
   end
 
+  local ok_pid, job_pid = pcall(vim.fn.jobpid, job)
+  local pid = ok_pid and job_pid or nil
+  local pgid, start_ticks, pgid_reason = M._verify_own_pgid(pid)
   state.job = job
+  state.pid = pid
+  state.pgid = pgid
+  state.pgid_start_ticks = start_ticks
+  state.pgid_reason = pgid_reason
+  state.draining_pgid = nil
+  state.draining_start_ticks = nil
+  state.stopping = false
   state.buf = buf
   state.last_output = buf
   state.kind = kind
-  state.cmd = cmd
+  state.cmd = cmd_has_secret and redact_cmd_list(cmd, redactions) or cmd
   state.cwd = cwd
-  state.root = root or cwd
-  state.last_output_root = root or cwd
+  state.root = project_root
+  state.last_output_root = project_root
   state.running = true
   state.status = "running"
+  state.redactions = redactions
+
+  -- Record non-secret repeat/restart metadata ONLY after successful launch.
+  if cmd_has_secret then
+    if not opts._secret_warned then
+      ui.notify(
+        "command arguments overlap with .env values (including short substrings) — not persisted or recorded for Repeat/Restart",
+        vim.log.levels.WARN
+      )
+    end
+  else
+    last_runs[canon_root] = {
+      kind = kind,
+      cmd = vim.deepcopy(cmd),
+      cwd = cwd,
+      root = project_root,
+      use_env = opts.use_env == true,
+    }
+    if type(opts.build_args) == "table" and #opts.build_args > 0 then
+      last_builds[canon_root] = vim.deepcopy(opts.build_args)
+      local ok_save_build, save_build_err = run_config.save_last_build(canon_root, opts.build_args)
+      if not ok_save_build and save_build_err then
+        ui.notify(save_build_err, vim.log.levels.WARN)
+      end
+      local jc_str = run_config.format_jc_args(opts.build_args)
+      if jc_str then
+        local ok_jc, jc_err = jca.write_build_last(jc_str)
+        if not ok_jc then
+          ui.notify(jc_err, vim.log.levels.WARN)
+        end
+      else
+        ui.notify(
+          "build arguments contain quotes, whitespace, or empty tokens incompatible with jc build-last — saved for Java Menu Repeat Last only",
+          vim.log.levels.WARN
+        )
+      end
+    end
+  end
 
   -- keep focus in the code; the output split stays visible below
   if prev_win and vim.api.nvim_win_is_valid(prev_win) then
@@ -344,41 +760,47 @@ local function start(kind, cmd, cwd, root)
   end
 
   ui.notify(
-    ("%s started (project %s)\n$ %s\nin %s"):format(kind, vim.fs.basename(state.root), table.concat(cmd, " "), cwd),
+    ("%s started (project %s)\n$ %s\nin %s"):format(kind, vim.fs.basename(state.root), cmd_display, cwd),
     vim.log.levels.INFO
   )
 end
 
----Kill the process tree started by this job (children first).
-local function kill_tree(pid)
-  if not pid or pid <= 0 then
-    return
-  end
-  local ok, children = pcall(vim.fn.systemlist, { "pgrep", "-P", tostring(pid) })
-  if ok then
-    for _, child in ipairs(children or {}) do
-      local child_pid = tonumber(child)
-      if child_pid then
-        kill_tree(child_pid)
-      end
-    end
-  end
-  pcall(vim.fn.system, { "kill", "-TERM", tostring(pid) })
-end
-
----Stop the current process (and only its tree). When the process belongs to
+---Stop the current process (and only its process group). When the process belongs to
 ---another project, require an explicit user choice — never silently kill a
 ---job from a project other than the current buffer.
----@param confirmed boolean|nil
+---@param confirmed boolean|table|nil
 function M.stop(confirmed)
-  if not state.running or not state.job then
+  local current_root = project.root(context_buf())
+  local cur_canon = current_root and run_config.canonical(current_root) or nil
+  local active_root = state.root and run_config.canonical(state.root) or nil
+  local draining = is_draining()
+  local active = (state.running and state.job ~= nil) or draining
+
+  if type(confirmed) == "table" then
+    if
+      not active
+      or state.seq ~= confirmed.seq
+      or active_root ~= confirmed.origin_root
+      or (confirmed.context_root ~= nil and cur_canon ~= confirmed.context_root)
+    then
+      ui.notify("stop confirmation is stale — process or project changed", vim.log.levels.WARN)
+      return
+    end
+  end
+
+  if not active then
     ui.notify("no Java process is running", vim.log.levels.WARN)
     return
   end
-  local current_root = project.root(context_buf())
-  local from_other_project = state.root ~= nil and current_root ~= nil and state.root ~= current_root
+
+  local from_other_project = active_root ~= nil and cur_canon ~= nil and active_root ~= cur_canon
   if from_other_project and not confirmed then
     local origin = vim.fs.basename(state.root)
+    local token = {
+      seq = state.seq,
+      origin_root = active_root,
+      context_root = cur_canon,
+    }
     ui.pick_one(
       {
         ("No — keep the %s project process"):format(origin),
@@ -387,22 +809,131 @@ function M.stop(confirmed)
       "Java: Build — process belongs to another project",
       function(choice)
         if choice and choice:find("^Yes") then
-          M.stop(true)
+          M.stop(token)
         elseif choice then
-          ui.notify(("the %s project process was kept running"):format(origin), vim.log.levels.INFO)
+          local still_active = (state.running and state.job ~= nil) or is_draining()
+          local still_root = state.root and run_config.canonical(state.root) or nil
+          if still_active and state.seq == token.seq and still_root == token.origin_root then
+            ui.notify(("the %s project process was kept running"):format(origin), vim.log.levels.INFO)
+          else
+            ui.notify("stop confirmation is stale — process or project changed", vim.log.levels.WARN)
+          end
         end
       end
     )
     return
   end
-  local pid = vim.fn.jobpid(state.job)
-  kill_tree(pid)
-  pcall(vim.fn.jobstop, state.job)
+
+  local was_stopping = state.stopping
+  state.after_exit = nil
+  state.restarting = false
+  state.stopping = true
+  terminate_active((not state.running and draining and was_stopping) and "sigkill" or "sigterm")
+  start_drain_monitor(state.seq, state.pgid or state.draining_pgid, state.pgid_start_ticks or state.draining_start_ticks)
   ui.notify(
     from_other_project and ("the %s project process was stopped"):format(vim.fs.basename(state.root))
       or "process stopped",
     vim.log.levels.INFO
   )
+end
+
+---Restart the recorded command of the current project (stop if running, then re-run).
+---When a process from another project is running, asks for explicit confirmation.
+---@param confirmed boolean|table|nil
+function M.restart(confirmed)
+  local root = project.root(context_buf())
+  local canon_root = root and run_config.canonical(root) or nil
+  local draining = is_draining()
+  local active = (state.running and state.job ~= nil) or draining
+  local active_root = state.root and run_config.canonical(state.root) or nil
+
+  if type(confirmed) == "table" then
+    if
+      not active
+      or state.seq ~= confirmed.seq
+      or active_root ~= confirmed.origin_root
+      or canon_root ~= confirmed.target_root
+    then
+      ui.notify("restart confirmation is stale — process or project changed", vim.log.levels.WARN)
+      return
+    end
+  end
+
+  if not root then
+    ui.notify("no Maven/Gradle project (pom.xml, build.gradle) from this buffer", vim.log.levels.WARN)
+    return
+  end
+
+  local rec = last_runs[canon_root]
+  if not rec then
+    ui.notify("no previous command in this project", vim.log.levels.WARN)
+    return
+  end
+
+  if state.restarting then
+    ui.notify("a restart is already in progress", vim.log.levels.WARN)
+    return
+  end
+
+  local function launch()
+    start(rec.kind, vim.deepcopy(rec.cmd), rec.cwd, rec.root, { use_env = rec.use_env })
+  end
+
+  if not active then
+    launch()
+    return
+  end
+
+  local target_pgid = state.pgid or state.draining_pgid
+  if not target_pgid then
+    local reason = state.pgid_reason or "process group could not be verified"
+    ui.notify(
+      ("cannot automatically restart running process: %s — stop it manually before restarting"):format(reason),
+      vim.log.levels.WARN
+    )
+    return
+  end
+
+  local from_other_project = active_root ~= nil and active_root ~= canon_root
+  if from_other_project and not confirmed then
+    local origin = vim.fs.basename(state.root)
+    local token = {
+      seq = state.seq,
+      origin_root = active_root,
+      target_root = canon_root,
+    }
+    ui.pick_one(
+      {
+        ("No — keep the %s project process"):format(origin),
+        ("Yes — stop the %s project process and restart"):format(origin),
+      },
+      "Java: Build — process belongs to another project",
+      function(choice)
+        if choice and choice:find("^Yes") then
+          M.restart(token)
+        elseif choice then
+          local cur_root = project.root(context_buf())
+          local cur_canon = cur_root and run_config.canonical(cur_root) or nil
+          local still_active = (state.running and state.job ~= nil) or is_draining()
+          local still_root = state.root and run_config.canonical(state.root) or nil
+          if still_active and state.seq == token.seq and still_root == token.origin_root and cur_canon == token.target_root then
+            ui.notify(("the %s project process was kept running"):format(origin), vim.log.levels.INFO)
+          else
+            ui.notify("restart confirmation is stale — process or project changed", vim.log.levels.WARN)
+          end
+        end
+      end
+    )
+    return
+  end
+
+  local seq = state.seq
+  local target_ticks = state.pgid and state.pgid_start_ticks or state.draining_start_ticks
+  state.restarting = true
+  state.stopping = true
+  state.after_exit = launch
+  terminate_active("sigterm")
+  start_drain_monitor(seq, target_pgid, target_ticks)
 end
 
 ---Show the last output (from any project — the origin is identified in the menu).
@@ -449,13 +980,10 @@ local function run_build(tool, root, module, args, label)
   local scoped = scope_args(tool.tool, root, module, args)
   local cmd = { tool.runner }
   vim.list_extend(cmd, scoped)
-  last_builds[root] = table.concat(scoped, " ")
-  -- same state as jc :JCbuildLast (argument string per project)
-  local ok, err = jca.write_build_last(table.concat(scoped, " "))
-  if not ok then
-    ui.notify(err, vim.log.levels.WARN)
-  end
-  start(label or args[1], cmd, root, root)
+  start(label or args[1], cmd, root, root, {
+    user_args = args,
+    build_args = scoped,
+  })
 end
 
 ---Runtime classpath + project JDK via jdtls (source-buffer client).
@@ -512,13 +1040,60 @@ local function java_bin()
 end
 
 local function split_args(text)
-  if not text or vim.trim(text) == "" then
-    return {}
-  end
-  return vim.split(vim.trim(text), "%s+", { trimempty = true })
+  return run_config.split_args(text)
 end
 
 -- ---------- operations ----------
+
+local function choose_profile(scan, saved_profile, cb)
+  saved_profile = vim.trim(saved_profile or "")
+  if #scan.profiles == 0 then
+    ui.ask("Java: Build — Spring profile (optional): ", saved_profile, function(value)
+      if value ~= nil then
+        cb(vim.trim(value))
+      end
+    end)
+    return
+  end
+
+  local labels, by_label = {}, {}
+  local seen = {}
+  if saved_profile ~= "" then
+    local label = saved_profile .. "  (saved)"
+    labels[#labels + 1] = label
+    by_label[label] = saved_profile
+    seen[saved_profile] = true
+  end
+  for _, p in ipairs(scan.profiles) do
+    if not seen[p] then
+      seen[p] = true
+      labels[#labels + 1] = p
+      by_label[p] = p
+    end
+  end
+  local none_label = "(none — default)"
+  labels[#labels + 1] = none_label
+  by_label[none_label] = ""
+  local custom_label = "Custom profile…"
+  labels[#labels + 1] = custom_label
+  by_label[custom_label] = "__custom__"
+
+  ui.pick_one(labels, "Java: Build — Spring profile", function(choice)
+    local picked = by_label[choice]
+    if picked == nil then
+      return
+    end
+    if picked == "__custom__" then
+      ui.ask("Java: Build — Spring profile (optional): ", saved_profile, function(value)
+        if value ~= nil then
+          cb(vim.trim(value))
+        end
+      end)
+      return
+    end
+    cb(picked)
+  end)
+end
 
 local function ask_module(root, bufnr, cb)
   local modules = project.modules(root)
@@ -576,38 +1151,69 @@ local function do_choose_goal(root, bufnr, tool)
     if value == "" then
       return
     end
+    local parsed, arg_err = split_args(value)
+    if not parsed then
+      ui.notify(arg_err or "invalid arguments", vim.log.levels.ERROR)
+      return
+    end
     ask_module(root, bufnr, function(module)
-      run_build(tool, root, module, split_args(value), "goal")
+      run_build(tool, root, module, parsed, "goal")
     end)
   end)
 end
 
 local function do_repeat(root, bufnr, tool)
-  -- prefer this session's record by ROOT (never crosses projects);
-  -- without it, fall back to jc build-last (keyed by the cwd project)
-  local last = last_builds[root]
-  if not last or last == "" then
-    local err
-    last, err = jca.read_build_last()
-    if err then
-      ui.notify(err, vim.log.levels.WARN)
+  local canon_root = run_config.canonical(root)
+  -- prefer this session's argv record by ROOT (never crosses projects),
+  -- then Java Menu's per-root persisted argv, then jc build-last fallback
+  local last = last_builds[canon_root]
+  local parsed
+  if type(last) == "table" and #last > 0 then
+    parsed = vim.deepcopy(last)
+  else
+    local saved_last, saved_err = run_config.load_last_build(canon_root)
+    if saved_err then
+      ui.notify(saved_err, vim.log.levels.WARN)
     end
-  end
-  if not last or last == "" then
-    ui.notify("no previous build in this project", vim.log.levels.WARN)
-    return
+    if type(saved_last) == "table" and #saved_last > 0 then
+      parsed = saved_last
+    else
+      local jc_last = type(last) == "string" and last or nil
+      if not jc_last or jc_last == "" then
+        local err
+        jc_last, err = jca.read_build_last()
+        if err then
+          ui.notify(err, vim.log.levels.WARN)
+        end
+      end
+      if not jc_last or jc_last == "" then
+        ui.notify("no previous build in this project", vim.log.levels.WARN)
+        return
+      end
+      local arg_err
+      parsed, arg_err = split_args(jc_last)
+      if not parsed then
+        ui.notify(arg_err or "invalid arguments", vim.log.levels.ERROR)
+        return
+      end
+    end
   end
   if not tool.runner then
     ui.notify(tool.reason or "build tool unavailable", vim.log.levels.WARN)
     return
   end
-  start("build", vim.list_extend({ tool.runner }, split_args(last)), root, root)
+  start("build", vim.list_extend({ tool.runner }, parsed), root, root, { user_args = parsed })
 end
 
 local function run_main(root, bufnr, mains)
   if #mains == 0 then
     ui.notify("no class with public static void main found", vim.log.levels.WARN)
     return
+  end
+
+  local cfg, cfg_err = run_config.load(root)
+  if cfg_err then
+    ui.notify(cfg_err, vim.log.levels.WARN)
   end
 
   local labels, by_label = {}, {}
@@ -623,31 +1229,69 @@ local function run_main(root, bufnr, mains)
       return
     end
 
-    ui.ask("Java: Build — application arguments: ", "", function(args)
-      if args == nil then
+    ui.ask("Java: Build — JVM arguments (optional): ", cfg.jvm_args or "", function(jvm_args)
+      if jvm_args == nil then
         return
       end
-      local uri = vim.uri_from_fname(entry.path)
-      classpath_for(uri, bufnr, function(cp, err)
-        if not cp then
-          ui.notify("Run Main unavailable: " .. tostring(err), vim.log.levels.ERROR)
+      local jvm_list, jvm_err = split_args(jvm_args)
+      if not jvm_list then
+        ui.notify("JVM arguments: " .. tostring(jvm_err), vim.log.levels.ERROR)
+        return
+      end
+
+      ui.ask("Java: Build — application arguments (optional): ", cfg.app_args or "", function(app_args)
+        if app_args == nil then
+          return
+        end
+        local app_list, app_err = split_args(app_args)
+        if not app_list then
+          ui.notify("application arguments: " .. tostring(app_err), vim.log.levels.ERROR)
           return
         end
 
-        local java = java_bin()
-        if not is_exec(java) then
-          ui.notify("java not found (PATH/JAVA_HOME)", vim.log.levels.ERROR)
-          return
-        end
+        local uri = vim.uri_from_fname(entry.path)
+        classpath_for(uri, bufnr, function(cp, err)
+          if not cp then
+            ui.notify("Run Main unavailable: " .. tostring(err), vim.log.levels.ERROR)
+            return
+          end
 
-        local cmd = { java }
-        if #cp.classpaths > 0 then
-          vim.list_extend(cmd, { "-cp", table.concat(cp.classpaths, ":") })
-        end
-        cmd[#cmd + 1] = entry.fqn
-        vim.list_extend(cmd, split_args(args))
+          local java = java_bin()
+          if not is_exec(java) then
+            ui.notify("java not found (PATH/JAVA_HOME)", vim.log.levels.ERROR)
+            return
+          end
 
-        start("run_main", cmd, cp.project_root or entry.module or root, root)
+          local next_cfg = vim.deepcopy(cfg)
+          next_cfg.jvm_args = vim.trim(jvm_args)
+          next_cfg.app_args = vim.trim(app_args)
+          local ok_save, save_err = run_config.save(root, next_cfg)
+          local secret_warned = false
+          if ok_save then
+            cfg = next_cfg
+          elseif save_err then
+            ui.notify(save_err, vim.log.levels.WARN)
+            secret_warned = save_err:find("overlap", 1, true) ~= nil
+          end
+
+          local cmd = { java }
+          vim.list_extend(cmd, jvm_list)
+          if #cp.classpaths > 0 then
+            vim.list_extend(cmd, { "-cp", table.concat(cp.classpaths, ":") })
+          end
+          cmd[#cmd + 1] = entry.fqn
+          vim.list_extend(cmd, app_list)
+
+          local user_args = {}
+          vim.list_extend(user_args, jvm_list)
+          vim.list_extend(user_args, app_list)
+
+          start("run_main", cmd, cp.project_root or entry.module or root, root, {
+            use_env = next_cfg.use_env ~= false,
+            _secret_warned = secret_warned,
+            user_args = user_args,
+          })
+        end)
       end)
     end)
   end)
@@ -668,6 +1312,11 @@ local function run_spring(root, bufnr, spring)
     return
   end
 
+  local cfg, cfg_err = run_config.load(root)
+  if cfg_err then
+    ui.notify(cfg_err, vim.log.levels.WARN)
+  end
+
   local labels, by_label = {}, {}
   for _, mod in ipairs(spring) do
     local label = vim.fs.relpath(root, mod)
@@ -677,26 +1326,65 @@ local function run_spring(root, bufnr, spring)
 
   local function ask_and_run(module)
     local rel = vim.fs.relpath(root, module)
-    ui.ask("Java: Build — Spring profile (optional): ", "", function(profile)
-      if profile == nil then
-        return
-      end
-      ui.ask("Java: Build — application arguments (optional): ", "", function(args)
-        if args == nil then
+    local scan = run_config.scan_profiles(root, module)
+    choose_profile(scan, cfg.profile, function(profile)
+      ui.ask("Java: Build — JVM arguments (optional): ", cfg.jvm_args or "", function(jvm_args)
+        if jvm_args == nil then
           return
         end
-        local cmd = { tool.runner }
-        if module ~= root then
-          vim.list_extend(cmd, { "-pl", rel, "-am" })
+        local jvm_list, jvm_err = split_args(jvm_args)
+        if not jvm_list then
+          ui.notify("JVM arguments: " .. tostring(jvm_err), vim.log.levels.ERROR)
+          return
         end
-        cmd[#cmd + 1] = "spring-boot:run"
-        if vim.trim(profile) ~= "" then
-          cmd[#cmd + 1] = "-Dspring-boot.run.profiles=" .. vim.trim(profile)
-        end
-        if vim.trim(args) ~= "" then
-          cmd[#cmd + 1] = "-Dspring-boot.run.arguments=" .. vim.trim(args)
-        end
-        start("spring", cmd, root, root)
+
+        ui.ask("Java: Build — application arguments (optional): ", cfg.app_args or "", function(app_args)
+          if app_args == nil then
+            return
+          end
+          local app_list, app_err = split_args(app_args)
+          if not app_list then
+            ui.notify("application arguments: " .. tostring(app_err), vim.log.levels.ERROR)
+            return
+          end
+
+          local next_cfg = vim.deepcopy(cfg)
+          next_cfg.profile = vim.trim(profile)
+          next_cfg.jvm_args = vim.trim(jvm_args)
+          next_cfg.app_args = vim.trim(app_args)
+          local ok_save, save_err = run_config.save(root, next_cfg)
+          local secret_warned = false
+          if ok_save then
+            cfg = next_cfg
+          elseif save_err then
+            ui.notify(save_err, vim.log.levels.WARN)
+            secret_warned = save_err:find("overlap", 1, true) ~= nil
+          end
+
+          local cmd = { tool.runner }
+          if module ~= root then
+            vim.list_extend(cmd, { "-pl", rel, "-am" })
+          end
+          cmd[#cmd + 1] = "spring-boot:run"
+          local user_args = {}
+          if next_cfg.profile ~= "" then
+            cmd[#cmd + 1] = "-Dspring-boot.run.profiles=" .. next_cfg.profile
+            user_args[#user_args + 1] = next_cfg.profile
+          end
+          if next_cfg.jvm_args ~= "" then
+            cmd[#cmd + 1] = "-Dspring-boot.run.jvmArguments=" .. next_cfg.jvm_args
+            user_args[#user_args + 1] = next_cfg.jvm_args
+          end
+          if next_cfg.app_args ~= "" then
+            cmd[#cmd + 1] = "-Dspring-boot.run.arguments=" .. next_cfg.app_args
+            user_args[#user_args + 1] = next_cfg.app_args
+          end
+          start("spring", cmd, root, root, {
+            use_env = next_cfg.use_env ~= false,
+            _secret_warned = secret_warned,
+            user_args = user_args,
+          })
+        end)
       end)
     end)
   end
@@ -713,6 +1401,131 @@ local function run_spring(root, bufnr, spring)
   end)
 end
 
+---Configure per-project run settings (contextual profile, JVM/app args, .env toggle).
+function M.run_settings()
+  local root = project.root(context_buf())
+  if not root then
+    ui.notify("no Maven/Gradle project (pom.xml, build.gradle) from this buffer", vim.log.levels.WARN)
+    return
+  end
+
+  local cfg, cfg_err = run_config.load(root)
+  if cfg_err then
+    ui.notify(cfg_err, vim.log.levels.WARN)
+  end
+  local scan = run_config.scan_profiles(root)
+  local env_info = run_config.load_env(root)
+  for _, warn in ipairs(env_info.warnings) do
+    ui.notify(warn, vim.log.levels.WARN)
+  end
+
+  local entries = {
+    {
+      key = "profile",
+      label = ("Spring Profile: %s"):format(cfg.profile ~= "" and cfg.profile or "(none)"),
+      enabled = true,
+    },
+    {
+      key = "jvm_args",
+      label = ("JVM Arguments: %s"):format(cfg.jvm_args ~= "" and cfg.jvm_args or "(none)"),
+      enabled = true,
+    },
+    {
+      key = "app_args",
+      label = ("Application Arguments: %s"):format(cfg.app_args ~= "" and cfg.app_args or "(none)"),
+      enabled = true,
+    },
+    {
+      key = "use_env",
+      label = env_info.exists
+          and (".env File: %s (%d variable(s), values hidden)"):format(
+            cfg.use_env ~= false and "enabled" or "disabled",
+            #env_info.keys
+          )
+        or ".env File: not found (optional)",
+      enabled = env_info.exists,
+      reason = "no .env file at project root",
+    },
+    {
+      key = "reset",
+      label = "Reset Run Settings",
+      enabled = true,
+    },
+  }
+
+  local function persist_and_notify(next_cfg, msg)
+    local ok_save, save_err = run_config.save(root, next_cfg)
+    if not ok_save then
+      ui.notify(save_err or "could not save run settings", vim.log.levels.ERROR)
+      return false
+    end
+    cfg = next_cfg
+    ui.notify(msg, vim.log.levels.INFO)
+    return true
+  end
+
+  ui.menu(entries, ("Java: Run Settings — %s"):format(vim.fs.basename(root)), function(entry)
+    if entry.key == "profile" then
+      choose_profile(scan, cfg.profile, function(profile)
+        local next_cfg = vim.deepcopy(cfg)
+        next_cfg.profile = vim.trim(profile)
+        persist_and_notify(
+          next_cfg,
+          ("run profile set to %s (project %s)"):format(
+            next_cfg.profile ~= "" and next_cfg.profile or "(none)",
+            vim.fs.basename(root)
+          )
+        )
+      end)
+    elseif entry.key == "jvm_args" then
+      ui.ask("Java: Run Settings — JVM arguments: ", cfg.jvm_args or "", function(value)
+        if value == nil then
+          return
+        end
+        local parsed, err = split_args(value)
+        if not parsed then
+          ui.notify("JVM arguments: " .. tostring(err), vim.log.levels.ERROR)
+          return
+        end
+        local next_cfg = vim.deepcopy(cfg)
+        next_cfg.jvm_args = vim.trim(value)
+        persist_and_notify(next_cfg, ("JVM arguments updated (project %s)"):format(vim.fs.basename(root)))
+      end)
+    elseif entry.key == "app_args" then
+      ui.ask("Java: Run Settings — application arguments: ", cfg.app_args or "", function(value)
+        if value == nil then
+          return
+        end
+        local parsed, err = split_args(value)
+        if not parsed then
+          ui.notify("application arguments: " .. tostring(err), vim.log.levels.ERROR)
+          return
+        end
+        local next_cfg = vim.deepcopy(cfg)
+        next_cfg.app_args = vim.trim(value)
+        persist_and_notify(next_cfg, ("application arguments updated (project %s)"):format(vim.fs.basename(root)))
+      end)
+    elseif entry.key == "use_env" then
+      local next_cfg = vim.deepcopy(cfg)
+      next_cfg.use_env = not (cfg.use_env ~= false)
+      persist_and_notify(
+        next_cfg,
+        (".env injection %s (project %s)"):format(
+          next_cfg.use_env and "enabled" or "disabled",
+          vim.fs.basename(root)
+        )
+      )
+    elseif entry.key == "reset" then
+      local ok_reset, reset_err = run_config.reset(root)
+      if not ok_reset then
+        ui.notify(reset_err or "could not reset run settings", vim.log.levels.ERROR)
+        return
+      end
+      ui.notify(("run settings reset (project %s)"):format(vim.fs.basename(root)), vim.log.levels.INFO)
+    end
+  end)
+end
+
 -- ---------- menu ----------
 
 ---Entry point of `<leader>jb`.
@@ -724,6 +1537,7 @@ function M.build()
     return
   end
 
+  local canon_root = run_config.canonical(root)
   local tool = build_tool(root)
   local attached = jdtls_attached(bufnr)
   local mains = main_classes(root)
@@ -731,6 +1545,10 @@ function M.build()
   local java = java_bin()
   local can_build = tool ~= nil and tool.runner ~= nil
   local build_reason = (tool and tool.reason) or "no build tool found"
+  local rec = last_runs[canon_root]
+  local draining = is_draining()
+  local active = state.running or draining
+  local active_root = state.root and run_config.canonical(state.root) or nil
 
   local entries = {
     {
@@ -749,6 +1567,24 @@ function M.build()
         or (tool and tool.tool ~= "maven" and "spring-boot:run requires Maven")
         or build_reason,
     },
+    {
+      key = "restart",
+      label = rec and ("Restart Last Process (%s)"):format(rec.kind) or "Restart Last Process",
+      enabled = rec ~= nil and not (active and not (state.pgid or state.draining_pgid)),
+      reason = (not rec and "no previous command in this project")
+        or (active and not (state.pgid or state.draining_pgid) and (
+          "cannot automatically restart running process ("
+          .. (state.pgid_reason or "process group could not be verified")
+          .. ") — stop it manually first"
+        ))
+        or (active and active_root ~= canon_root and "process from another project — will ask for confirmation")
+        or "",
+    },
+    {
+      key = "run_settings",
+      label = "Run Settings…",
+      enabled = true,
+    },
     { key = "compile", label = "Compile", enabled = can_build, reason = build_reason },
     { key = "package", label = "Package", enabled = can_build, reason = build_reason },
     { key = "clean", label = "Clean", enabled = can_build, reason = build_reason },
@@ -763,21 +1599,29 @@ function M.build()
       key = "repeat",
       label = "Repeat Last",
       enabled = can_build and (function()
-        local last = last_builds[root]
-        if not last or last == "" then
-          last = jca.read_build_last()
+        local last = last_builds[canon_root]
+        if type(last) == "table" then
+          return #last > 0
         end
-        return last ~= nil and last ~= ""
+        if type(last) == "string" and last ~= "" then
+          return true
+        end
+        local saved_last = run_config.load_last_build(canon_root)
+        if type(saved_last) == "table" and #saved_last > 0 then
+          return true
+        end
+        local jc_last = jca.read_build_last()
+        return jc_last ~= nil and jc_last ~= ""
       end)(),
       reason = (not can_build and build_reason) or "no previous build in this project",
     },
     {
       key = "stop",
-      label = state.running and state.root and ("Stop Running Process — project %s"):format(
+      label = active and state.root and ("Stop Running Process — project %s"):format(
         vim.fs.basename(state.root)
       ) or "Stop Running Process",
-      enabled = state.running,
-      reason = (state.running and state.root ~= root and "process from another project — will ask for confirmation")
+      enabled = active,
+      reason = (active and active_root ~= canon_root and "process from another project — will ask for confirmation")
         or "no process running",
     },
     {
@@ -799,6 +1643,10 @@ function M.build()
         run_main(root, bufnr, mains)
       elseif entry.key == "run_spring" then
         run_spring(root, bufnr, springs)
+      elseif entry.key == "restart" then
+        M.restart()
+      elseif entry.key == "run_settings" then
+        M.run_settings()
       elseif entry.key == "compile" then
         do_goal(root, bufnr, tool, LIFECYCLE.compile)
       elseif entry.key == "package" then
@@ -828,5 +1676,8 @@ M._spring_modules = spring_modules
 M._module_for = module_for
 M._scope_args = scope_args
 M._last_builds = last_builds
+M._last_runs = last_runs
+M._is_draining = is_draining
+M._verify_own_pgid = verify_own_pgid
 
 return M

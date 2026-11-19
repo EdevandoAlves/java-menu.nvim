@@ -92,6 +92,8 @@ FAST_SPECS=(
   project_info_spec
   environment_spec
   deps_spec
+  tests_navigation_spec
+  run_experience_spec
 )
 
 # INTEGRATION: JDTLS real (lsp_clients, refactor_lsp, jdtls_projects inclui

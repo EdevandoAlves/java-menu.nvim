@@ -2,6 +2,23 @@
 
 *Phase 7A — architecture plan (no code changes in this phase)*
 
+## Current module boundaries
+
+The sections below record the original 7A plan and its assumptions at the
+time. Project creation and dependency management have since been implemented.
+The current entry point registers menu groups lazily; `project_menu` coordinates
+the project UI, while `create`, `deps`, and `diagnostics` own their respective
+workflows. `project` provides project discovery without depending on the menu.
+The dependency menu exposes `available(bufnr)` and `menu(bufnr)` as its
+cross-module interface; callers should not rely on underscore-prefixed helpers.
+`ui`, `lsp`, and `jc` isolate user interaction, client selection, and jc.nvim
+compatibility. Build process lifecycle stays in `build`, and test navigation
+stays in `tests`; both consume project discovery instead of owning it.
+
+Keep these boundaries when extending a workflow: pass the buffer or project
+context explicitly, avoid starting language servers from discovery code, and
+add shared abstractions only when multiple consumers need the same behavior.
+
 Index:
 1. Product Vision
 2. Design Principles

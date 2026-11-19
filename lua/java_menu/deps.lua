@@ -113,12 +113,15 @@ end
 ---@param bufnr integer|nil
 ---@return boolean available
 ---@return string|nil reason
-function M._available(bufnr)
+function M.available(bufnr)
   if require("java_menu.project").root(bufnr) ~= nil then
     return true
   end
   return false, NO_PROJECT_REASON
 end
+
+-- Compatibility for existing callers of the former internal helper.
+M._available = M.available
 
 ---Resolve everything the menus/report need for the buffer.
 ---@param bufnr integer|nil

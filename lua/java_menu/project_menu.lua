@@ -179,7 +179,7 @@ end
 function M.project()
   local ui = require("java_menu.ui")
   local bufnr = context_buf()
-  local deps_available, deps_reason = require("java_menu.deps")._available(bufnr)
+  local deps_available, deps_reason = require("java_menu.deps").available(bufnr)
 
   local entries = {
     { key = "new", label = "New Project…", enabled = true },
