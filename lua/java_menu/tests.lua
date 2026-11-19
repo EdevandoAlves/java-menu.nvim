@@ -232,7 +232,8 @@ local function resolve_counterpart(buf_or_path, root)
   local current_mod = parsed.module_dir
   local cur_label = module_label(root, current_mod)
   local direction, target_set, names, default_name = counterpart_spec(parsed)
-  local default_target = default_name and build_target_path(current_mod, target_set, parsed.rel_dir, default_name) or nil
+  local default_target = default_name and build_target_path(current_mod, target_set, parsed.rel_dir, default_name)
+    or nil
   local default_fqn = default_name and ((parsed.pkg ~= "" and (parsed.pkg .. ".") or "") .. default_name) or nil
   local multimodule = #mods > 1
 
@@ -269,10 +270,7 @@ local function resolve_counterpart(buf_or_path, root)
   local other_matches = {}
   for _, mod in ipairs(mods) do
     if mod ~= current_mod then
-      vim.list_extend(
-        other_matches,
-        find_matches_in_module(mod, target_set, parsed.rel_dir, parsed.pkg, names, root)
-      )
+      vim.list_extend(other_matches, find_matches_in_module(mod, target_set, parsed.rel_dir, parsed.pkg, names, root))
     end
   end
   if #other_matches > 0 then
@@ -397,7 +395,10 @@ local function create_test_file(target_path, class_name, pkg)
   local written, write_err = vim.uv.fs_write(fd, rendered, 0)
   local closed, close_err = vim.uv.fs_close(fd)
   if written ~= #rendered or not closed then
-    ui.notify("could not finish writing test: " .. tostring(write_err or close_err or "short write"), vim.log.levels.ERROR)
+    ui.notify(
+      "could not finish writing test: " .. tostring(write_err or close_err or "short write"),
+      vim.log.levels.ERROR
+    )
     return false
   end
   if not open_file(target_path) then
@@ -527,8 +528,7 @@ local function goto_counterpart(buf_or_path, root)
     end
   end
 
-  local prompt = nav.status == "cross_module"
-      and ("Java: Tests — no paired test in " .. nav.module_label)
+  local prompt = nav.status == "cross_module" and ("Java: Tests — no paired test in " .. nav.module_label)
     or ("Java: Tests — no paired test for " .. nav.source_name)
   ui.pick_one(labels, prompt, function(choice)
     if actions[choice] then
@@ -694,8 +694,7 @@ local function goto_entry(is_java, nav)
       enabled = true,
     }
   elseif nav.status == "cross_module" then
-    local suffix = #nav.matches == 1
-        and ("  (" .. nav.matches[1].module_label .. " · " .. nav.matches[1].name .. ")")
+    local suffix = #nav.matches == 1 and ("  (" .. nav.matches[1].module_label .. " · " .. nav.matches[1].name .. ")")
       or ("  (" .. #nav.matches .. " modules…)")
     return {
       key = "goto_test",

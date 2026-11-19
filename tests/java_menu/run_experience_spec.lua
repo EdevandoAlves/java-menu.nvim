@@ -207,10 +207,8 @@ do
     end
   end
   assert(idx_a and idx_b and idx_a < idx_b, "secret_a deve vir antes de secret_b na ordenação")
-  local redacted = run_config.redact(
-    ("token=%s prefix=%s exit 1 cmd=%s"):format(secret_a, secret_b, cmd_sub),
-    redactions
-  )
+  local redacted =
+    run_config.redact(("token=%s prefix=%s exit 1 cmd=%s"):format(secret_a, secret_b, cmd_sub), redactions)
   assert(not redacted:find(secret_a, 1, true), "secret_a não foi redigido")
   assert(not redacted:find(secret_b, 1, true), "secret_b não foi redigido")
   assert(not redacted:find(cmd_sub, 1, true), "cmd_sub não foi redigido")
@@ -221,7 +219,7 @@ end
 -- ========== 3. split_args sem shell ==========
 
 do
-  local a, err = run_config.split_args('-Xmx512m -Dmsg="hello world" --tag=\'v 1\'')
+  local a, err = run_config.split_args("-Xmx512m -Dmsg=\"hello world\" --tag='v 1'")
   assert(err == nil and vim.deep_equal(a, { "-Xmx512m", "-Dmsg=hello world", "--tag=v 1" }), vim.inspect(a))
   local b, berr = run_config.split_args('-Dbad="unclosed')
   assert(b == nil and berr ~= nil, "aspas abertas deveriam falhar")
@@ -238,12 +236,8 @@ do
   vim.fn.mkdir(p2, "p")
 
   assert(run_config.storage_path(p1) ~= run_config.storage_path(p2), "mesmo basename colidiu no storage_path")
-  assert(
-    run_config.save(p1, { profile = "dev", jvm_args = "-Xmx1g", app_args = "--port=8081", use_env = true })
-  )
-  assert(
-    run_config.save(p2, { profile = "prod", jvm_args = "-Xmx2g", app_args = "--port=8082", use_env = false })
-  )
+  assert(run_config.save(p1, { profile = "dev", jvm_args = "-Xmx1g", app_args = "--port=8081", use_env = true }))
+  assert(run_config.save(p2, { profile = "prod", jvm_args = "-Xmx2g", app_args = "--port=8082", use_env = false }))
 
   local c1 = run_config.load(p1)
   local c2 = run_config.load(p2)
@@ -549,9 +543,7 @@ menu_cb(entry("run_main"))
 
 assert(
   fixtures.wait_for(10000, function()
-    return not build._state.running
-      and build._state.status == "success"
-      and vim.fn.filereadable(java_capture) == 1
+    return not build._state.running and build._state.status == "success" and vim.fn.filereadable(java_capture) == 1
   end),
   "Run Main não concluiu"
 )
@@ -636,9 +628,7 @@ do
 
   assert(
     fixtures.wait_for(10000, function()
-      return build._state.running
-        and build._state.seq > first_seq
-        and vim.fn.filereadable(child_pid_file) == 1
+      return build._state.running and build._state.seq > first_seq and vim.fn.filereadable(child_pid_file) == 1
     end),
     "Restart não relançou após encerramento completo do grupo resistente"
   )
@@ -677,16 +667,22 @@ do
     open_file(pair[2])
     build.build()
     menu_cb(entry("compile"))
-    assert(fixtures.wait_for(5000, function() return build._state.running end))
+    assert(fixtures.wait_for(5000, function()
+      return build._state.running
+    end))
     build.stop(true)
-    assert(fixtures.wait_for(5000, function() return not build._state.running end))
+    assert(fixtures.wait_for(5000, function()
+      return not build._state.running
+    end))
   end
 
   -- Inicia processo em s1
   open_file(main_s1)
   build.build()
   menu_cb(entry("compile"))
-  assert(fixtures.wait_for(5000, function() return build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return build._state.running
+  end))
   local seq_s1 = build._state.seq
 
   -- Captura callbacks pendentes de M.stop e M.restart a partir de s2 sem responder ainda
@@ -708,11 +704,15 @@ do
 
   -- Troca s1 -> s3 (novo processo, nova seq e novo projeto!)
   build.stop(true)
-  assert(fixtures.wait_for(5000, function() return not build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return not build._state.running
+  end))
   open_file(main_s3)
   build.build()
   menu_cb(entry("compile"))
-  assert(fixtures.wait_for(5000, function() return build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return build._state.running
+  end))
   local pid_s3 = build._state.pid
   local seq_s3 = build._state.seq
   assert(seq_s3 > seq_s1)
@@ -733,13 +733,17 @@ do
   assert(has_notice("stale"), "callback stale de restart deveria avisar")
 
   build.stop(true)
-  assert(fixtures.wait_for(5000, function() return not build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return not build._state.running
+  end))
 
   -- Callback stale por mudança de projeto do buffer mesmo quando seq original ainda roda
   open_file(main_s1)
   build.build()
   menu_cb(entry("compile"))
-  assert(fixtures.wait_for(5000, function() return build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return build._state.running
+  end))
   local pid_s1_b = build._state.pid
   local seq_s1_b = build._state.seq
 
@@ -763,7 +767,9 @@ do
   assert(has_notice("stale"), "mudança de projeto deveria invalidar confirmação")
 
   build.stop(true)
-  assert(fixtures.wait_for(5000, function() return not build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return not build._state.running
+  end))
 end
 
 -- ========== 10. Regression (3): Args com aspas preservados no Repeat Last e jc ==========
@@ -773,18 +779,24 @@ do
   local samples = {
     { "clean", "package" },
     { "-Dmsg=hello world", "--tag=v 1", "test" },
-    { '-Dquote="hi there"', "it's ok", 'mix"and\'both', "" },
+    { '-Dquote="hi there"', "it's ok", "mix\"and'both", "" },
   }
   for _, argv in ipairs(samples) do
     local formatted = run_config.format_args(argv)
     local parsed, perr = run_config.split_args(formatted)
-    assert(perr == nil and vim.deep_equal(parsed, argv), "roundtrip divergiu: " .. vim.inspect({ formatted, parsed, argv }))
+    assert(
+      perr == nil and vim.deep_equal(parsed, argv),
+      "roundtrip divergiu: " .. vim.inspect({ formatted, parsed, argv })
+    )
   end
   assert(run_config.format_args({ "clean", "package" }) == "clean package", "args simples devem permanecer sem aspas")
 
   -- format_jc_args: só serializa quando parser por %s+ do jc reproduz fielmente
   assert(run_config.format_jc_args({ "clean", "package" }) == "clean package", "format_jc_args falhou em args simples")
-  assert(run_config.format_jc_args({ "-Dmsg=hello world", "compile" }) == nil, "arg com espaço não é compatível com jc")
+  assert(
+    run_config.format_jc_args({ "-Dmsg=hello world", "compile" }) == nil,
+    "arg com espaço não é compatível com jc"
+  )
   assert(run_config.format_jc_args({ '-Dx="quoted"' }) == nil, "arg com aspas não é compatível com jc")
   assert(run_config.format_jc_args({ "" }) == nil, "arg vazio não é compatível com jc")
   assert(run_config.format_jc_args({ "a\nb" }) == nil, "arg com newline não é compatível com jc")
@@ -811,7 +823,7 @@ do
   open_file(main_q)
   notices = {}
   build.build()
-  ask_script = { '-Dmsg="hello world" --note=\'two  spaces\' compile' }
+  ask_script = { "-Dmsg=\"hello world\" --note='two  spaces' compile" }
   menu_cb(entry("choose_goal"))
   assert(
     fixtures.wait_for(10000, function()
@@ -849,7 +861,10 @@ do
     end),
     "repeat persistido do java_menu com aspas não concluiu"
   )
-  assert(read_raw(q_capture) == expected_lines, "repeat próprio perdeu aspas após limpar memória: " .. read_raw(q_capture))
+  assert(
+    read_raw(q_capture) == expected_lines,
+    "repeat próprio perdeu aspas após limpar memória: " .. read_raw(q_capture)
+  )
 
   -- Args simples sem aspas/espaços continuam gravando jc build-last normalmente
   vim.fn.delete(q_capture)
@@ -898,14 +913,19 @@ do
 
   -- Substrings curtas de .env também são protegidas (aceitando falsos positivos como --server.port=9091)
   local env_map = run_config.load_env(root_sec).env
-  assert(run_config.overlaps_env("--server.port=9091", env_map), "--server.port=9091 contém substring '9' e deve ser protegido")
+  assert(
+    run_config.overlaps_env("--server.port=9091", env_map),
+    "--server.port=9091 contém substring '9' e deve ser protegido"
+  )
   assert(run_config.overlaps_env("--pin=9", env_map), "--pin=9 deveria colidir com SHORT_PIN=9")
   assert(run_config.overlaps_env("-Dpw=xab12", env_map), "substring curta 'ab' deve ser protegida")
   assert(run_config.overlaps_env({ "-Dflag=ab12" }, env_map), "substring curta 'ab' em argv deve ser protegida")
   assert(run_config.overlaps_env("-Dapi.key=" .. secret_val, env_map), "valor secreto deveria colidir")
 
   -- Persistência direta via run_config.save recusa segredo (inclusive curto) e preserva config segura anterior
-  assert(run_config.save(root_sec, { profile = "dev", jvm_args = "-Xmx512m", app_args = "--port=8080", use_env = true }))
+  assert(
+    run_config.save(root_sec, { profile = "dev", jvm_args = "-Xmx512m", app_args = "--port=8080", use_env = true })
+  )
   local ok_short_save, short_save_err =
     run_config.save(root_sec, { profile = "dev", jvm_args = "-Dpw=ab12", app_args = "", use_env = true })
   assert(not ok_short_save and short_save_err ~= nil, "run_config.save deveria recusar substring curta do .env")
@@ -1027,7 +1047,10 @@ do
     end),
     "choose_goal com substring curta do .env não concluiu"
   )
-  assert(build._last_builds[run_config.canonical(root_sec)] == nil, "_last_builds não pode reter substring curta do .env")
+  assert(
+    build._last_builds[run_config.canonical(root_sec)] == nil,
+    "_last_builds não pode reter substring curta do .env"
+  )
   assert(build._last_runs[run_config.canonical(root_sec)] == nil, "_last_runs não pode reter substring curta do .env")
   assert(jc_sec_store["build-last"] == "clean", "jc build-last não pode ser sobrescrito com substring curta!")
   assert(has_notice("overlap"), "usuário deveria ser avisado em choose_goal com substring curta")
@@ -1072,9 +1095,13 @@ do
   open_file(main_pg)
   build.build()
   menu_cb(entry("compile"))
-  assert(fixtures.wait_for(5000, function() return build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return build._state.running
+  end))
   build.stop(true)
-  assert(fixtures.wait_for(5000, function() return not build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return not build._state.running
+  end))
 
   -- Simula falha de verificação de PGID no próximo processo ativo
   local real_verify = build._verify_own_pgid
@@ -1084,7 +1111,9 @@ do
 
   build.build()
   menu_cb(entry("compile"))
-  assert(fixtures.wait_for(5000, function() return build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return build._state.running
+  end))
   local unverified_pid = build._state.pid
   local unverified_seq = build._state.seq
   assert(build._state.pgid == nil and build._state.pgid_reason == "simulated shared PGID")
@@ -1095,13 +1124,18 @@ do
 
   notices = {}
   build.restart()
-  assert(build._state.running and build._state.seq == unverified_seq and pid_alive(unverified_pid), "Restart automático não pode parar nem sobrepor processo com PGID não verificado")
+  assert(
+    build._state.running and build._state.seq == unverified_seq and pid_alive(unverified_pid),
+    "Restart automático não pode parar nem sobrepor processo com PGID não verificado"
+  )
   assert(not build._state.restarting, "estado restarting deve permanecer false")
   assert(has_notice("simulated shared PGID"), "Restart recusado deve reportar motivo do PGID")
 
   build._verify_own_pgid = real_verify
   build.stop(true)
-  assert(fixtures.wait_for(5000, function() return not build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return not build._state.running
+  end))
   assert(not pid_alive(unverified_pid), "stop manual deve conseguir encerrar processo mesmo sem PGID")
 end
 
@@ -1128,9 +1162,7 @@ do
   menu_cb(entry("compile"))
   assert(
     fixtures.wait_for(5000, function()
-      return not build._state.running
-        and build._state.status == "success"
-        and vim.fn.filereadable(bg_pid_file) == 1
+      return not build._state.running and build._state.status == "success" and vim.fn.filereadable(bg_pid_file) == 1
     end),
     "processo líder deveria ter saído com sucesso"
   )
@@ -1190,10 +1222,15 @@ do
   -- 14a. Primeiro build válido grava histórico
   build.build()
   menu_cb(entry("compile"))
-  assert(fixtures.wait_for(5000, function() return build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return build._state.running
+  end))
   assert(vim.deep_equal(build._last_builds[canon_h], { "compile" }), "compile lançado deveria gravar _last_builds")
   assert(jc_hist_store["build-last"] == "compile", "compile lançado deveria gravar jc build-last")
-  assert(vim.deep_equal(run_config.load_last_build(canon_h), { "compile" }), "compile lançado deveria persistir last_build")
+  assert(
+    vim.deep_equal(run_config.load_last_build(canon_h), { "compile" }),
+    "compile lançado deveria persistir last_build"
+  )
 
   -- 14b. Tentativa rejeitada porque já há processo rodando NÃO altera histórico
   notices = {}
@@ -1201,12 +1238,20 @@ do
   ask_script = { "package" }
   menu_cb(entry("choose_goal"))
   assert(has_notice("already running"), "tentativa concorrente deveria ser rejeitada")
-  assert(vim.deep_equal(build._last_builds[canon_h], { "compile" }), "tentativa rejeitada (running) não pode alterar _last_builds")
+  assert(
+    vim.deep_equal(build._last_builds[canon_h], { "compile" }),
+    "tentativa rejeitada (running) não pode alterar _last_builds"
+  )
   assert(jc_hist_store["build-last"] == "compile", "tentativa rejeitada (running) não pode alterar jc build-last")
-  assert(vim.deep_equal(run_config.load_last_build(canon_h), { "compile" }), "tentativa rejeitada (running) não pode alterar last_build em disco")
+  assert(
+    vim.deep_equal(run_config.load_last_build(canon_h), { "compile" }),
+    "tentativa rejeitada (running) não pode alterar last_build em disco"
+  )
 
   build.stop(true)
-  assert(fixtures.wait_for(5000, function() return not build._state.running end))
+  assert(fixtures.wait_for(5000, function()
+    return not build._state.running
+  end))
 
   -- 14c. Falha em jobstart (job <= 0) NÃO altera histórico
   local real_jobstart = vim.fn.jobstart
@@ -1222,7 +1267,10 @@ do
   assert(has_notice("could not start"), "falha em jobstart deveria notificar erro")
   assert(vim.deep_equal(build._last_builds[canon_h], { "compile" }), "jobstart<=0 não pode alterar _last_builds")
   assert(jc_hist_store["build-last"] == "compile", "jobstart<=0 não pode alterar jc build-last")
-  assert(vim.deep_equal(run_config.load_last_build(canon_h), { "compile" }), "jobstart<=0 não pode alterar last_build em disco")
+  assert(
+    vim.deep_equal(run_config.load_last_build(canon_h), { "compile" }),
+    "jobstart<=0 não pode alterar last_build em disco"
+  )
 
   package.loaded["jc.settings"] = prev_jc_settings
 end

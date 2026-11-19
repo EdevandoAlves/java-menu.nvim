@@ -117,10 +117,7 @@ for _, pair in ipairs({
 }) do
   open_java_buf(pair[1])
   tests_mod._goto_counterpart(0, single_root)
-  assert(
-    canonical(vim.api.nvim_buf_get_name(0)) == canonical(pair[2]),
-    pair[1] .. " failed to jump to " .. pair[3]
-  )
+  assert(canonical(vim.api.nvim_buf_get_name(0)) == canonical(pair[2]), pair[1] .. " failed to jump to " .. pair[3])
   tests_mod._goto_counterpart(0, single_root)
   assert(
     canonical(vim.api.nvim_buf_get_name(0)) == canonical(pair[1]),
@@ -160,10 +157,7 @@ stub_select(function(items)
   end
 end)
 tests_mod._goto_counterpart(0, single_root)
-assert(
-  canonical(vim.api.nvim_buf_get_name(0)) == canonical(multi_it),
-  "selecting MultiIT should open MultiIT.java"
-)
+assert(canonical(vim.api.nvim_buf_get_name(0)) == canonical(multi_it), "selecting MultiIT should open MultiIT.java")
 
 -- ---------- 3. Missing counterpart (safe non-destructive behavior) ----------
 
@@ -178,10 +172,7 @@ captured_select = {}
 stub_select(nil)
 tests_mod._goto_counterpart(0, single_root)
 assert(#captured_select == 1, "missing test counterpart should prompt instead of writing blindly")
-assert(
-  vim.fn.filereadable(lonely_expected_test) == 0,
-  "canceling missing test prompt must not create LonelyTest.java"
-)
+assert(vim.fn.filereadable(lonely_expected_test) == 0, "canceling missing test prompt must not create LonelyTest.java")
 local missing_opts = table.concat(captured_select[1].items, "\n")
 assert(missing_opts:find("Create com.lonely.LonelyTest", 1, true), "picker should offer Create LonelyTest")
 assert(missing_opts:find("Open com.lonely.ScenarioTest", 1, true), "picker should offer package test ScenarioTest")
@@ -225,7 +216,10 @@ local unsaved_buf = vim.api.nvim_get_current_buf()
 vim.cmd("hide edit " .. vim.fn.fnameescape(unsaved_main))
 tests_mod._goto_counterpart(0, single_root)
 assert(vim.api.nvim_get_current_buf() == unsaved_buf, "should open the existing unsaved buffer")
-assert(vim.api.nvim_buf_get_lines(unsaved_buf, 0, 1, false)[1] == "unsaved user content", "must preserve unsaved content")
+assert(
+  vim.api.nvim_buf_get_lines(unsaved_buf, 0, 1, false)[1] == "unsaved user content",
+  "must preserve unsaved content"
+)
 assert(vim.fn.filereadable(unsaved_test) == 0, "must not write over an unsaved buffer")
 vim.bo[unsaved_buf].modified = false
 
@@ -262,7 +256,10 @@ assert(
 open_java_buf(scratch_java)
 clear_notices()
 tests_mod._goto_counterpart(0, single_root)
-assert(vim.fn.filereadable(single_root .. "/ScratchTest.java") == 0, "non-source-root file must not create ScratchTest.java")
+assert(
+  vim.fn.filereadable(single_root .. "/ScratchTest.java") == 0,
+  "non-source-root file must not create ScratchTest.java"
+)
 
 -- ---------- 4. Multi-module resolution & prioritization ----------
 
@@ -323,16 +320,25 @@ end
 
 -- Same-name class in api and worker stays module-isolated
 local api_nav = tests_mod._resolve_counterpart(api_thing, mm_root)
-assert(api_nav.status == "match" and canonical(api_nav.target) == canonical(api_thing_test), "api Thing should resolve to api ThingTest")
+assert(
+  api_nav.status == "match" and canonical(api_nav.target) == canonical(api_thing_test),
+  "api Thing should resolve to api ThingTest"
+)
 
 local worker_nav = tests_mod._resolve_counterpart(worker_thing_test, mm_root)
-assert(worker_nav.status == "match" and canonical(worker_nav.target) == canonical(worker_thing), "worker ThingTest should resolve to worker Thing")
+assert(
+  worker_nav.status == "match" and canonical(worker_nav.target) == canonical(worker_thing),
+  "worker ThingTest should resolve to worker Thing"
+)
 
 -- Cross-module to_class with unique match jumps directly and informs module
 open_java_buf(it_unique)
 clear_notices()
 tests_mod._goto_counterpart(0, mm_root)
-assert(canonical(vim.api.nvim_buf_get_name(0)) == canonical(api_unique), "UniqueFeatureIT should jump across modules to UniqueFeature")
+assert(
+  canonical(vim.api.nvim_buf_get_name(0)) == canonical(api_unique),
+  "UniqueFeatureIT should jump across modules to UniqueFeature"
+)
 assert(
   last_notice() and last_notice().msg:find("services/api", 1, true),
   "cross-module jump should report module: " .. tostring(last_notice() and last_notice().msg)
@@ -350,7 +356,10 @@ stub_select(function(items)
 end)
 tests_mod._goto_counterpart(0, mm_root)
 assert(#captured_select == 1, "cross-module ambiguous to_class should open picker")
-assert(canonical(vim.api.nvim_buf_get_name(0)) == canonical(worker_thing), "picker choice should open worker Thing.java")
+assert(
+  canonical(vim.api.nvim_buf_get_name(0)) == canonical(worker_thing),
+  "picker choice should open worker Thing.java"
+)
 
 -- Cross-module to_test offers Open from other module AND Create in current module
 open_java_buf(api_unique)
@@ -360,7 +369,10 @@ tests_mod._goto_counterpart(0, mm_root)
 assert(#captured_select == 1, "cross-module to_test should prompt")
 local cross_opts = table.concat(captured_select[1].items, "\n")
 assert(cross_opts:find("Open integration-tests · com.mm.UniqueFeatureIT", 1, true), "should offer other-module test")
-assert(cross_opts:find("Create services/api · com.mm.UniqueFeatureTest", 1, true), "should offer creating in current module")
+assert(
+  cross_opts:find("Create services/api · com.mm.UniqueFeatureTest", 1, true),
+  "should offer creating in current module"
+)
 assert(
   vim.fn.filereadable(mm_root .. "/services/api/src/test/java/com/mm/UniqueFeatureTest.java") == 0,
   "cancel must not create file"
@@ -372,8 +384,14 @@ assert(#listed == 5, "expected 5 declared test files (excluding rogue), got " ..
 for _, item in ipairs(listed) do
   assert(not item.label:find("RogueTest", 1, true), "undeclared rogue module must not be listed")
 end
-assert(listed[1].label == "services/api · com.mm.ThingTest", "tier 1 should prioritize same module + same package: " .. listed[1].label)
-assert(listed[2].label == "services/api · com.mm.other.OtherTest", "tier 2 should prioritize same module: " .. listed[2].label)
+assert(
+  listed[1].label == "services/api · com.mm.ThingTest",
+  "tier 1 should prioritize same module + same package: " .. listed[1].label
+)
+assert(
+  listed[2].label == "services/api · com.mm.other.OtherTest",
+  "tier 2 should prioritize same module: " .. listed[2].label
+)
 
 -- ---------- 5. Contextual <leader>jt menu, defaults & reason consistency ----------
 
@@ -444,16 +462,31 @@ captured_select = {}
 stub_select(nil)
 tests_mod.tests()
 assert(#captured_select == 1, "menu should open for pom.xml")
-assert(captured_select[1].prompt == "Java: Tests — services/api", "prompt should reflect module: " .. captured_select[1].prompt)
+assert(
+  captured_select[1].prompt == "Java: Tests — services/api",
+  "prompt should reflect module: " .. captured_select[1].prompt
+)
 local pom_items = captured_select[1].items
-assert(pom_items[1]:find("^Run Test Suite  %(module: services/api%)"), "non-Java buffer should prioritize Run Test Suite: " .. pom_items[1])
+assert(
+  pom_items[1]:find("^Run Test Suite  %(module: services/api%)"),
+  "non-Java buffer should prioritize Run Test Suite: " .. pom_items[1]
+)
 assert(pom_items[2]:find("^Pick Test"), "second entry on non-Java buffer should be Pick Test: " .. pom_items[2])
 local _, nearest_pom = find_line(pom_items, "Run Nearest Test")
-assert(nearest_pom and nearest_pom:find("(unavailable: open a .java file)", 1, true), "nearest reason should be consistent: " .. tostring(nearest_pom))
+assert(
+  nearest_pom and nearest_pom:find("(unavailable: open a .java file)", 1, true),
+  "nearest reason should be consistent: " .. tostring(nearest_pom)
+)
 local _, file_pom = find_line(pom_items, "Run Test File")
-assert(file_pom and file_pom:find("(unavailable: open a .java file)", 1, true), "file reason should be consistent: " .. tostring(file_pom))
+assert(
+  file_pom and file_pom:find("(unavailable: open a .java file)", 1, true),
+  "file reason should be consistent: " .. tostring(file_pom)
+)
 local _, goto_pom = find_line(pom_items, "Go to Test / Class")
-assert(goto_pom and goto_pom:find("(unavailable: open a .java file)", 1, true), "goto_test reason should be consistent: " .. tostring(goto_pom))
+assert(
+  goto_pom and goto_pom:find("(unavailable: open a .java file)", 1, true),
+  "goto_test reason should be consistent: " .. tostring(goto_pom)
+)
 
 -- (b) Java buffer WITHOUT jdtls attached: Go to Test/Class promoted to #1 and works!
 vim.lsp.get_clients = function()
@@ -486,7 +519,10 @@ tests_mod.tests()
 local test_items = captured_select[1].items
 assert(test_items[1]:find("^Run Nearest Test$"), "Java test buffer #1 should be Run Nearest Test: " .. test_items[1])
 assert(test_items[2]:find("^Run Test File$"), "Java test buffer #2 should be Run Test File: " .. test_items[2])
-assert(test_items[3]:find("^Go to Class  %(Thing%)$"), "Java test buffer #3 should be Go to Class (Thing): " .. test_items[3])
+assert(
+  test_items[3]:find("^Go to Class  %(Thing%)$"),
+  "Java test buffer #3 should be Go to Class (Thing): " .. test_items[3]
+)
 
 -- Missing source class disables Go to Class with clear reason
 open_java_buf(orphan_test)
@@ -518,7 +554,10 @@ clear_notices()
 stub_select(nil)
 tests_mod.tests()
 assert(#captured_select == 0, "nofile context must not guess a project")
-assert(last_notice() and last_notice().msg:find("open a project file", 1, true), "nofile context should explain how to proceed")
+assert(
+  last_notice() and last_notice().msg:find("open a project file", 1, true),
+  "nofile context should explain how to proceed"
+)
 
 -- ---------- cleanup ----------
 

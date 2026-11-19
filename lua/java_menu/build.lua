@@ -829,7 +829,11 @@ function M.stop(confirmed)
   state.restarting = false
   state.stopping = true
   terminate_active((not state.running and draining and was_stopping) and "sigkill" or "sigterm")
-  start_drain_monitor(state.seq, state.pgid or state.draining_pgid, state.pgid_start_ticks or state.draining_start_ticks)
+  start_drain_monitor(
+    state.seq,
+    state.pgid or state.draining_pgid,
+    state.pgid_start_ticks or state.draining_start_ticks
+  )
   ui.notify(
     from_other_project and ("the %s project process was stopped"):format(vim.fs.basename(state.root))
       or "process stopped",
@@ -916,7 +920,12 @@ function M.restart(confirmed)
           local cur_canon = cur_root and run_config.canonical(cur_root) or nil
           local still_active = (state.running and state.job ~= nil) or is_draining()
           local still_root = state.root and run_config.canonical(state.root) or nil
-          if still_active and state.seq == token.seq and still_root == token.origin_root and cur_canon == token.target_root then
+          if
+            still_active
+            and state.seq == token.seq
+            and still_root == token.origin_root
+            and cur_canon == token.target_root
+          then
             ui.notify(("the %s project process was kept running"):format(origin), vim.log.levels.INFO)
           else
             ui.notify("restart confirmation is stale — process or project changed", vim.log.levels.WARN)
@@ -1437,12 +1446,10 @@ function M.run_settings()
     },
     {
       key = "use_env",
-      label = env_info.exists
-          and (".env File: %s (%d variable(s), values hidden)"):format(
-            cfg.use_env ~= false and "enabled" or "disabled",
-            #env_info.keys
-          )
-        or ".env File: not found (optional)",
+      label = env_info.exists and (".env File: %s (%d variable(s), values hidden)"):format(
+        cfg.use_env ~= false and "enabled" or "disabled",
+        #env_info.keys
+      ) or ".env File: not found (optional)",
       enabled = env_info.exists,
       reason = "no .env file at project root",
     },
@@ -1510,10 +1517,7 @@ function M.run_settings()
       next_cfg.use_env = not (cfg.use_env ~= false)
       persist_and_notify(
         next_cfg,
-        (".env injection %s (project %s)"):format(
-          next_cfg.use_env and "enabled" or "disabled",
-          vim.fs.basename(root)
-        )
+        (".env injection %s (project %s)"):format(next_cfg.use_env and "enabled" or "disabled", vim.fs.basename(root))
       )
     elseif entry.key == "reset" then
       local ok_reset, reset_err = run_config.reset(root)
@@ -1572,11 +1576,7 @@ function M.build()
       label = rec and ("Restart Last Process (%s)"):format(rec.kind) or "Restart Last Process",
       enabled = rec ~= nil and not (active and not (state.pgid or state.draining_pgid)),
       reason = (not rec and "no previous command in this project")
-        or (active and not (state.pgid or state.draining_pgid) and (
-          "cannot automatically restart running process ("
-          .. (state.pgid_reason or "process group could not be verified")
-          .. ") — stop it manually first"
-        ))
+        or (active and not (state.pgid or state.draining_pgid) and ("cannot automatically restart running process (" .. (state.pgid_reason or "process group could not be verified") .. ") — stop it manually first"))
         or (active and active_root ~= canon_root and "process from another project — will ask for confirmation")
         or "",
     },
@@ -1617,9 +1617,8 @@ function M.build()
     },
     {
       key = "stop",
-      label = active and state.root and ("Stop Running Process — project %s"):format(
-        vim.fs.basename(state.root)
-      ) or "Stop Running Process",
+      label = active and state.root and ("Stop Running Process — project %s"):format(vim.fs.basename(state.root))
+        or "Stop Running Process",
       enabled = active,
       reason = (active and active_root ~= canon_root and "process from another project — will ask for confirmation")
         or "no process running",

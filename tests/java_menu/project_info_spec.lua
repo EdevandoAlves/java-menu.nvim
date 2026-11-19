@@ -68,7 +68,10 @@ project_menu.info(0)
 local lines = read_report()
 assert(find_line(lines, "Root: ") == "Root: " .. real_root, "root divergiu: " .. tostring(find_line(lines, "Root: ")))
 assert(find_line(lines, "Build tool: ") == "Build tool: Maven", "build tool divergiu")
-assert(find_line(lines, "Modules: ") == "Modules: 1", "contagem de módulos divergiu: " .. tostring(find_line(lines, "Modules: ")))
+assert(
+  find_line(lines, "Modules: ") == "Modules: 1",
+  "contagem de módulos divergiu: " .. tostring(find_line(lines, "Modules: "))
+)
 assert(vim.tbl_contains(lines, "  ."), "lista de módulos sem a raiz: " .. vim.inspect(lines))
 assert(vim.tbl_contains(lines, "  src/main/java"), "source root da raiz ausente: " .. vim.inspect(lines))
 assert(find_line(lines, "JDTLS: ") == "JDTLS: not attached", "JDTLS deveria estar desanexado nesta sessão")
@@ -100,7 +103,10 @@ buffer_for(gradle .. "/app/src/main/java/.keep")
 project_menu.info(0)
 lines = read_report()
 assert(find_line(lines, "Build tool: ") == "Build tool: Gradle", "build tool Gradle divergiu")
-assert(find_line(lines, "Modules: ") == "Modules: 2", "módulos Gradle divergiram: " .. tostring(find_line(lines, "Modules: ")))
+assert(
+  find_line(lines, "Modules: ") == "Modules: 2",
+  "módulos Gradle divergiram: " .. tostring(find_line(lines, "Modules: "))
+)
 assert(vim.tbl_contains(lines, "  app"), "módulo app ausente na lista Gradle")
 
 -- Gradle com include dinâmico: limitação explícita, nunca módulo inventado

@@ -59,7 +59,10 @@ assert(create._validate(maven_opts(valid_parent)) == nil, "opts maven válidas f
 
 for _, bad in ipairs({ "", "a/b", "..", "../evil", "x/y", ".hidden", "trailing." }) do
   local reason = create._validate(plain_opts(valid_parent, bad))
-  assert(reason ~= nil and reason:find("invalid project name", 1, true), "nome '" .. bad .. "' não rejeitado: " .. tostring(reason))
+  assert(
+    reason ~= nil and reason:find("invalid project name", 1, true),
+    "nome '" .. bad .. "' não rejeitado: " .. tostring(reason)
+  )
 end
 
 -- ---------- 3. _validate: package e release inválidos ----------
@@ -68,7 +71,10 @@ for _, bad in ipairs({ "", "1abc", "a..b", "a.b.", ".a", "com.class" }) do
   local opts = plain_opts(valid_parent)
   opts.pkg = bad
   local reason = create._validate(opts)
-  assert(reason ~= nil and reason:find("invalid package", 1, true), "package '" .. bad .. "' não rejeitado: " .. tostring(reason))
+  assert(
+    reason ~= nil and reason:find("invalid package", 1, true),
+    "package '" .. bad .. "' não rejeitado: " .. tostring(reason)
+  )
 end
 
 local bad_release = plain_opts(valid_parent)
@@ -92,7 +98,10 @@ assert(create._validate(plain_opts(parent_file)):find("not a directory", 1, true
 local occupied = valid_parent .. "/occupied"
 vim.fn.mkdir(occupied, "p")
 vim.fn.writefile({ "x" }, occupied .. "/keep.txt")
-assert(create._validate(plain_opts(valid_parent, "occupied")):find("not empty", 1, true), "target não vazio foi aceito")
+assert(
+  create._validate(plain_opts(valid_parent, "occupied")):find("not empty", 1, true),
+  "target não vazio foi aceito"
+)
 
 vim.fn.mkdir(valid_parent .. "/ready", "p")
 assert(create._validate(plain_opts(valid_parent, "ready")) == nil, "target vazio deveria ser aceito")
@@ -129,7 +138,10 @@ assert(vim.fn.filereadable(main_path) == 1, "Main.java não criado em " .. main_
 local main_text = table.concat(vim.fn.readfile(main_path), "\n")
 assert(main_text:find("package com.example.app;", 1, true), "package ausente no Main.java:\n" .. main_text)
 assert(main_text:find("static void main", 1, true), "método main ausente no Main.java:\n" .. main_text)
-assert(vim.deep_equal(entries(plain_parent), { "app" }), "o parent tem lixo além do projeto: " .. vim.inspect(entries(plain_parent)))
+assert(
+  vim.deep_equal(entries(plain_parent), { "app" }),
+  "o parent tem lixo além do projeto: " .. vim.inspect(entries(plain_parent))
+)
 assert(not exists(plain_parent .. "/.app.java-menu-stage"), "staging não removido")
 
 -- ---------- 8. happy path maven ----------
