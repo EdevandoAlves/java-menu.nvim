@@ -23,6 +23,7 @@ M.actions = {
   build = { key = "b", module = "java_menu.build", entry = "build", modes = { "n" }, desc = "Build/Run" },
   tests = { key = "t", module = "java_menu.tests", entry = "tests", modes = { "n" }, desc = "Tests" },
   debug = { key = "d", module = "java_menu.debug", entry = "debug", modes = { "n" }, desc = "Debug" },
+  project = { key = "p", module = "java_menu.project_menu", entry = "project", modes = { "n" }, desc = "Project" },
 }
 
 M.config = {

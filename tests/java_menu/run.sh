@@ -86,6 +86,12 @@ FAST_SPECS=(
   project_gradle_spec
   project_nested_spec
   project_workspace_spec
+  project_menu_spec
+  create_project_spec
+  spring_project_spec
+  project_info_spec
+  environment_spec
+  deps_spec
 )
 
 # INTEGRATION: JDTLS real (lsp_clients, refactor_lsp, jdtls_projects inclui
@@ -96,6 +102,9 @@ INTEGRATION_SPECS=(
   generate_lsp_spec
   jdtls_projects_spec
   build_isolation_spec
+  project_create_real_spec
+  spring_project_real_spec
+  deps_sync_real_spec
 )
 
 # --- execução ----------------------------------------------------------------

@@ -22,9 +22,9 @@ CONTENTS                                                      *java-menu-content
 1. INTRODUCTION                                                *java-menu-intro*
 
 java-menu.nvim is a contextual menu layer for Java development in Neovim.
-Seven groups — New, Generate, Refactor, Imports, Build/Run, Tests, Debug —
-collect the operations you need for the current situation, and every entry
-says whether it is available and, when it is not, why.
+Eight groups — New, Generate, Refactor, Imports, Build/Run, Tests,
+Debug, Project — collect the operations you need for the current situation,
+and every entry says whether it is available and, when it is not, why.
 
 The Java work itself is done by |jc.nvim| and by the jdtls language server
 you already run. java-menu.nvim never starts, installs or manages a language
@@ -51,7 +51,10 @@ inside a Java project; they are not gated on |filetype| alone.
 - Optional: snacks.nvim (pickers; falls back to `vim.ui.select`/
   `vim.ui.input`), which-key.nvim (group label), neotest (Tests menu,
   via jc.nvim's adapter), nvim-dap + java-debug bundle (Debug menu),
-  Maven or Gradle (Build/Run; `mvnw`/`gradlew` preferred when executable).
+  Maven or Gradle (Build/Run; `mvnw`/`gradlew` preferred when executable),
+  `curl` (or `wget`) and `unzip` (Spring Boot project creation via Spring
+  Initializr; `curl`/`wget` also enables optional Maven Central search —
+  Plain Java, Maven creation and manual Maven dependency entry work offline).
 
 Developed and tested on Neovim 0.12, Linux. The practical Neovim floor is
 the one jc.nvim itself requires; older versions are untested.
@@ -114,6 +117,7 @@ dependency instead of half-registering menus.
       build = true,
       tests = true,
       debug = true,
+      project = true,
     },
     which_key = true,     -- label the group in which-key when installed
   })
@@ -137,9 +141,9 @@ Behavior you get without asking:
                                                             *java-menu-javamenu*
                                                               *java-menu-trigger-cmd*
 `:JavaMenu [group]` ~
-Opens one of the seven menus, with command-line completion for
-`new | generate | refactor | imports | build | tests | debug`. Without an
-argument it lists the accepted groups.
+Opens one of the eight menus, with command-line completion for
+`new | generate | refactor | imports | build | tests | debug | project`.
+Without an argument it lists the accepted groups.
 
 ==============================================================================
 6. KEYMAPS                                                    *java-menu-keymaps*
@@ -156,6 +160,7 @@ Global keymaps registered by `setup()`; `<prefix>` is the `prefix` option
 |n    | `<prefix>b`      | Build / Run               | Maven or Gradle          |
 |n    | `<prefix>t`      | Tests                     | neotest + jdtls          |
 |n    | `<prefix>d`      | Debug                     | nvim-dap + java-debug    |
+|n    | `<prefix>p`      | Project                   | no jdtls needed          |
 
 Keymap conflicts with mappings that are not java-menu's are never
 overwritten: yours is kept, ours is skipped, and the conflict is reported.
@@ -222,6 +227,70 @@ offered; ambiguous ones are flagged), debug nearest/class JUnit test via
 jdtls' java-test, attach to a running JVM, toggle/conditional breakpoints
 and session controls — through nvim-dap and the java-debug bundle.
 
+                                                                *java-menu-project*
+Project ~
+Project-level actions, available even in an empty directory and without
+jdtls. Four entries:
+  New Project...    Wizard for Plain Java, Maven and Spring Boot projects.
+                    Nothing is written before the final confirmation;
+                    cancelling at any step creates nothing. Generation or
+                    extraction is staged in a hidden sibling directory and
+                    published by atomic rename (entry-by-entry into an
+                    already-empty target); rollback removes only what was
+                    created, an existing destination is never overwritten
+                    (empty ones are reused) and symlinks are refused.
+                    Plain and Maven work offline: Maven writes a minimal
+                    deterministic pom.xml (maven.compiler.release, zero
+                    dependencies) plus Main.java, resources and test dirs;
+                    plain writes Main.java only. Main.java prints
+                    "Hello from <name>!" — jc.nvim's main template is used
+                    when it satisfies that contract, but v1.7.0 renders an
+                    empty body, so a built-in generator is used in practice.
+                    Spring Boot queries Spring Initializr (requires network,
+                    `curl` or `wget`, and `unzip`; disabled with a checked
+                    reason when tools are missing), lets you pick build
+                    type, Boot version, packaging, Java version, coordinates
+                    and optional dependencies, validates the zip listing
+                    before extraction (rejecting `..`, absolute/drive paths,
+                    symlinks and non-file/non-dir entries), re-checks the
+                    extracted tree before publishing, and offers Retry or
+                    Cancel on network errors without leaving partial files.
+                    Opens Main.java (plain/Maven) or pom.xml/build.gradle*
+                    (Spring Boot), reports the full path and a compile/run
+                    hint. No cwd change, no jdtls start, no git init, no
+                    scripts.
+  Project Info...   Read-only buffer (q closes): root, build tool (Maven |
+                    Gradle | Plain Java (no build file)), modules (count +
+                    relpaths), source roots, Gradle discovery limitation,
+                    jdtls attached (workspace dir) or not. Enabled when a
+                    build file or a src/main/java directory is found above
+                    the buffer.
+  Dependencies...   Enabled in Maven or Gradle projects (multi-module
+                    projects pick the module first, current module on top).
+                    - List dependencies...: read-only report (q closes).
+                      Maven lists project-level dependencies, parent,
+                      dependencyManagement and BOM/profile notes. Gradle
+                      reads Groovy build.gradle string/catalog entries plus
+                      gradle/libs.versions.toml and reports dynamic forms or
+                      Kotlin DSL (.kts, deferred) explicitly.
+                    - Add dependency... (Maven only; disabled on Gradle):
+                      optional Maven Central search or offline manual entry,
+                      dedupe by literal groupId+artifactId, honest BOM/parent
+                      version notes, refuses unsaved pom.xml buffers,
+                      byte/comment-preserving surgical insertion after
+                      confirmation, and per-buffer JDTLS sync
+                      (`java/projectConfigurationUpdate`) when attached.
+                    - Open build file: opens pom.xml / build.gradle(.kts).
+                    - Sync JDTLS: re-imports the build file on the buffer's
+                      attached JDTLS client (disabled when not attached).
+  Environment...    Read-only buffer (q closes): Neovim version, java/javac,
+                    JAVA_HOME, Maven/Gradle, curl/wget and unzip, wrappers,
+                    jdtls attached (client count + workspace dir) or not
+                    (never started), jc.nvim available / MISSING (required),
+                    and optional snacks/which-key/neotest/nvim-dap with
+                    consequences. Strictly informative: installs, fixes and
+                    builds nothing.
+
 ==============================================================================
 8. WORKSPACEEDIT PREVIEW                                     *java-menu-preview*
 
@@ -267,6 +336,20 @@ generate delegate methods.
   Dynamic declarations produce a partial-result note instead of invented
   modules. Gradle task execution is untested (no Gradle in the test
   environment); Maven execution is tested for real.
+- Plain Java projects have no build file: Build/Run does not apply, and the
+  Java release entered in the wizard is informational only — nothing records
+  it. Project Info detects them through a src/main/java directory.
+- Generated Main.java uses a built-in generator today: jc.nvim's main
+  template (used automatically when it satisfies the contract) renders an
+  empty body in v1.7.0.
+- Spring Boot creation requires network access to Spring Initializr plus
+  `curl` (or `wget`) and `unzip` on PATH; no local version matrix is
+  bundled. Network errors offer Retry or Cancel and leave no partial files.
+- Dependencies: Maven edits are surgical text insertions (no XML parser);
+  textual <parent>/BOM detection cannot prove per-artifact version coverage
+  and notes this explicitly when <version> is omitted. Gradle is read-only
+  (editing disabled, Kotlin DSL static parsing deferred).
+- Project creation runs no git init and installs/configures no tools.
 - Rename Package / Move Package are disabled (see |java-menu-refactor|).
 - Tested on Linux only; no Windows/macOS validation.
 
