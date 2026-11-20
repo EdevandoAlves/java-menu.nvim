@@ -36,11 +36,15 @@ local GRADLE_CONFIGS = {
   implementation = true,
   api = true,
   compileOnly = true,
+  compileOnlyApi = true,
   runtimeOnly = true,
   annotationProcessor = true,
   testImplementation = true,
   testCompileOnly = true,
   testRuntimeOnly = true,
+  testAnnotationProcessor = true,
+  developmentOnly = true,
+  testAndDevelopmentOnly = true,
   classpath = true,
 }
 
@@ -870,17 +874,217 @@ end
 ---@param coord string
 ---@return table|nil
 local function split_coordinate(coord)
+  if type(coord) ~= "string" or coord == "" or coord:find("%s") then
+    return nil
+  end
+  local raw = coord:gsub("@[^:@]+$", "")
+  local parts = vim.split(raw, ":", { plain = true })
+  if #parts < 2 or #parts > 4 then
+    return nil
+  end
+  local group, artifact, version = parts[1], parts[2], parts[3]
+  if group == "" or artifact == "" then
+    return nil
+  end
+  if version == "" then
+    version = nil
+  end
+  return { groupId = group, artifactId = artifact, version = version }
+end
+
+---Parse a single-line TOML inline table `{ k = v, ... }` into typed entries.
+---@param text string
+---@return table<string, table>|nil
+local function parse_toml_inline_table(text)
+  local trimmed = trim(text)
+  if trimmed:sub(1, 1) ~= "{" or trimmed:sub(-1, -1) ~= "}" then
+    return nil
+  end
+  local inner = trimmed:sub(2, -2)
   local parts = {}
-  for part in tostring(coord):gmatch("[^:]+") do
-    parts[#parts + 1] = part
+  local start_idx = 1
+  local quote = nil
+  local brace, bracket = 0, 0
+  local i = 1
+  local n = #inner
+  while i <= n do
+    local ch = inner:sub(i, i)
+    if quote then
+      if quote == '"' and ch == "\\" then
+        i = i + 2
+      else
+        if ch == quote then
+          quote = nil
+        end
+        i = i + 1
+      end
+    elseif ch == '"' or ch == "'" then
+      quote = ch
+      i = i + 1
+    elseif ch == "{" then
+      brace = brace + 1
+      i = i + 1
+    elseif ch == "}" then
+      brace = brace - 1
+      if brace < 0 then
+        return nil
+      end
+      i = i + 1
+    elseif ch == "[" then
+      bracket = bracket + 1
+      i = i + 1
+    elseif ch == "]" then
+      bracket = bracket - 1
+      if bracket < 0 then
+        return nil
+      end
+      i = i + 1
+    elseif ch == "," and brace == 0 and bracket == 0 then
+      parts[#parts + 1] = trim(inner:sub(start_idx, i - 1))
+      start_idx = i + 1
+      i = i + 1
+    else
+      i = i + 1
+    end
   end
-  if #parts >= 3 then
-    return { groupId = parts[1], artifactId = parts[2], version = parts[3] }
+  if quote or brace ~= 0 or bracket ~= 0 then
+    return nil
   end
-  if #parts == 2 then
-    return { groupId = parts[1], artifactId = parts[2] }
+  local last_part = trim(inner:sub(start_idx))
+  if #parts > 0 or last_part ~= "" then
+    parts[#parts + 1] = last_part
   end
-  return nil
+
+  local entries = {}
+  for _, part in ipairs(parts) do
+    if part == "" then
+      return nil
+    end
+    local eq = part:find("=", 1, true)
+    if not eq then
+      return nil
+    end
+    local raw_key = trim(part:sub(1, eq - 1))
+    local norm_key = raw_key:gsub("%s*%.%s*", ".")
+    if norm_key == "" or not norm_key:match("^[%w_%-%.]+$") then
+      return nil
+    end
+    local val_str = trim(part:sub(eq + 1))
+    if val_str == "" then
+      return nil
+    end
+    local first = val_str:sub(1, 1)
+    if first == '"' then
+      local j = 2
+      local out = {}
+      local closed = false
+      while j <= #val_str do
+        local c = val_str:sub(j, j)
+        if c == "\\" then
+          local nxt = val_str:sub(j + 1, j + 1)
+          if nxt == "" then
+            return nil
+          end
+          out[#out + 1] = nxt
+          j = j + 2
+        elseif c == '"' then
+          closed = true
+          j = j + 1
+          break
+        else
+          out[#out + 1] = c
+          j = j + 1
+        end
+      end
+      if not closed or j <= #val_str then
+        return nil
+      end
+      entries[norm_key] = { kind = "string", value = table.concat(out) }
+    elseif first == "'" then
+      local close_q = val_str:find("'", 2, true)
+      if not close_q or close_q ~= #val_str then
+        return nil
+      end
+      entries[norm_key] = { kind = "string", value = val_str:sub(2, -2) }
+    elseif first == "{" then
+      local sub = parse_toml_inline_table(val_str)
+      if not sub then
+        return nil
+      end
+      entries[norm_key] = { kind = "table", entries = sub }
+    else
+      entries[norm_key] = { kind = "other", raw = val_str }
+    end
+  end
+  return entries
+end
+
+---Resolve a `[libraries]` inline table's version / version.* entries safely.
+---@param lib table
+---@param entries table<string, table>
+---@param module_version string|nil
+---@param versions table<string, string>
+local function apply_catalog_version(lib, entries, module_version, versions)
+  local version_keys = {}
+  for k in pairs(entries) do
+    if k == "version" or k:sub(1, 8) == "version." then
+      version_keys[#version_keys + 1] = k
+    end
+  end
+
+  if #version_keys == 0 then
+    if module_version then
+      lib.version = module_version
+    end
+    return
+  end
+
+  if #version_keys == 1 and entries["version"] then
+    local v = entries["version"]
+    if v.kind == "string" then
+      if v.value ~= "" then
+        lib.version = v.value
+      else
+        lib.note = "rich or empty version constraint not resolved"
+      end
+    elseif v.kind == "table" then
+      local t = v.entries
+      local count = 0
+      for _ in pairs(t) do
+        count = count + 1
+      end
+      if count == 1 and t.ref and t.ref.kind == "string" and t.ref.value ~= "" then
+        local ref = t.ref.value
+        if versions[ref] then
+          lib.version = versions[ref]
+        else
+          lib.note = "unresolved version.ref: " .. ref
+        end
+      else
+        lib.note = "rich version constraint not resolved"
+      end
+    else
+      lib.note = "unsupported version in catalog"
+    end
+    return
+  end
+
+  if #version_keys == 1 and entries["version.ref"] then
+    local v = entries["version.ref"]
+    if v.kind == "string" and v.value ~= "" then
+      local ref = v.value
+      if versions[ref] then
+        lib.version = versions[ref]
+      else
+        lib.note = "unresolved version.ref: " .. ref
+      end
+    else
+      lib.note = "unsupported version.ref in catalog"
+    end
+    return
+  end
+
+  lib.note = "rich version constraint not resolved"
 end
 
 ---Static parse of gradle/libs.versions.toml ([versions] and [libraries]).
@@ -898,6 +1102,9 @@ function M._parse_version_catalog(toml_text)
         section = trim(header)
       elseif section == "versions" then
         local key, value = line:match('^([%w%._%-]+)%s*=%s*"(.-)"$')
+        if not key then
+          key, value = line:match("^([%w%._%-]+)%s*=%s*'(.-)'$")
+        end
         if key then
           versions[key] = value
         elseif line:find("=", 1, true) then
@@ -907,7 +1114,7 @@ function M._parse_version_catalog(toml_text)
         local alias, rest = line:match("^([%w%._%-]+)%s*=%s*(.+)$")
         if alias then
           local lib
-          local coord = rest:match('^"(.-)"$')
+          local coord = rest:match('^"(.-)"$') or rest:match("^'(.-)'$")
           if coord then
             lib = split_coordinate(coord)
             if lib then
@@ -916,29 +1123,23 @@ function M._parse_version_catalog(toml_text)
               lib = { alias = alias, note = "unsupported coordinate: " .. coord }
             end
           elseif rest:find("^%b{}") then
-            local module = rest:match('module%s*=%s*"([^"]+)"')
-            local group = rest:match('group%s*=%s*"([^"]+)"')
-            local name = rest:match('name%s*=%s*"([^"]+)"')
-            local version = rest:match('version%s*=%s*"([^"]+)"')
-            local ref = rest:match('version%s*%.%s*ref%s*=%s*"([^"]+)"')
-            local group_id, artifact_id = group, name
-            if module then
-              local parsed = split_coordinate(module)
-              if parsed then
-                group_id, artifact_id = parsed.groupId, parsed.artifactId
-                version = version or parsed.version
-              end
-            end
-            if group_id and artifact_id then
-              lib = { alias = alias, groupId = group_id, artifactId = artifact_id }
-              if ref then
-                if versions[ref] then
-                  lib.version = versions[ref]
-                else
-                  lib.note = "unresolved version.ref: " .. ref
+            local entries = parse_toml_inline_table(rest)
+            if entries then
+              local module = entries.module and entries.module.kind == "string" and entries.module.value or nil
+              local group = entries.group and entries.group.kind == "string" and entries.group.value or nil
+              local name = entries.name and entries.name.kind == "string" and entries.name.value or nil
+              local group_id, artifact_id, module_version = group, name, nil
+              if module then
+                local parsed = split_coordinate(module)
+                if parsed then
+                  group_id, artifact_id, module_version = parsed.groupId, parsed.artifactId, parsed.version
                 end
-              elseif version then
-                lib.version = version
+              end
+              if group_id and artifact_id then
+                lib = { alias = alias, groupId = group_id, artifactId = artifact_id }
+                apply_catalog_version(lib, entries, module_version, versions)
+              else
+                lib = { alias = alias, note = "libraries entry not understood: " .. line }
               end
             else
               lib = { alias = alias, note = "libraries entry not understood: " .. line }
@@ -953,25 +1154,99 @@ function M._parse_version_catalog(toml_text)
     end
   end
 
+  local by_normalized = {}
+  for alias in pairs(by_alias) do
+    local norm = alias:gsub("[%-_%.]", ".")
+    local list = by_normalized[norm]
+    if not list then
+      list = {}
+      by_normalized[norm] = list
+    end
+    list[#list + 1] = alias
+  end
+  local ambiguous_norms = {}
+  for norm, aliases in pairs(by_normalized) do
+    if #aliases > 1 then
+      table.sort(aliases)
+      ambiguous_norms[#ambiguous_norms + 1] = { norm = norm, aliases = aliases }
+    end
+  end
+  table.sort(ambiguous_norms, function(a, b)
+    return a.norm < b.norm
+  end)
+  for _, item in ipairs(ambiguous_norms) do
+    notes[#notes + 1] = ("ambiguous catalog accessor libs.%s (aliases: %s)"):format(
+      item.norm,
+      table.concat(item.aliases, ", ")
+    )
+  end
+
   return { versions = versions, libraries = libraries, by_alias = by_alias, notes = notes }
 end
 
 ---Resolve a `libs.foo.bar` accessor against a parsed catalog.
 ---@param catalog table|nil
 ---@param accessor string
----@return table|nil
+---@return table|nil lib
+---@return string[]|nil ambiguous_aliases sorted list when multiple aliases share the Gradle normalized accessor
 local function catalog_library(catalog, accessor)
   if not catalog or not catalog.by_alias then
-    return nil
+    return nil, nil
   end
   local name = accessor:gsub("^libs%.", ""):gsub("^libs$", "")
-  local candidates = { name, (name:gsub("%.", "-")), (name:gsub("%.", "_")) }
-  for _, candidate in ipairs(candidates) do
-    if catalog.by_alias[candidate] then
-      return catalog.by_alias[candidate]
+  local normalized = name:gsub("[%-_%.]", ".")
+  if normalized == "" then
+    return nil, nil
+  end
+  local matches = {}
+  for alias, lib in pairs(catalog.by_alias) do
+    if alias:gsub("[%-_%.]", ".") == normalized then
+      matches[#matches + 1] = { alias = alias, lib = lib }
     end
   end
-  return nil
+  if #matches == 0 then
+    return nil, nil
+  end
+  if #matches > 1 then
+    local aliases = {}
+    for _, match in ipairs(matches) do
+      aliases[#aliases + 1] = match.alias
+    end
+    table.sort(aliases)
+    return nil, aliases
+  end
+  return matches[1].lib, nil
+end
+
+---Resolve a `libs.*` dependency accessor into a dependency entry or notes.
+---@param conf string
+---@param accessor string
+---@param catalog table|nil
+---@return table|nil dep
+---@return string[] notes
+local function resolve_catalog_dep(conf, accessor, catalog)
+  local lib, ambiguous = catalog_library(catalog, accessor)
+  if ambiguous then
+    return nil,
+      {
+        ("ambiguous catalog alias %s (matches: %s)"):format(accessor, table.concat(ambiguous, ", ")),
+      }
+  end
+  if lib and lib.groupId then
+    local extra_notes = {}
+    if lib.note then
+      extra_notes[#extra_notes + 1] = accessor .. ": " .. lib.note
+    end
+    return {
+      configuration = conf,
+      groupId = lib.groupId,
+      artifactId = lib.artifactId,
+      version = lib.version,
+      note = lib.note,
+    },
+      extra_notes
+  end
+  return nil, { "catalog alias not resolved (no libs.versions.toml entry): " .. accessor }
 end
 
 local DYNAMIC_MARKERS = {
@@ -1021,20 +1296,12 @@ function M._parse_gradle_dependencies(text, catalog)
         -- catalog alias: conf(libs.foo.bar) or conf libs.foo.bar
         local accessor = rest:match("^%s*%(%s*(libs[%w%._%-]*)%s*%)%s*$") or rest:match("^%s+(libs[%w%._%-]*)%s*$")
         if accessor then
-          local lib = catalog_library(catalog, accessor)
-          if lib and lib.groupId then
-            deps[#deps + 1] = {
-              configuration = conf,
-              groupId = lib.groupId,
-              artifactId = lib.artifactId,
-              version = lib.version,
-              note = lib.note,
-            }
-            if lib.note then
-              notes[#notes + 1] = accessor .. ": " .. lib.note
-            end
-          else
-            notes[#notes + 1] = "catalog alias not resolved (no libs.versions.toml entry): " .. accessor
+          local dep, extra_notes = resolve_catalog_dep(conf, accessor, catalog)
+          if dep then
+            deps[#deps + 1] = dep
+          end
+          for _, extra in ipairs(extra_notes) do
+            notes[#notes + 1] = extra
           end
         else
           local matched = false
@@ -1057,6 +1324,1031 @@ function M._parse_gradle_dependencies(text, catalog)
     end
   end
 
+  return deps, notes
+end
+
+-- ---------- Gradle Kotlin DSL (read-only static parse) ----------
+
+local KOTLIN_CONTROL_KEYWORDS = {
+  ["if"] = true,
+  ["else"] = true,
+  ["for"] = true,
+  ["while"] = true,
+  when = true,
+  try = true,
+  catch = true,
+  finally = true,
+}
+
+local KOTLIN_UNSUPPORTED_DECL_KEYWORDS = {
+  val = true,
+  var = true,
+}
+
+local KOTLIN_NON_DEP_BLOCKS = {
+  constraints = true,
+  modules = true,
+  components = true,
+  attributesSchema = true,
+  artifactTypes = true,
+}
+
+---Shadow copy of `text` with Kotlin line (`//`) and nested block (`/* ... */`)
+---comments replaced by spaces. Preserves byte length and line endings while
+---respecting string (`"..."`, `"""..."""`) and char (`'...'`) literals.
+---@param text string
+---@return string masked
+---@return boolean has_unterminated_comment
+function M._mask_kotlin(text)
+  text = text or ""
+  local n = #text
+  local out = {}
+  local i = 1
+  local unterminated = false
+
+  while i <= n do
+    local ch = text:sub(i, i)
+    if ch == '"' then
+      if text:sub(i, i + 2) == '"""' then
+        local close_s = text:find('"""', i + 3, true)
+        local stop = close_s and (close_s + 2) or n
+        out[#out + 1] = text:sub(i, stop)
+        i = stop + 1
+      else
+        local j = i + 1
+        while j <= n do
+          local c = text:sub(j, j)
+          if c == "\\" then
+            j = j + 2
+          elseif c == '"' then
+            j = j + 1
+            break
+          elseif c == "\n" or c == "\r" then
+            break
+          else
+            j = j + 1
+          end
+        end
+        out[#out + 1] = text:sub(i, j - 1)
+        i = j
+      end
+    elseif ch == "'" then
+      local j = i + 1
+      while j <= n do
+        local c = text:sub(j, j)
+        if c == "\\" then
+          j = j + 2
+        elseif c == "'" then
+          j = j + 1
+          break
+        elseif c == "\n" or c == "\r" then
+          break
+        else
+          j = j + 1
+        end
+      end
+      out[#out + 1] = text:sub(i, j - 1)
+      i = j
+    elseif ch == "/" and text:sub(i + 1, i + 1) == "/" then
+      local nl = text:find("\n", i + 2, true)
+      local stop = nl and (nl - 1) or n
+      out[#out + 1] = (text:sub(i, stop):gsub("[^\r\n]", " "))
+      i = stop + 1
+    elseif ch == "/" and text:sub(i + 1, i + 1) == "*" then
+      local depth = 1
+      local j = i + 2
+      while j <= n and depth > 0 do
+        local pair = text:sub(j, j + 1)
+        if pair == "/*" then
+          depth = depth + 1
+          j = j + 2
+        elseif pair == "*/" then
+          depth = depth - 1
+          j = j + 2
+        else
+          j = j + 1
+        end
+      end
+      if depth > 0 then
+        unterminated = true
+      end
+      out[#out + 1] = (text:sub(i, j - 1):gsub("[^\r\n]", " "))
+      i = j
+    else
+      local next_special = text:find("[\"'/]", i + 1)
+      local stop = next_special and (next_special - 1) or n
+      out[#out + 1] = text:sub(i, stop)
+      i = stop + 1
+    end
+  end
+
+  return table.concat(out), unterminated
+end
+
+---Tokenize a comment-masked Kotlin DSL string into a flat token list.
+---@param masked string
+---@return table[]
+local function tokenize_kotlin(masked)
+  local n = #masked
+  local tokens = {}
+  local i = 1
+
+  while i <= n do
+    local ch = masked:sub(i, i)
+    if ch == " " or ch == "\t" or ch == "\r" then
+      i = i + 1
+    elseif ch == "\n" then
+      tokens[#tokens + 1] = { kind = "newline", value = "\n", start_pos = i, end_pos = i }
+      i = i + 1
+    elseif ch == '"' then
+      if masked:sub(i, i + 2) == '"""' then
+        local close_s = masked:find('"""', i + 3, true)
+        local stop = close_s and (close_s + 2) or n
+        local content = close_s and masked:sub(i + 3, close_s - 1) or masked:sub(i + 3)
+        tokens[#tokens + 1] = {
+          kind = "string",
+          value = content,
+          interpolated = content:find("%$[%a_{]") ~= nil,
+          unterminated = close_s == nil,
+          start_pos = i,
+          end_pos = stop,
+        }
+        i = stop + 1
+      else
+        local j = i + 1
+        local decoded = {}
+        local interpolated = false
+        local unterminated = false
+        while j <= n do
+          local c = masked:sub(j, j)
+          if c == "\\" then
+            if j + 1 <= n then
+              local nxt = masked:sub(j + 1, j + 1)
+              if nxt == "n" then
+                decoded[#decoded + 1] = "\n"
+              elseif nxt == "r" then
+                decoded[#decoded + 1] = "\r"
+              elseif nxt == "t" then
+                decoded[#decoded + 1] = "\t"
+              else
+                decoded[#decoded + 1] = nxt
+              end
+              j = j + 2
+            else
+              unterminated = true
+              j = j + 1
+              break
+            end
+          elseif c == '"' then
+            j = j + 1
+            break
+          elseif c == "\n" or c == "\r" then
+            unterminated = true
+            break
+          else
+            if c == "$" and j + 1 <= n and masked:sub(j + 1, j + 1):match("[%a_{]") then
+              interpolated = true
+            end
+            decoded[#decoded + 1] = c
+            j = j + 1
+          end
+        end
+        if j > n and (n == 0 or masked:sub(n, n) ~= '"') then
+          unterminated = true
+        end
+        tokens[#tokens + 1] = {
+          kind = "string",
+          value = table.concat(decoded),
+          interpolated = interpolated,
+          unterminated = unterminated,
+          start_pos = i,
+          end_pos = j - 1,
+        }
+        i = j
+      end
+    elseif ch == "'" then
+      local j = i + 1
+      while j <= n do
+        local c = masked:sub(j, j)
+        if c == "\\" then
+          j = j + 2
+        elseif c == "'" then
+          j = j + 1
+          break
+        elseif c == "\n" or c == "\r" then
+          break
+        else
+          j = j + 1
+        end
+      end
+      tokens[#tokens + 1] = {
+        kind = "char",
+        value = masked:sub(i, j - 1),
+        start_pos = i,
+        end_pos = j - 1,
+      }
+      i = j
+    elseif ch == "`" then
+      local close_s = masked:find("`", i + 1, true)
+      local nl = masked:find("[\r\n]", i + 1)
+      local stop
+      local inner
+      if close_s and (not nl or close_s < nl) then
+        inner = masked:sub(i + 1, close_s - 1)
+        stop = close_s
+      else
+        stop = nl and (nl - 1) or n
+        inner = masked:sub(i + 1, stop)
+      end
+      tokens[#tokens + 1] = {
+        kind = "ident",
+        value = inner,
+        start_pos = i,
+        end_pos = stop,
+      }
+      i = stop + 1
+    elseif ch:match("[%a_]") then
+      local _, word_e = masked:find("^[%a_][%w_]*", i)
+      local word = masked:sub(i, word_e)
+      tokens[#tokens + 1] = {
+        kind = "ident",
+        value = word,
+        start_pos = i,
+        end_pos = word_e,
+      }
+      i = word_e + 1
+    elseif ch:match("%d") then
+      local _, num_e = masked:find("^%d[%w_]*", i)
+      tokens[#tokens + 1] = {
+        kind = "number",
+        value = masked:sub(i, num_e),
+        start_pos = i,
+        end_pos = num_e,
+      }
+      i = num_e + 1
+    else
+      tokens[#tokens + 1] = {
+        kind = "punct",
+        value = ch,
+        start_pos = i,
+        end_pos = i,
+      }
+      i = i + 1
+    end
+  end
+
+  return tokens
+end
+
+---@param masked string
+---@param stmt_tokens table[]
+---@return string
+local function kotlin_snippet(masked, stmt_tokens)
+  if #stmt_tokens == 0 then
+    return ""
+  end
+  local first_pos = stmt_tokens[1].start_pos
+  local last_pos = stmt_tokens[#stmt_tokens].end_pos
+  local text = trim(masked:sub(first_pos, last_pos):gsub("%s+", " "))
+  if #text > 120 then
+    return text:sub(1, 117) .. "..."
+  end
+  return text
+end
+
+---@param tokens table[]
+---@param open_idx integer index of `(` or `{`
+---@param open_char string
+---@param close_char string
+---@return integer|nil close_idx
+local function find_matching_delim(tokens, open_idx, open_char, close_char)
+  local depth = 0
+  for i = open_idx, #tokens do
+    local tok = tokens[i]
+    if tok.kind == "punct" then
+      if tok.value == open_char then
+        depth = depth + 1
+      elseif tok.value == close_char then
+        depth = depth - 1
+        if depth == 0 then
+          return i
+        end
+      end
+    end
+  end
+  return nil
+end
+
+---@param arg_tokens table[]
+---@return string|nil accessor
+local function kotlin_libs_accessor(arg_tokens)
+  if #arg_tokens < 3 or #arg_tokens % 2 == 0 then
+    return nil
+  end
+  if arg_tokens[1].kind ~= "ident" or arg_tokens[1].value ~= "libs" then
+    return nil
+  end
+  local parts = { "libs" }
+  for i = 2, #arg_tokens, 2 do
+    local dot = arg_tokens[i]
+    local seg = arg_tokens[i + 1]
+    if dot.kind ~= "punct" or dot.value ~= "." or not seg or seg.kind ~= "ident" then
+      return nil
+    end
+    parts[#parts + 1] = seg.value
+  end
+  return table.concat(parts, ".")
+end
+
+---@param arg_tokens table[]
+---@return boolean
+local function has_interpolated_or_dynamic(arg_tokens)
+  for _, tok in ipairs(arg_tokens) do
+    if tok.kind == "string" and tok.interpolated then
+      return true
+    end
+    if tok.kind == "punct" and tok.value == "+" then
+      return true
+    end
+  end
+  return #arg_tokens == 1 and arg_tokens[1].kind == "ident"
+end
+
+---@param args_slice table[]
+---@return table[]|nil arg_list
+local function split_kotlin_call_args(args_slice)
+  if #args_slice > 0 and args_slice[#args_slice].kind == "punct" and args_slice[#args_slice].value == "," then
+    table.remove(args_slice)
+  end
+  if #args_slice == 0 then
+    return nil
+  end
+  local arg_list = {}
+  local current = {}
+  local paren, bracket, brace = 0, 0, 0
+  for _, tok in ipairs(args_slice) do
+    local is_comma_sep = tok.kind == "punct" and tok.value == "," and paren == 0 and bracket == 0 and brace == 0
+    if is_comma_sep then
+      if #current == 0 then
+        return nil
+      end
+      arg_list[#arg_list + 1] = current
+      current = {}
+    else
+      if tok.kind == "punct" then
+        if tok.value == "(" then
+          paren = paren + 1
+        elseif tok.value == ")" then
+          paren = math.max(0, paren - 1)
+        elseif tok.value == "[" then
+          bracket = bracket + 1
+        elseif tok.value == "]" then
+          bracket = math.max(0, bracket - 1)
+        elseif tok.value == "{" then
+          brace = brace + 1
+        elseif tok.value == "}" then
+          brace = math.max(0, brace - 1)
+        end
+      end
+      current[#current + 1] = tok
+    end
+  end
+  if #current == 0 then
+    return nil
+  end
+  arg_list[#arg_list + 1] = current
+  return arg_list
+end
+
+local KOTLIN_NAMED_DEP_PARAMS = { "group", "name", "version", "configuration", "classifier", "ext" }
+local KOTLIN_ALLOWED_DEP_PARAMS = {
+  group = true,
+  name = true,
+  version = true,
+  configuration = true,
+  classifier = true,
+  ext = true,
+}
+
+---@param ctx table
+---@param dep table
+---@param has_config_lambda boolean
+---@param snippet string
+local function record_kotlin_dep(ctx, dep, has_config_lambda, snippet)
+  if has_config_lambda then
+    if dep.version then
+      dep.declared_version = dep.version
+      dep.version = nil
+    end
+    dep.has_configuration_lambda = true
+    ctx.notes[#ctx.notes + 1] = "dependency configuration lambda not evaluated (effective version/constraints may differ): "
+      .. snippet
+  end
+  ctx.deps[#ctx.deps + 1] = dep
+end
+
+---@param conf string
+---@param arg_list table[]
+---@param snippet string
+---@param ctx table
+---@param has_config_lambda boolean
+local function parse_kotlin_multi_arg_dep(conf, arg_list, snippet, ctx, has_config_lambda)
+  local values = {}
+  local seen_named = false
+  for idx, arg in ipairs(arg_list) do
+    local key, val_tokens
+    if #arg >= 3 and arg[1].kind == "ident" and arg[2].kind == "punct" and arg[2].value == "=" then
+      seen_named = true
+      key = arg[1].value
+      if not KOTLIN_ALLOWED_DEP_PARAMS[key] then
+        ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+        return
+      end
+      val_tokens = vim.list_slice(arg, 3)
+    elseif seen_named then
+      ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+      return
+    else
+      key = KOTLIN_NAMED_DEP_PARAMS[idx]
+      if not key then
+        ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+        return
+      end
+      val_tokens = arg
+    end
+
+    if #val_tokens == 1 and val_tokens[1].kind == "string" then
+      local tok = val_tokens[1]
+      if tok.unterminated then
+        ctx.notes[#ctx.notes + 1] = "unterminated string in dependency declaration: " .. snippet
+        return
+      end
+      if tok.interpolated then
+        ctx.notes[#ctx.notes + 1] = "dynamic version or variable not resolved: " .. snippet
+        return
+      end
+      if tok.value == "" or tok.value:find("%s") or tok.value:find(":", 1, true) then
+        ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+        return
+      end
+      values[key] = tok.value
+    elseif #val_tokens == 1 and val_tokens[1].kind == "ident" and val_tokens[1].value == "null" then
+      values[key] = false
+    else
+      if has_interpolated_or_dynamic(val_tokens) or key == "version" or key == "group" or key == "name" then
+        ctx.notes[#ctx.notes + 1] = "dynamic version or variable not resolved: " .. snippet
+      else
+        ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+      end
+      return
+    end
+  end
+
+  if type(values.group) == "string" and type(values.name) == "string" then
+    local dep = {
+      configuration = conf,
+      groupId = values.group,
+      artifactId = values.name,
+    }
+    if type(values.version) == "string" then
+      dep.version = values.version
+    end
+    record_kotlin_dep(ctx, dep, has_config_lambda, snippet)
+  else
+    ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+  end
+end
+
+---@param arg table[]
+---@param snippet string
+---@return string|nil note
+local function kotlin_dynamic_arg_note(arg, snippet)
+  if #arg >= 2 and arg[1].kind == "ident" then
+    local head = arg[1].value
+    local second = arg[2]
+    if second.kind == "punct" and second.value == "(" then
+      if head == "project" then
+        return "project dependency not resolved: " .. snippet
+      elseif head == "platform" or head == "enforcedPlatform" then
+        return "platform/BOM dependency not resolved: " .. snippet
+      elseif head == "testFixtures" then
+        return "testFixtures dependency not resolved: " .. snippet
+      elseif head == "files" then
+        return "file dependency not resolved: " .. snippet
+      elseif head == "fileTree" then
+        return "file-tree dependency not resolved: " .. snippet
+      elseif head == "kotlin" then
+        return "kotlin() dependency helper not resolved: " .. snippet
+      end
+    elseif head == "projects" and second.kind == "punct" and second.value == "." then
+      return "project dependency not resolved: " .. snippet
+    end
+  end
+  if has_interpolated_or_dynamic(arg) then
+    return "dynamic version or variable not resolved: " .. snippet
+  end
+  return "unsupported dependency notation: " .. snippet
+end
+
+---@param stmt_tokens table[]
+---@param ctx table
+local function parse_kotlin_dep_statement(stmt_tokens, ctx)
+  if #stmt_tokens == 0 then
+    return
+  end
+  local first = stmt_tokens[1]
+  local snippet = kotlin_snippet(ctx.masked, stmt_tokens)
+
+  if first.kind == "ident" then
+    if KOTLIN_UNSUPPORTED_DECL_KEYWORDS[first.value] then
+      ctx.notes[#ctx.notes + 1] = "unsupported declaration in dependencies not resolved: " .. snippet
+      return
+    end
+    if KOTLIN_CONTROL_KEYWORDS[first.value] then
+      ctx.notes[#ctx.notes + 1] = "conditional or loop block in dependencies not resolved: " .. snippet
+      return
+    end
+    if KOTLIN_NON_DEP_BLOCKS[first.value] then
+      ctx.notes[#ctx.notes + 1] = ("dependency %s block not resolved"):format(first.value)
+      return
+    end
+  end
+
+  if first.kind ~= "ident" or not GRADLE_CONFIGS[first.value] then
+    ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+    return
+  end
+
+  local conf = first.value
+  local open_tok = stmt_tokens[2]
+  if not open_tok or open_tok.kind ~= "punct" or open_tok.value ~= "(" then
+    ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+    return
+  end
+
+  local close_paren = find_matching_delim(stmt_tokens, 2, "(", ")")
+  if not close_paren then
+    ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+    return
+  end
+
+  local has_config_lambda = false
+  -- Only nothing or a trailing configuration lambda `{ ... }` may follow `(...)`.
+  if close_paren < #stmt_tokens then
+    local after = stmt_tokens[close_paren + 1]
+    local close_brace = after.kind == "punct"
+      and after.value == "{"
+      and find_matching_delim(stmt_tokens, close_paren + 1, "{", "}")
+    if close_brace ~= #stmt_tokens then
+      ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+      return
+    end
+    has_config_lambda = true
+  end
+
+  local args_slice = {}
+  for i = 3, close_paren - 1 do
+    args_slice[#args_slice + 1] = stmt_tokens[i]
+  end
+  local arg_list = split_kotlin_call_args(args_slice)
+  if not arg_list then
+    ctx.notes[#ctx.notes + 1] = "unsupported dependency notation: " .. snippet
+    return
+  end
+
+  if #arg_list == 1 then
+    local arg = arg_list[1]
+    local is_named = #arg >= 3 and arg[1].kind == "ident" and arg[2].kind == "punct" and arg[2].value == "="
+    if is_named then
+      parse_kotlin_multi_arg_dep(conf, arg_list, snippet, ctx, has_config_lambda)
+      return
+    end
+    if #arg == 1 and arg[1].kind == "string" then
+      local str_tok = arg[1]
+      if str_tok.unterminated then
+        ctx.notes[#ctx.notes + 1] = "unterminated string in dependency declaration: " .. snippet
+      elseif str_tok.interpolated then
+        ctx.notes[#ctx.notes + 1] = "dynamic version or variable not resolved: " .. str_tok.value
+      else
+        local parsed = split_coordinate(str_tok.value)
+        if parsed then
+          parsed.configuration = conf
+          record_kotlin_dep(ctx, parsed, has_config_lambda, snippet)
+        else
+          ctx.notes[#ctx.notes + 1] = "unsupported coordinate: " .. str_tok.value
+        end
+      end
+      return
+    end
+
+    local accessor = kotlin_libs_accessor(arg)
+    if accessor then
+      if accessor:match("^libs%.bundles%.") then
+        ctx.notes[#ctx.notes + 1] = "catalog bundle not resolved: " .. accessor
+      elseif accessor:match("^libs%.versions%.") or accessor:match("^libs%.plugins%.") then
+        ctx.notes[#ctx.notes + 1] = "unsupported catalog accessor: " .. accessor
+      else
+        local dep, extra_notes = resolve_catalog_dep(conf, accessor, ctx.catalog)
+        if dep then
+          record_kotlin_dep(ctx, dep, has_config_lambda, snippet)
+        end
+        for _, extra in ipairs(extra_notes) do
+          ctx.notes[#ctx.notes + 1] = extra
+        end
+      end
+      return
+    end
+
+    ctx.notes[#ctx.notes + 1] = kotlin_dynamic_arg_note(arg, snippet)
+    return
+  end
+
+  parse_kotlin_multi_arg_dep(conf, arg_list, snippet, ctx, has_config_lambda)
+end
+
+---@param tokens table[]
+---@param i integer
+---@return table|nil
+local function next_non_newline(tokens, i)
+  while i <= #tokens do
+    if tokens[i].kind ~= "newline" then
+      return tokens[i]
+    end
+    i = i + 1
+  end
+  return nil
+end
+
+local KOTLIN_CONTINUATION_PUNCT = {
+  ["="] = true,
+  ["+"] = true,
+  ["."] = true,
+  [","] = true,
+}
+
+---Parse all statements inside one `dependencies { ... }` block starting at `start_idx`.
+---@param tokens table[]
+---@param start_idx integer
+---@param ctx table
+---@return integer next_idx
+local function parse_kotlin_dependencies_block(tokens, start_idx, ctx)
+  local i = start_idx
+  local n = #tokens
+  while i <= n do
+    while i <= n and (tokens[i].kind == "newline" or (tokens[i].kind == "punct" and tokens[i].value == ";")) do
+      i = i + 1
+    end
+    if i > n then
+      ctx.notes[#ctx.notes + 1] = "unterminated dependencies block in build.gradle.kts"
+      return i
+    end
+    if tokens[i].kind == "punct" and tokens[i].value == "}" then
+      return i + 1
+    end
+
+    local stmt = {}
+    local paren, bracket, brace = 0, 0, 0
+    local closed_outer = false
+    while i <= n do
+      local tok = tokens[i]
+      if tok.kind == "punct" then
+        if tok.value == "(" then
+          paren = paren + 1
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == ")" then
+          paren = math.max(0, paren - 1)
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == "[" then
+          bracket = bracket + 1
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == "]" then
+          bracket = math.max(0, bracket - 1)
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == "{" then
+          brace = brace + 1
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == "}" then
+          if paren == 0 and bracket == 0 and brace == 0 then
+            closed_outer = true
+            break
+          end
+          brace = brace - 1
+          stmt[#stmt + 1] = tok
+          i = i + 1
+          if paren == 0 and bracket == 0 and brace == 0 then
+            local nxt = next_non_newline(tokens, i)
+            local keep = nxt
+              and ((nxt.kind == "ident" and nxt.value == "else") or (nxt.kind == "punct" and nxt.value == "."))
+            if not keep then
+              break
+            end
+          end
+        elseif tok.value == ";" and paren == 0 and bracket == 0 and brace == 0 then
+          i = i + 1
+          break
+        else
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        end
+      elseif tok.kind == "newline" then
+        if paren == 0 and bracket == 0 and brace == 0 then
+          local prev = stmt[#stmt]
+          local nxt = next_non_newline(tokens, i + 1)
+          local cont_prev = prev and prev.kind == "punct" and KOTLIN_CONTINUATION_PUNCT[prev.value]
+          local cont_next = nxt and nxt.kind == "punct" and (nxt.value == "{" or nxt.value == ".")
+          if not cont_prev and not cont_next then
+            i = i + 1
+            break
+          end
+        end
+        i = i + 1
+      else
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      end
+    end
+
+    parse_kotlin_dep_statement(stmt, ctx)
+    if closed_outer then
+      return i + 1
+    end
+    if i > n then
+      ctx.notes[#ctx.notes + 1] = "unterminated dependencies block in build.gradle.kts"
+      return i
+    end
+  end
+  return i
+end
+
+---@param stmt_tokens table[]
+---@return "unqualified"|"qualified"|"unsupported"|nil
+local function classify_dependencies_header(stmt_tokens)
+  if #stmt_tokens == 0 then
+    return nil
+  end
+  local last = stmt_tokens[#stmt_tokens]
+  if last.kind ~= "ident" or last.value ~= "dependencies" then
+    return nil
+  end
+  if #stmt_tokens == 1 then
+    return "unqualified"
+  end
+  local prev = stmt_tokens[#stmt_tokens - 1]
+  if prev.kind == "punct" and prev.value == "." then
+    return "qualified"
+  end
+  return "unsupported"
+end
+
+---@param stmt_tokens table[]
+---@param name string
+---@return boolean
+local function stmt_has_ident(stmt_tokens, name)
+  for _, tok in ipairs(stmt_tokens) do
+    if tok.kind == "ident" and tok.value == name then
+      return true
+    end
+  end
+  return false
+end
+
+---@param stmt_tokens table[]
+---@return boolean
+local function is_kotlin_apply_from_stmt(stmt_tokens)
+  for k = 1, #stmt_tokens - 1 do
+    local tok = stmt_tokens[k]
+    local nxt = stmt_tokens[k + 1]
+    if tok.kind == "ident" and tok.value == "apply" and nxt.kind == "punct" and nxt.value == "(" then
+      local close_p = find_matching_delim(stmt_tokens, k + 1, "(", ")")
+      local stop = close_p and (close_p - 1) or #stmt_tokens
+      for j = k + 2, stop - 1 do
+        local arg_tok = stmt_tokens[j]
+        local after_tok = stmt_tokens[j + 1]
+        if
+          arg_tok.kind == "ident"
+          and arg_tok.value == "from"
+          and after_tok.kind == "punct"
+          and after_tok.value == "="
+        then
+          return true
+        end
+        if
+          arg_tok.kind == "string"
+          and arg_tok.value == "from"
+          and after_tok.kind == "ident"
+          and after_tok.value == "to"
+        then
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
+---@param tokens table[]
+---@param open_brace_idx integer
+---@param close_brace_idx integer|nil
+---@return boolean
+local function block_has_apply_from(tokens, open_brace_idx, close_brace_idx)
+  local stop = close_brace_idx and (close_brace_idx - 1) or #tokens
+  for k = open_brace_idx + 1, stop do
+    local tok = tokens[k]
+    if tok.kind == "ident" and tok.value == "from" then
+      local nxt = next_non_newline(tokens, k + 1)
+      if nxt and nxt.kind == "punct" and (nxt.value == "(" or nxt.value == "=") then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+---@param tokens table[]
+---@param start_idx integer
+---@param block_stack string[]
+---@param ctx table
+---@return integer next_idx
+local function scan_kotlin_blocks(tokens, start_idx, block_stack, ctx)
+  local i = start_idx
+  local n = #tokens
+  local stmt = {}
+  local paren, bracket = 0, 0
+
+  local function flush_top_statement()
+    if #stmt == 0 then
+      return
+    end
+    if
+      #stmt >= 3
+      and stmt[1].kind == "ident"
+      and stmt[1].value == "dependencies"
+      and stmt[2].kind == "punct"
+      and stmt[2].value == "."
+    then
+      if #block_stack == 0 or (#block_stack == 1 and block_stack[1] == "buildscript") then
+        parse_kotlin_dep_statement(vim.list_slice(stmt, 3), ctx)
+      else
+        ctx.notes[#ctx.notes + 1] = ("scoped or conditional dependencies block not resolved (%s)"):format(
+          table.concat(block_stack, " > ")
+        )
+      end
+    else
+      local matched = false
+      for k = 2, #stmt - 1 do
+        local tok = stmt[k]
+        local nxt = stmt[k + 1]
+        if tok.kind == "ident" and tok.value == "dependencies" and nxt.kind == "punct" and nxt.value == "." then
+          local prev = stmt[k - 1]
+          if prev.kind == "punct" and prev.value == "." then
+            ctx.notes[#ctx.notes + 1] = "scoped dependencies receiver not resolved: "
+              .. kotlin_snippet(ctx.masked, stmt)
+          else
+            ctx.notes[#ctx.notes + 1] = "unsupported declaration in dependencies not resolved: "
+              .. kotlin_snippet(ctx.masked, stmt)
+          end
+          matched = true
+          break
+        end
+      end
+      if not matched then
+        if stmt_has_ident(stmt, "dependencies") then
+          ctx.notes[#ctx.notes + 1] = "unsupported dependencies block not resolved: "
+            .. kotlin_snippet(ctx.masked, stmt)
+        elseif is_kotlin_apply_from_stmt(stmt) then
+          ctx.notes[#ctx.notes + 1] = "external script apply(from = ...) not resolved: "
+            .. kotlin_snippet(ctx.masked, stmt)
+        end
+      end
+    end
+    stmt = {}
+  end
+
+  while i <= n do
+    local tok = tokens[i]
+    if tok.kind == "punct" then
+      if tok.value == "(" then
+        paren = paren + 1
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      elseif tok.value == ")" then
+        paren = math.max(0, paren - 1)
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      elseif tok.value == "[" then
+        bracket = bracket + 1
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      elseif tok.value == "]" then
+        bracket = math.max(0, bracket - 1)
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      elseif tok.value == "{" and paren == 0 and bracket == 0 then
+        local header_kind = classify_dependencies_header(stmt)
+        if header_kind == "unqualified" then
+          stmt = {}
+          if #block_stack == 0 or (#block_stack == 1 and block_stack[1] == "buildscript") then
+            i = parse_kotlin_dependencies_block(tokens, i + 1, ctx)
+          else
+            ctx.notes[#ctx.notes + 1] = ("scoped or conditional dependencies block not resolved (%s)"):format(
+              table.concat(block_stack, " > ")
+            )
+            local close_brace = find_matching_delim(tokens, i, "{", "}")
+            i = close_brace and (close_brace + 1) or (n + 1)
+          end
+        elseif header_kind == "qualified" then
+          ctx.notes[#ctx.notes + 1] = "scoped dependencies receiver not resolved: " .. kotlin_snippet(ctx.masked, stmt)
+          stmt = {}
+          local close_brace = find_matching_delim(tokens, i, "{", "}")
+          i = close_brace and (close_brace + 1) or (n + 1)
+        elseif header_kind == "unsupported" or stmt_has_ident(stmt, "dependencies") then
+          ctx.notes[#ctx.notes + 1] = "unsupported dependencies block not resolved: "
+            .. kotlin_snippet(ctx.masked, stmt)
+          stmt = {}
+          local close_brace = find_matching_delim(tokens, i, "{", "}")
+          i = close_brace and (close_brace + 1) or (n + 1)
+        elseif #stmt >= 1 and stmt[#stmt].kind == "ident" and stmt[#stmt].value == "apply" then
+          local close_brace = find_matching_delim(tokens, i, "{", "}")
+          if block_has_apply_from(tokens, i, close_brace) then
+            local end_tok = tokens[close_brace or n]
+            ctx.notes[#ctx.notes + 1] = "external script apply(from = ...) not resolved: "
+              .. kotlin_snippet(ctx.masked, { stmt[1], end_tok })
+            stmt = {}
+            i = close_brace and (close_brace + 1) or (n + 1)
+          else
+            local label = stmt[1].kind == "ident" and stmt[1].value or "block"
+            stmt = {}
+            block_stack[#block_stack + 1] = label
+            i = scan_kotlin_blocks(tokens, i + 1, block_stack, ctx)
+            block_stack[#block_stack] = nil
+          end
+        else
+          local label = (#stmt > 0 and stmt[1].kind == "ident") and stmt[1].value or "block"
+          stmt = {}
+          block_stack[#block_stack + 1] = label
+          i = scan_kotlin_blocks(tokens, i + 1, block_stack, ctx)
+          block_stack[#block_stack] = nil
+        end
+      elseif tok.value == "}" and paren == 0 and bracket == 0 then
+        flush_top_statement()
+        if #block_stack > 0 then
+          return i + 1
+        end
+        i = i + 1
+      elseif tok.value == ";" and paren == 0 and bracket == 0 then
+        flush_top_statement()
+        i = i + 1
+      else
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      end
+    elseif tok.kind == "newline" then
+      if paren == 0 and bracket == 0 then
+        local prev = stmt[#stmt]
+        local nxt = next_non_newline(tokens, i + 1)
+        local cont_prev = prev and prev.kind == "punct" and (prev.value == "." or prev.value == "=")
+        local cont_next = nxt and nxt.kind == "punct" and (nxt.value == "{" or nxt.value == ".")
+        if not cont_prev and not cont_next then
+          flush_top_statement()
+        end
+      end
+      i = i + 1
+    else
+      stmt[#stmt + 1] = tok
+      i = i + 1
+    end
+  end
+
+  flush_top_statement()
+  return i
+end
+
+---Static read-only parse of a Kotlin DSL build.gradle.kts file. Never executes
+---Gradle. Unsupported, interpolated, dynamic, or scoped forms are reported as
+---partial notes instead of being guessed.
+---@param text string
+---@param catalog table|nil result of _parse_version_catalog
+---@return table[] deps, string[] notes
+function M._parse_kotlin_gradle_dependencies(text, catalog)
+  local masked, has_unterminated = M._mask_kotlin(text or "")
+  local deps, notes = {}, {}
+  if has_unterminated then
+    notes[#notes + 1] = "unterminated block comment in build.gradle.kts"
+  end
+
+  local tokens = tokenize_kotlin(masked)
+  local ctx = {
+    masked = masked,
+    deps = deps,
+    notes = notes,
+    catalog = catalog,
+  }
+  scan_kotlin_blocks(tokens, 1, {}, ctx)
   return deps, notes
 end
 
@@ -1198,29 +2490,51 @@ function M._report_lines(target)
     lines[#lines + 1] = "Version catalog: none"
   end
 
+  local text = read_file(target.build_file) or ""
+  local deps, notes
   if target.is_kotlin_dsl then
-    lines[#lines + 1] =
-      "Kotlin DSL: static parsing of build.gradle.kts is not supported (deferred) — open the build file to inspect dependencies"
+    deps, notes = M._parse_kotlin_gradle_dependencies(text, catalog)
   else
-    local deps, notes = M._parse_gradle_dependencies(read_file(target.build_file) or "", catalog)
-    lines[#lines + 1] = ("Dependencies: %d (static parse of build.gradle)"):format(#deps)
-    if #deps == 0 then
-      lines[#lines + 1] = "  (none found in the statically parsed configurations)"
-    else
-      for _, dep in ipairs(deps) do
-        lines[#lines + 1] = "  - " .. dep.configuration .. " " .. dependency_label(dep)
+    deps, notes = M._parse_gradle_dependencies(text, catalog)
+  end
+  local kind_label = target.is_kotlin_dsl and "build.gradle.kts" or "build.gradle"
+  lines[#lines + 1] = ("Dependencies: %d (static parse of %s)"):format(#deps, kind_label)
+  if #deps == 0 then
+    lines[#lines + 1] = "  (none found in the statically parsed configurations)"
+  else
+    for _, dep in ipairs(deps) do
+      local detail = {}
+      if dep.declared_version then
+        detail[#detail + 1] = "declared version=" .. dep.declared_version
       end
+      if dep.has_configuration_lambda then
+        detail[#detail + 1] = "configuration lambda not evaluated"
+      end
+      if dep.note then
+        detail[#detail + 1] = dep.note
+      end
+      lines[#lines + 1] = "  - "
+        .. dep.configuration
+        .. " "
+        .. dependency_label(dep)
+        .. (#detail > 0 and ("  (" .. table.concat(detail, ", ") .. ")") or "")
     end
-    for _, note in ipairs(notes) do
-      lines[#lines + 1] = "Note: " .. note
-    end
+  end
+  local has_catalog_notes = catalog and catalog.notes and #catalog.notes > 0
+  if #notes > 0 or has_catalog_notes then
+    local flavor = target.is_kotlin_dsl and "Kotlin DSL" or "Gradle"
+    lines[#lines + 1] = ("Coverage: partial (dynamic/unsupported %s forms noted below)"):format(flavor)
+  end
+  for _, note in ipairs(notes) do
+    lines[#lines + 1] = "Note: " .. note
   end
 
   if catalog and #catalog.libraries > 0 then
     lines[#lines + 1] = "Catalog libraries:"
     for _, lib in ipairs(catalog.libraries) do
       if lib.groupId then
-        lines[#lines + 1] = "  - " .. lib.alias .. " " .. dependency_label(lib)
+        local suffix = lib.note and ("  (" .. lib.note .. ")") or ""
+        lines[#lines + 1] = "  - " .. lib.alias .. " " .. dependency_label(lib) .. suffix
       else
         lines[#lines + 1] = "  - " .. lib.alias .. " (" .. (lib.note or "unresolved") .. ")"
       end

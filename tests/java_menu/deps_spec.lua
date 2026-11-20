@@ -747,10 +747,20 @@ local minimal_report = table.concat(
 assert(minimal_report:find("Dependencies: 0", 1, true))
 assert(minimal_report:find("  (none)", 1, true))
 
--- Kotlin DSL: limitação honesta + catálogo ainda visível
+-- Kotlin DSL: parse estático seguro + catálogo + cobertura parcial honesta
 local kts_dir = tempdir("kts")
 write_raw(kts_dir .. "/settings.gradle.kts", 'rootProject.name = "kts"\n')
-write_raw(kts_dir .. "/build.gradle.kts", 'dependencies {\n  implementation("org.slf4j:slf4j-api:2.0.20")\n}\n')
+write_raw(
+  kts_dir .. "/build.gradle.kts",
+  table.concat({
+    "dependencies {",
+    '  implementation("org.slf4j:slf4j-api:2.0.20")',
+    "  testImplementation(libs.junit.jupiter)",
+    '  implementation(project(":core"))',
+    "}",
+    "",
+  }, "\n")
+)
 write_raw(kts_dir .. "/gradle/libs.versions.toml", catalog_text)
 local kts_buf = buffer_for(kts_dir .. "/build.gradle.kts")
 local kts_target = deps._resolve_target(kts_buf)
@@ -758,10 +768,17 @@ assert(kts_target and kts_target.tool == "gradle", "projeto Gradle não resolvid
 assert(kts_target.is_kotlin_dsl == true, "build.gradle.kts não marcado como Kotlin DSL")
 assert(kts_target.catalog_file ~= nil, "libs.versions.toml não encontrado")
 local kts_report = table.concat(deps._report_lines(kts_target), "\n")
-assert(kts_report:find("Kotlin DSL", 1, true), "limitação do Kotlin DSL ausente")
+assert(kts_report:find("Build file: build.gradle.kts", 1, true), "build file .kts ausente no relatório")
+assert(
+  kts_report:find("Dependencies: 2 (static parse of build.gradle.kts)", 1, true),
+  "contagem de dependências .kts divergiu:\n" .. kts_report
+)
+assert(kts_report:find("implementation org.slf4j:slf4j-api:2.0.20", 1, true), "dep literal .kts ausente")
+assert(kts_report:find("testImplementation org.junit.jupiter:junit-jupiter:5.10.0", 1, true), "alias .kts ausente")
+assert(kts_report:find("Coverage: partial", 1, true), "marcador de cobertura parcial ausente no .kts")
+assert(kts_report:find("Note: project dependency not resolved", 1, true), "nota de project() ausente no .kts")
 assert(kts_report:find("Version catalog", 1, true), "catálogo ausente no relatório .kts")
 assert(kts_report:find("junit-jupiter", 1, true), "libraries do catálogo ausentes no relatório .kts")
-assert(not kts_report:find("implementation org.slf4j", 1, true), "relatório fingiu parsear build.gradle.kts")
 
 -- Gradle Groovy via fixtures
 local gradle_root = fixtures.gradle_project("deps", { 'rootProject.name = "deps-gradle"' })
@@ -775,6 +792,678 @@ assert(
   "dependência Groovy ausente no relatório: " .. gradle_report
 )
 assert(gradle_report:find("Version catalog: none", 1, true))
+
+local function kotlin_dsl_spec()
+  -- ---------- 12b. Kotlin DSL: mascaramento, literais, catálogo, multiline e formas dinâmicas ----------
+
+  -- 1) Mascaramento de comentários e preservação de strings/chars
+  local raw_kts = table.concat({
+    '/* outer /* nested implementation("fake:nested:1.0") */ still comment */',
+    'val url = "https://example.com/*not-comment*/"',
+    'val escaped = "quote \\" // not comment"',
+    'val rawStr = """// keep inside raw string /* keep */"""',
+    "val ch = '\"'",
+    '// implementation("fake:line:1.0")',
+    "dependencies {",
+    '  implementation("org.slf4j:slf4j-api:2.0.20") // inline comment',
+    "}",
+  }, "\n")
+  local masked_kts, has_unterm = deps._mask_kotlin(raw_kts)
+  assert(has_unterm == false, "comentário fechado foi marcado como não terminado")
+  assert(#masked_kts == #raw_kts, "mascaramento Kotlin mudou o tamanho em bytes")
+  local _, raw_nl = raw_kts:gsub("\n", "")
+  local _, mask_nl = masked_kts:gsub("\n", "")
+  assert(raw_nl == mask_nl, "mascaramento Kotlin não preservou quebras de linha")
+  assert(masked_kts:find("fake:nested", 1, true) == nil, "comentário aninhado vazou")
+  assert(masked_kts:find("fake:line", 1, true) == nil, "comentário de linha vazou")
+  assert(masked_kts:find("https://example.com/*not-comment*/", 1, true) ~= nil, "string com // e /* foi mascarada")
+  assert(masked_kts:find("// keep inside raw string", 1, true) ~= nil, "raw string com // foi mascarada")
+
+  local unterm_kts, unterm_flag = deps._mask_kotlin('dependencies {\n  /* unclosed\n  implementation("x:y:1")\n}')
+  assert(unterm_flag == true, "comentário não terminado não foi sinalizado")
+  assert(#unterm_kts == #'dependencies {\n  /* unclosed\n  implementation("x:y:1")\n}')
+  assert(unterm_kts:find("x:y:1", 1, true) == nil, "comentário não terminado não foi mascarado")
+
+  -- 2) Literais, multiline, argumentos nomeados/posicionais, blocos e catálogo
+  local mixed_catalog = deps._parse_version_catalog(table.concat({
+    "[versions]",
+    'junit = "5.10.0"',
+    "",
+    "[libraries]",
+    'junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }',
+    'spring-boot_starter-web = { group = "org.springframework.boot", name = "spring-boot-starter-web" }',
+    'slf4j = "org.slf4j:slf4j-api:2.0.20"',
+  }, "\n"))
+
+  local full_kts = table.concat({
+    "plugins {",
+    "  java",
+    "  alias(libs.plugins.spring.boot)",
+    "}",
+    "",
+    "buildscript {",
+    "  dependencies {",
+    '    classpath("com.example:build-plugin:1.2.3")',
+    "  }",
+    "}",
+    "",
+    "configurations {",
+    "  implementation {",
+    '    exclude(group = "ch.qos.logback")',
+    "  }",
+    "}",
+    "",
+    'val fake = "dependencies { implementation(\\"fake:in-string:9.9\\") }"',
+    "",
+    "subprojects {",
+    "  dependencies {",
+    '    implementation("com.sub:sub-only:1.0.0")',
+    "  }",
+    "}",
+    "",
+    "dependencies {",
+    '  implementation("org.slf4j:slf4j-api:2.0.20")',
+    '  api("org.projectlombok:lombok")',
+    '  implementation("""com.google.guava:guava:33.0.0-jre""")',
+    "  implementation(",
+    "      // multiline com vírgula final e comentário",
+    '      "org.apache.commons:commons-lang3:3.14.0",',
+    "  )",
+    "  testImplementation(",
+    '      group = "org.junit.jupiter",',
+    '      name = "junit-jupiter-api",',
+    '      version = "5.10.0",',
+    "  ) {",
+    "      isTransitive = false",
+    "  }",
+    '  compileOnlyApi("com.example", "pos-lib", "2.1.0")',
+    '  developmentOnly("com.example:escaped\\$dollar:1.0.0")',
+    "  testImplementation(libs.junit.jupiter)",
+    "  implementation(libs.spring.boot.starter.web)",
+    "  constraints {",
+    '    implementation("org.apache.logging.log4j:log4j-core:2.20.0")',
+    "  }",
+    '  if (hasProperty("extra")) {',
+    '    runtimeOnly("com.example:conditional:1.0.0")',
+    "  }",
+    "}",
+  }, "\n")
+
+  local kdeps, knotes = deps._parse_kotlin_gradle_dependencies(full_kts, mixed_catalog)
+  local function kfind(group, artifact)
+    for _, entry in ipairs(kdeps) do
+      if entry.groupId == group and entry.artifactId == artifact then
+        return entry
+      end
+    end
+  end
+
+  assert(kfind("com.example", "build-plugin").configuration == "classpath", "buildscript classpath não lido")
+  assert(kfind("org.slf4j", "slf4j-api").version == "2.0.20", "literal básico .kts não lido")
+  assert(kfind("org.projectlombok", "lombok").version == nil, "literal sem versão ganhou versão")
+  assert(kfind("com.google.guava", "guava").version == "33.0.0-jre", "triple-quoted string não lida")
+  assert(kfind("org.apache.commons", "commons-lang3").version == "3.14.0", "chamada multiline com vírgula falhou")
+  local junit_api = kfind("org.junit.jupiter", "junit-jupiter-api")
+  assert(
+    junit_api
+      and junit_api.configuration == "testImplementation"
+      and junit_api.version == nil
+      and junit_api.declared_version == "5.10.0"
+      and junit_api.has_configuration_lambda == true,
+    "argumentos nomeados multiline + lambda falharam"
+  )
+  local pos_lib = kfind("com.example", "pos-lib")
+  assert(
+    pos_lib and pos_lib.configuration == "compileOnlyApi" and pos_lib.version == "2.1.0",
+    "posicional 3-args falhou"
+  )
+  assert(
+    kfind("com.example", "escaped$dollar") ~= nil,
+    "cifrão escapado \\$ não deveria ser tratado como interpolação"
+  )
+  assert(kfind("org.junit.jupiter", "junit-jupiter").version == "5.10.0", "alias libs.junit.jupiter falhou")
+  local boot_web = kfind("org.springframework.boot", "spring-boot-starter-web")
+  assert(boot_web and boot_web.version == nil, "alias misto spring-boot_starter-web sem versão falhou")
+
+  assert(kfind("fake", "in-string") == nil, "string simulando dependencies {} vazou")
+  assert(kfind("com.sub", "sub-only") == nil, "dependência de subprojects vazou para o módulo raiz")
+  assert(kfind("org.apache.logging.log4j", "log4j-core") == nil, "constraints vazou como dependência direta")
+  assert(kfind("com.example", "conditional") == nil, "dependência dentro de if() vazou")
+
+  local joined_notes = table.concat(knotes, "\n")
+  assert(
+    joined_notes:find("scoped or conditional dependencies block not resolved", 1, true),
+    "nota de subprojects ausente"
+  )
+  assert(joined_notes:find("dependency constraints block not resolved", 1, true), "nota de constraints ausente")
+  assert(joined_notes:find("conditional or loop block in dependencies not resolved", 1, true), "nota de if() ausente")
+  assert(
+    joined_notes:find("dependency configuration lambda not evaluated", 1, true),
+    "nota de lambda de configuração ausente"
+  )
+
+  -- 3) Formas dinâmicas, interpoladas e não suportadas: sempre parciais, nunca inventam dependências
+  local dynamic_kts = table.concat({
+    "dependencies {",
+    '  val ver = "1.0.0"',
+    '  implementation("com.dyn:interp:$ver")',
+    '  implementation("com.dyn:braced:${libs.versions.junit.get()}")',
+    '  implementation("com.dyn:escaped-slash:\\\\$ver")',
+    '  implementation("""com.dyn:raw-interp:$ver""")',
+    '  implementation("com.dyn:concat:" + ver)',
+    '  implementation(group = "com.dyn", name = "named-var", version = ver)',
+    '  implementation(platform("org.springframework.boot:spring-boot-dependencies:3.2.0"))',
+    "  implementation(enforcedPlatform(libs.junit.jupiter))",
+    '  implementation(project(":core"))',
+    "  implementation(projects.shared)",
+    '  implementation(testFixtures(project(":common")))',
+    '  runtimeOnly(files("libs/local.jar"))',
+    '  runtimeOnly(fileTree("libs"))',
+    '  implementation(kotlin("stdlib"))',
+    "  implementation(libs.bundles.testing)",
+    "  implementation(libs.unknown.alias)",
+    "  implementation('com.groovy:single-quoted:1.0.0')",
+    '  customConfig("com.custom:thing:1.0.0")',
+    "}",
+  }, "\n")
+
+  local dyn_deps, dyn_notes = deps._parse_kotlin_gradle_dependencies(dynamic_kts, mixed_catalog)
+  assert(#dyn_deps == 0, "formas dinâmicas/não suportadas não podem virar dependências: " .. vim.inspect(dyn_deps))
+  local dyn_joined = table.concat(dyn_notes, "\n")
+  for _, expected_note in ipairs({
+    "dynamic version or variable not resolved: com.dyn:interp:$ver",
+    "dynamic version or variable not resolved: com.dyn:braced:${libs.versions.junit.get()}",
+    "escaped-slash",
+    "raw-interp",
+    "concat",
+    "named-var",
+    "platform/BOM dependency not resolved",
+    'project dependency not resolved: implementation(project(":core"))',
+    "project dependency not resolved: implementation(projects.shared)",
+    "testFixtures dependency not resolved",
+    "file dependency not resolved",
+    "file-tree dependency not resolved",
+    "kotlin() dependency helper not resolved",
+    "catalog bundle not resolved: libs.bundles.testing",
+    "catalog alias not resolved (no libs.versions.toml entry): libs.unknown.alias",
+    "single-quoted",
+    "customConfig",
+  }) do
+    assert(dyn_joined:find(expected_note, 1, true), "nota esperada ausente: " .. expected_note .. "\n" .. dyn_joined)
+  end
+end
+
+kotlin_dsl_spec()
+
+local function kotlin_repair_spec()
+  -- 1) Trailing configuration lambdas: report partial and never present a misleading effective version
+  local lambda_catalog = deps._parse_version_catalog(table.concat({
+    "[libraries]",
+    'junit-jupiter = "org.junit.jupiter:junit-jupiter:5.10.0"',
+  }, "\n"))
+  local lambda_kts = table.concat({
+    "dependencies {",
+    '  implementation("com.example:override:1.0.0") {',
+    "    version {",
+    '      strictly("2.0.0")',
+    "    }",
+    "  }",
+    "  testImplementation(libs.junit.jupiter) {",
+    "    isTransitive = false",
+    "  }",
+    '  api(group = "com.example", name = "named-lambda", version = "1.2.0") {',
+    "    isForce = true",
+    "  }",
+    '  runtimeOnly("com.example:no-declared") {',
+    "    version {",
+    '      require("3.0.0")',
+    "    }",
+    "  }",
+    "}",
+  }, "\n")
+  local ldeps, lnotes = deps._parse_kotlin_gradle_dependencies(lambda_kts, lambda_catalog)
+  assert(#ldeps == 4, "esperava 4 deps com lambda de configuração: " .. #ldeps)
+  assert(#lnotes == 4, "esperava 4 notas de lambda de configuração: " .. #lnotes)
+  local function lfind(group, artifact)
+    for _, entry in ipairs(ldeps) do
+      if entry.groupId == group and entry.artifactId == artifact then
+        return entry
+      end
+    end
+  end
+  local override_dep = lfind("com.example", "override")
+  assert(
+    override_dep
+      and override_dep.version == nil
+      and override_dep.declared_version == "1.0.0"
+      and override_dep.has_configuration_lambda == true
+  )
+  local cat_lambda_dep = lfind("org.junit.jupiter", "junit-jupiter")
+  assert(
+    cat_lambda_dep
+      and cat_lambda_dep.version == nil
+      and cat_lambda_dep.declared_version == "5.10.0"
+      and cat_lambda_dep.has_configuration_lambda == true
+  )
+  local named_lambda_dep = lfind("com.example", "named-lambda")
+  assert(
+    named_lambda_dep
+      and named_lambda_dep.version == nil
+      and named_lambda_dep.declared_version == "1.2.0"
+      and named_lambda_dep.has_configuration_lambda == true
+  )
+  local no_decl_dep = lfind("com.example", "no-declared")
+  assert(
+    no_decl_dep
+      and no_decl_dep.version == nil
+      and no_decl_dep.declared_version == nil
+      and no_decl_dep.has_configuration_lambda == true
+  )
+
+  local lambda_dir = tempdir("kts-lambda")
+  write_raw(lambda_dir .. "/settings.gradle.kts", 'rootProject.name = "kts-lambda"\n')
+  write_raw(lambda_dir .. "/build.gradle.kts", lambda_kts .. "\n")
+  write_raw(
+    lambda_dir .. "/gradle/libs.versions.toml",
+    '[libraries]\njunit-jupiter = "org.junit.jupiter:junit-jupiter:5.10.0"\n'
+  )
+  local lambda_target = deps._resolve_target(buffer_for(lambda_dir .. "/build.gradle.kts"))
+  local lambda_report = table.concat(deps._report_lines(lambda_target), "\n")
+  assert(
+    lambda_report:find("Coverage: partial", 1, true),
+    "lambda não deveria alegar cobertura total:\n" .. lambda_report
+  )
+  assert(
+    lambda_report:find(
+      "  - implementation com.example:override  (declared version=1.0.0, configuration lambda not evaluated)",
+      1,
+      true
+    ),
+    "versão declarada com lambda mal formatada:\n" .. lambda_report
+  )
+  assert(
+    lambda_report:find("  - runtimeOnly com.example:no-declared  (configuration lambda not evaluated)", 1, true),
+    "dep sem versão declarada + lambda mal formatada:\n" .. lambda_report
+  )
+  assert(
+    not lambda_report:find("  - implementation com.example:override:1.0.0", 1, true),
+    "versão declarada apresentada como efetiva:\n" .. lambda_report
+  )
+
+  -- 2) val/var containing dependency registration must surface partial (never silently disappear)
+  local decl_kts = table.concat({
+    "dependencies {",
+    '  val dep = add("implementation", "com.example:added:1.0.0")',
+    '  var other = implementation("com.example:assigned:2.0.0")',
+    "}",
+    'val topDep = dependencies.add("implementation", "com.example:top-add:3.0.0")',
+    "val topBlock = dependencies {",
+    '  implementation("com.example:top-block:4.0.0")',
+    "}",
+  }, "\n")
+  local decl_deps, decl_notes = deps._parse_kotlin_gradle_dependencies(decl_kts, nil)
+  assert(#decl_deps == 0, "declarações val/var não devem gerar deps: " .. vim.inspect(decl_deps))
+  assert(#decl_notes == 4, "esperava 4 notas para val/var: " .. vim.inspect(decl_notes))
+  local decl_joined = table.concat(decl_notes, "\n")
+  assert(decl_joined:find('val dep = add("implementation", "com.example:added:1.0.0")', 1, true))
+  assert(decl_joined:find('var other = implementation("com.example:assigned:2.0.0")', 1, true))
+  assert(decl_joined:find('val topDep = dependencies.add("implementation", "com.example:top-add:3.0.0")', 1, true))
+  assert(decl_joined:find("val topBlock = dependencies", 1, true))
+
+  local decl_dir = tempdir("kts-decl")
+  write_raw(decl_dir .. "/settings.gradle.kts", 'rootProject.name = "kts-decl"\n')
+  write_raw(decl_dir .. "/build.gradle.kts", decl_kts .. "\n")
+  local decl_report =
+    table.concat(deps._report_lines(deps._resolve_target(buffer_for(decl_dir .. "/build.gradle.kts"))), "\n")
+  assert(decl_report:find("Coverage: partial", 1, true), "val/var não reportou partial:\n" .. decl_report)
+
+  -- 3) Qualified other.dependencies blocks/receivers must not be assumed current project
+  local scoped_kts = table.concat({
+    "buildscript {",
+    "  dependencies {",
+    '    classpath("com.current:plugin:1.0.0")',
+    "  }",
+    "  other.dependencies {",
+    '    classpath("com.other:buildscript-other:9.9.9")',
+    "  }",
+    "}",
+    "other.dependencies {",
+    '  implementation("com.other:direct:1.0.0")',
+    "}",
+    'project(":core").dependencies {',
+    '  implementation("com.other:proj:1.0.0")',
+    "}",
+    "other",
+    "  .dependencies {",
+    '    implementation("com.other:multiline-dot-next:1.0.0")',
+    "  }",
+    "other.",
+    "  dependencies {",
+    '    implementation("com.other:multiline-dot-prev:1.0.0")',
+    "  }",
+    'other.dependencies.implementation("com.other:dot-call:1.0.0")',
+    "subprojects {",
+    '  dependencies.implementation("com.other:sub-dot-call:1.0.0")',
+    "}",
+    "dependencies {",
+    '  implementation("com.current:ok:2.0.0")',
+    "}",
+  }, "\n")
+  local sdeps, snotes = deps._parse_kotlin_gradle_dependencies(scoped_kts, nil)
+  assert(#sdeps == 2, "esperava apenas 2 deps do projeto atual: " .. vim.inspect(sdeps))
+  assert(sdeps[1].groupId == "com.current" and sdeps[1].artifactId == "plugin")
+  assert(sdeps[2].groupId == "com.current" and sdeps[2].artifactId == "ok")
+  assert(#snotes == 7, "esperava 7 notas para receptores scoped: " .. vim.inspect(snotes))
+  local snotes_joined = table.concat(snotes, "\n")
+  assert(snotes_joined:find("scoped dependencies receiver not resolved: other.dependencies", 1, true))
+  assert(snotes_joined:find('scoped dependencies receiver not resolved: project(":core").dependencies', 1, true))
+  assert(snotes_joined:find("scoped dependencies receiver not resolved: other .dependencies", 1, true))
+  assert(snotes_joined:find("scoped dependencies receiver not resolved: other. dependencies", 1, true))
+  assert(
+    snotes_joined:find(
+      'scoped dependencies receiver not resolved: other.dependencies.implementation("com.other:dot-call:1.0.0")',
+      1,
+      true
+    )
+  )
+  assert(snotes_joined:find("scoped or conditional dependencies block not resolved (subprojects)", 1, true))
+
+  -- 4) Ambiguous catalog aliases (same Gradle normalized accessor) for both Kotlin and Groovy
+  local amb_toml_a = table.concat({
+    "[libraries]",
+    'foo-bar = "com.example:foo-dash:1.0.0"',
+    'foo_bar = "com.example:foo-under:2.0.0"',
+    'ok-lib = "com.example:ok:3.0.0"',
+  }, "\n")
+  local amb_toml_b = table.concat({
+    "[libraries]",
+    'foo_bar = "com.example:foo-under:2.0.0"',
+    'foo-bar = "com.example:foo-dash:1.0.0"',
+    'ok-lib = "com.example:ok:3.0.0"',
+  }, "\n")
+  local amb_cat_a = deps._parse_version_catalog(amb_toml_a)
+  local amb_cat_b = deps._parse_version_catalog(amb_toml_b)
+  assert(
+    #amb_cat_a.notes == 1
+      and amb_cat_a.notes[1] == "ambiguous catalog accessor libs.foo.bar (aliases: foo-bar, foo_bar)",
+    "nota de catálogo ambíguo divergiu: " .. vim.inspect(amb_cat_a.notes)
+  )
+  assert(
+    #amb_cat_b.notes == 1 and amb_cat_b.notes[1] == amb_cat_a.notes[1],
+    "nota de catálogo ambíguo não é determinística entre ordens"
+  )
+
+  local amb_kts = table.concat({
+    "dependencies {",
+    "  implementation(libs.foo.bar)",
+    "  api(libs.ok.lib)",
+    "}",
+  }, "\n")
+  for _, cat in ipairs({ amb_cat_a, amb_cat_b }) do
+    local ak_deps, ak_notes = deps._parse_kotlin_gradle_dependencies(amb_kts, cat)
+    assert(#ak_deps == 1 and ak_deps[1].artifactId == "ok", "alias não ambíguo deveria resolver e ambíguo não")
+    assert(
+      #ak_notes == 1 and ak_notes[1] == "ambiguous catalog alias libs.foo.bar (matches: foo-bar, foo_bar)",
+      "ambiguidade Kotlin divergiu: " .. vim.inspect(ak_notes)
+    )
+  end
+
+  local amb_groovy = table.concat({
+    "dependencies {",
+    "  implementation(libs.foo.bar)",
+    "  testImplementation libs.foo.bar",
+    "  api libs.ok.lib",
+    "}",
+  }, "\n")
+  for _, cat in ipairs({ amb_cat_a, amb_cat_b }) do
+    local ag_deps, ag_notes = deps._parse_gradle_dependencies(amb_groovy, cat)
+    assert(
+      #ag_deps == 1 and ag_deps[1].artifactId == "ok",
+      "Groovy: alias não ambíguo deveria resolver e ambíguo não"
+    )
+    assert(#ag_notes == 2, "Groovy: esperava 2 notas de ambiguidade: " .. vim.inspect(ag_notes))
+    assert(ag_notes[1] == "ambiguous catalog alias libs.foo.bar (matches: foo-bar, foo_bar)")
+    assert(ag_notes[2] == "ambiguous catalog alias libs.foo.bar (matches: foo-bar, foo_bar)")
+  end
+
+  -- Colisão de 3 aliases normalizados (hífen, ponto e sublinhado)
+  local amb_toml_3 = table.concat({
+    "[libraries]",
+    'foo.bar = "com.example:foo-dot:1.0.0"',
+    'foo_bar = "com.example:foo-under:2.0.0"',
+    'foo-bar = "com.example:foo-dash:3.0.0"',
+  }, "\n")
+  local amb_cat_3 = deps._parse_version_catalog(amb_toml_3)
+  local _, k3_notes = deps._parse_kotlin_gradle_dependencies("dependencies { implementation(libs.foo.bar) }", amb_cat_3)
+  local _, g3_notes = deps._parse_gradle_dependencies("dependencies {\n  implementation libs.foo.bar\n}", amb_cat_3)
+  assert(k3_notes[1] == "ambiguous catalog alias libs.foo.bar (matches: foo-bar, foo.bar, foo_bar)")
+  assert(g3_notes[1] == "ambiguous catalog alias libs.foo.bar (matches: foo-bar, foo.bar, foo_bar)")
+
+  local amb_dir = tempdir("kts-ambig")
+  write_raw(amb_dir .. "/settings.gradle.kts", 'rootProject.name = "kts-ambig"\n')
+  write_raw(amb_dir .. "/build.gradle.kts", amb_kts .. "\n")
+  write_raw(amb_dir .. "/gradle/libs.versions.toml", amb_toml_a .. "\n")
+  local amb_report =
+    table.concat(deps._report_lines(deps._resolve_target(buffer_for(amb_dir .. "/build.gradle.kts"))), "\n")
+  assert(amb_report:find("Coverage: partial", 1, true), "catálogo ambíguo não reportou partial:\n" .. amb_report)
+  assert(amb_report:find("Note: ambiguous catalog alias libs.foo.bar (matches: foo-bar, foo_bar)", 1, true))
+  assert(amb_report:find("  - api com.example:ok:3.0.0", 1, true))
+  assert(not amb_report:find("  - implementation com.example:foo-", 1, true))
+end
+
+kotlin_repair_spec()
+
+local function kotlin_followup_spec()
+  -- 1) TOML inline ref (`version = { ref = "..." }`) e inline rich version (`version = { require = "..." }`)
+  local rich_toml = table.concat({
+    "[versions]",
+    'junit = "5.10.0"',
+    "",
+    "[libraries]",
+    'inline-ref = { module = "com.example:inline-ref", version = { ref = "junit" } }',
+    'inline-ref-gn = { group = "com.example", name = "inline-ref-gn", version = { ref = "junit" } }',
+    'missing-inline-ref = { module = "com.example:missing-inline-ref", version = { ref = "missingVer" } }',
+    'rich-require = { module = "com.example:rich-require", version = { require = "1.2.3" } }',
+    'rich-range = { group = "com.example", name = "rich-range", version = { require = "[1.0, 2.0)", prefer = "1.5.0", reject = ["1.4.0"] } }',
+    'dotted-rich = { module = "com.example:dotted-rich", version.strictly = "2.0.0" }',
+  }, "\n")
+  local rich_cat = deps._parse_version_catalog(rich_toml)
+  assert(rich_cat.by_alias["inline-ref"].version == "5.10.0" and rich_cat.by_alias["inline-ref"].note == nil)
+  assert(rich_cat.by_alias["inline-ref-gn"].version == "5.10.0" and rich_cat.by_alias["inline-ref-gn"].note == nil)
+  assert(
+    rich_cat.by_alias["missing-inline-ref"].version == nil
+      and rich_cat.by_alias["missing-inline-ref"].note == "unresolved version.ref: missingVer"
+  )
+  assert(
+    rich_cat.by_alias["rich-require"].version == nil
+      and rich_cat.by_alias["rich-require"].note == "rich version constraint not resolved"
+  )
+  assert(
+    rich_cat.by_alias["rich-range"].version == nil
+      and rich_cat.by_alias["rich-range"].note == "rich version constraint not resolved"
+  )
+  assert(
+    rich_cat.by_alias["dotted-rich"].version == nil
+      and rich_cat.by_alias["dotted-rich"].note == "rich version constraint not resolved"
+  )
+
+  local rich_kts = table.concat({
+    "dependencies {",
+    "  implementation(libs.inline.ref)",
+    "  api(libs.inline.ref.gn)",
+    "  testImplementation(libs.missing.inline.ref)",
+    "  implementation(libs.rich.require)",
+    "  runtimeOnly(libs.rich.range)",
+    "  compileOnly(libs.dotted.rich)",
+    "}",
+  }, "\n")
+  local rk_deps, rk_notes = deps._parse_kotlin_gradle_dependencies(rich_kts, rich_cat)
+  assert(#rk_deps == 6, "esperava 6 deps do catálogo no Kotlin: " .. #rk_deps)
+  assert(rk_deps[1].version == "5.10.0" and rk_deps[2].version == "5.10.0")
+  assert(
+    rk_deps[3].version == nil and rk_deps[4].version == nil and rk_deps[5].version == nil and rk_deps[6].version == nil
+  )
+  local rk_joined = table.concat(rk_notes, "\n")
+  assert(rk_joined:find("libs.missing.inline.ref: unresolved version.ref: missingVer", 1, true))
+  assert(rk_joined:find("libs.rich.require: rich version constraint not resolved", 1, true))
+  assert(rk_joined:find("libs.rich.range: rich version constraint not resolved", 1, true))
+  assert(rk_joined:find("libs.dotted.rich: rich version constraint not resolved", 1, true))
+
+  local rich_groovy = table.concat({
+    "dependencies {",
+    "  implementation libs.inline.ref",
+    "  api(libs.inline.ref.gn)",
+    "  testImplementation libs.missing.inline.ref",
+    "  implementation(libs.rich.require)",
+    "  runtimeOnly libs.rich.range",
+    "  compileOnly libs.dotted.rich",
+    "}",
+  }, "\n")
+  local rg_deps, rg_notes = deps._parse_gradle_dependencies(rich_groovy, rich_cat)
+  assert(#rg_deps == 6, "esperava 6 deps do catálogo no Groovy: " .. #rg_deps)
+  assert(rg_deps[1].version == "5.10.0" and rg_deps[2].version == "5.10.0")
+  assert(
+    rg_deps[3].version == nil and rg_deps[4].version == nil and rg_deps[5].version == nil and rg_deps[6].version == nil
+  )
+  local rg_joined = table.concat(rg_notes, "\n")
+  assert(rg_joined:find("libs.missing.inline.ref: unresolved version.ref: missingVer", 1, true))
+  assert(rg_joined:find("libs.rich.require: rich version constraint not resolved", 1, true))
+  assert(rg_joined:find("libs.rich.range: rich version constraint not resolved", 1, true))
+  assert(rg_joined:find("libs.dotted.rich: rich version constraint not resolved", 1, true))
+
+  local rich_kts_dir = tempdir("kts-rich-toml")
+  write_raw(rich_kts_dir .. "/settings.gradle.kts", 'rootProject.name = "kts-rich-toml"\n')
+  write_raw(rich_kts_dir .. "/build.gradle.kts", rich_kts .. "\n")
+  write_raw(rich_kts_dir .. "/gradle/libs.versions.toml", rich_toml .. "\n")
+  local rich_kts_report =
+    table.concat(deps._report_lines(deps._resolve_target(buffer_for(rich_kts_dir .. "/build.gradle.kts"))), "\n")
+  assert(rich_kts_report:find("Coverage: partial", 1, true), "relatório .kts rich TOML deve ser parcial")
+  assert(rich_kts_report:find("  - implementation com.example:inline-ref:5.10.0", 1, true))
+  assert(
+    rich_kts_report:find("  - implementation com.example:rich-require  (rich version constraint not resolved)", 1, true),
+    "dep rich-require sem indicação no relatório .kts:\n" .. rich_kts_report
+  )
+  assert(
+    rich_kts_report:find("  - rich-require com.example:rich-require  (rich version constraint not resolved)", 1, true),
+    "catálogo rich-require sem indicação no relatório .kts:\n" .. rich_kts_report
+  )
+
+  local rich_groovy_dir = tempdir("groovy-rich-toml")
+  write_raw(rich_groovy_dir .. "/settings.gradle", 'rootProject.name = "groovy-rich-toml"\n')
+  write_raw(rich_groovy_dir .. "/build.gradle", rich_groovy .. "\n")
+  write_raw(rich_groovy_dir .. "/gradle/libs.versions.toml", rich_toml .. "\n")
+  local rich_groovy_report =
+    table.concat(deps._report_lines(deps._resolve_target(buffer_for(rich_groovy_dir .. "/build.gradle"))), "\n")
+  assert(rich_groovy_report:find("Coverage: partial", 1, true), "relatório Groovy rich TOML deve ser parcial")
+  assert(rich_groovy_report:find("Note: libs.rich.require: rich version constraint not resolved", 1, true))
+  assert(
+    rich_groovy_report:find(
+      "  - testImplementation com.example:missing-inline-ref  (unresolved version.ref: missingVer)",
+      1,
+      true
+    )
+  )
+
+  -- 2) Formas Kotlin `dependencies({ ... })`, `with(dependencies) { ... }` e variantes
+  local scope_forms_kts = table.concat({
+    "dependencies({",
+    '  implementation("com.example:in-parens:1.0.0")',
+    "})",
+    "with(dependencies) {",
+    '  implementation("com.example:in-with:1.0.0")',
+    "}",
+    "with(project.dependencies) {",
+    '  api("com.example:in-with-proj:1.0.0")',
+    "}",
+    "with(dependencies, {",
+    '  runtimeOnly("com.example:in-with-arg:1.0.0")',
+    "})",
+    "dependencies.apply {",
+    '  implementation("com.example:in-apply:1.0.0")',
+    "}",
+    "dependencies {",
+    '  implementation("com.example:normal:1.0.0")',
+    "}",
+  }, "\n")
+  local sf_deps, sf_notes = deps._parse_kotlin_gradle_dependencies(scope_forms_kts, nil)
+  assert(
+    #sf_deps == 1 and sf_deps[1].artifactId == "normal",
+    "formas não suportadas inventaram deps: " .. vim.inspect(sf_deps)
+  )
+  assert(#sf_notes == 5, "esperava 5 notas para formas de dependencies(): " .. vim.inspect(sf_notes))
+  local sf_joined = table.concat(sf_notes, "\n")
+  assert(sf_joined:find("dependencies({", 1, true), "nota ausente para dependencies({ ... }):\n" .. sf_joined)
+  assert(sf_joined:find("with(dependencies)", 1, true), "nota ausente para with(dependencies):\n" .. sf_joined)
+  assert(
+    sf_joined:find("with(project.dependencies)", 1, true),
+    "nota ausente para with(project.dependencies):\n" .. sf_joined
+  )
+  assert(sf_joined:find("with(dependencies, {", 1, true), "nota ausente para with(dependencies, {...}):\n" .. sf_joined)
+  assert(sf_joined:find("dependencies.apply", 1, true), "nota ausente para dependencies.apply:\n" .. sf_joined)
+
+  local sf_dir = tempdir("kts-scope-forms")
+  write_raw(sf_dir .. "/settings.gradle.kts", 'rootProject.name = "kts-scope-forms"\n')
+  write_raw(sf_dir .. "/build.gradle.kts", scope_forms_kts .. "\n")
+  local sf_report =
+    table.concat(deps._report_lines(deps._resolve_target(buffer_for(sf_dir .. "/build.gradle.kts"))), "\n")
+  assert(
+    sf_report:find("Coverage: partial", 1, true),
+    "relatório de formas scoped não marcou partial:\n" .. sf_report
+  )
+  assert(sf_report:find("Dependencies: 1 (static parse of build.gradle.kts)", 1, true))
+
+  -- 3) Script externo `apply(from = "deps.gradle.kts")` e `apply { from(...) }`: reporta partial sem executar
+  local apply_dir = tempdir("kts-apply-from")
+  write_raw(apply_dir .. "/settings.gradle.kts", 'rootProject.name = "kts-apply-from"\n')
+  write_raw(
+    apply_dir .. "/deps.gradle.kts",
+    'dependencies {\n  implementation("com.external:should-not-execute:9.9.9")\n}\n'
+  )
+  write_raw(
+    apply_dir .. "/build.gradle.kts",
+    table.concat({
+      'apply(plugin = "java")',
+      'apply(from = "deps.gradle.kts")',
+      "apply {",
+      '  from("extra.gradle.kts")',
+      "}",
+      'project.apply(mapOf("from" to "more.gradle.kts"))',
+      "dependencies {",
+      '  implementation("com.example:local:1.0.0")',
+      "}",
+      "",
+    }, "\n")
+  )
+  local apply_report =
+    table.concat(deps._report_lines(deps._resolve_target(buffer_for(apply_dir .. "/build.gradle.kts"))), "\n")
+  assert(apply_report:find("Coverage: partial", 1, true), "apply(from=...) não marcou partial:\n" .. apply_report)
+  assert(apply_report:find("Dependencies: 1 (static parse of build.gradle.kts)", 1, true))
+  assert(apply_report:find("  - implementation com.example:local:1.0.0", 1, true))
+  assert(not apply_report:find("should-not-execute", 1, true), "script externo não pode ser executado/inventado")
+  assert(
+    apply_report:find('Note: external script apply(from = ...) not resolved: apply(from = "deps.gradle.kts")', 1, true)
+  )
+  assert(
+    apply_report:find(
+      'Note: external script apply(from = ...) not resolved: apply { from("extra.gradle.kts") }',
+      1,
+      true
+    )
+  )
+  assert(
+    apply_report:find(
+      'Note: external script apply(from = ...) not resolved: project.apply(mapOf("from" to "more.gradle.kts"))',
+      1,
+      true
+    )
+  )
+  assert(
+    not apply_report:find('apply(plugin = "java")', 1, true),
+    "apply(plugin = ...) não deveria gerar falso positivo de script externo"
+  )
+end
+
+kotlin_followup_spec()
 
 -- Estes testes interativos vivem em uma função própria: o chunk principal já
 -- usa o limite de 200 variáveis locais do Lua.
@@ -903,6 +1592,28 @@ local function interactive_spec()
   vim.cmd("close")
   assert(list_lines:find("Build file: pom.xml", 1, true), "List não abriu o relatório do POM")
   assert(list_lines:find("Dependencies: 0", 1, true))
+
+  -- Kotlin DSL: menu mantém Add desabilitado e List abre relatório estático
+  stub_ui({ "Add dependency" }, {})
+  notices = {}
+  deps.menu(kts_buf)
+  assert(#select_calls == 1, "menu Kotlin DSL deveria abrir uma vez")
+  local kts_menu = table.concat(select_calls[1].items, "\n")
+  assert(
+    kts_menu:find("Add dependency…  (unavailable: Gradle build file editing is not supported", 1, true),
+    "Add dependency deveria seguir desabilitado no Kotlin DSL: " .. kts_menu
+  )
+  assert(kts_menu:find("Open build.gradle.kts", 1, true), "Open build.gradle.kts ausente no menu")
+  assert(has_notice("read-only MVP"), "escolher Add no Kotlin DSL deveria avisar")
+
+  stub_ui({ "List dependencies" }, {})
+  deps.menu(kts_buf)
+  local kts_list_buf = vim.api.nvim_get_current_buf()
+  local kts_list_lines = table.concat(vim.api.nvim_buf_get_lines(kts_list_buf, 0, -1, false), "\n")
+  vim.cmd("close")
+  assert(kts_list_lines:find("Build file: build.gradle.kts", 1, true), "List não abriu o relatório .kts")
+  assert(kts_list_lines:find("implementation org.slf4j:slf4j-api:2.0.20", 1, true), "dep .kts ausente no buffer")
+  assert(kts_list_lines:find("Coverage: partial", 1, true), "cobertura parcial ausente no buffer .kts")
 
   -- cancelar no menu não escreve nada
   local menu_cancel_root, menu_cancel_main = fixtures.maven_project("deps-menu-cancel", "com.deps.mc", "App")

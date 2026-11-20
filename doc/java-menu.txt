@@ -287,9 +287,11 @@ jdtls. Four entries:
                     - List dependencies...: read-only report (q closes).
                       Maven lists project-level dependencies, parent,
                       dependencyManagement and BOM/profile notes. Gradle
-                      reads Groovy build.gradle string/catalog entries plus
-                      gradle/libs.versions.toml and reports dynamic forms or
-                      Kotlin DSL (.kts, deferred) explicitly.
+                      performs a static read-only parse of Groovy
+                      build.gradle and Kotlin DSL build.gradle.kts literal
+                      entries plus gradle/libs.versions.toml, and reports
+                      dynamic, interpolated, helper or scoped forms as
+                      partial notes without executing Gradle.
                     - Add dependency... (Maven only; disabled on Gradle):
                       optional Maven Central search or offline manual entry,
                       dedupe by literal groupId+artifactId, honest BOM/parent
@@ -365,7 +367,9 @@ generate delegate methods.
 - Dependencies: Maven edits are surgical text insertions (no XML parser);
   textual <parent>/BOM detection cannot prove per-artifact version coverage
   and notes this explicitly when <version> is omitted. Gradle is read-only
-  (editing disabled, Kotlin DSL static parsing deferred).
+  (editing disabled); static parsing covers Groovy build.gradle and Kotlin
+  DSL build.gradle.kts literal/catalog entries and reports dynamic,
+  interpolated, helper or scoped forms as partial without running Gradle.
 - Project creation runs no git init and installs/configures no tools.
 - Rename Package / Move Package are disabled (see |java-menu-refactor|).
 - Tested on Linux only; no Windows/macOS validation.
