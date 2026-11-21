@@ -1762,6 +1762,954 @@ do
   assert(vim.fn.filereadable(legacy_path) == 1 and vim.trim(read_raw(legacy_path)) == legacy_content)
 end
 
+-- ========== 16. Issue #6: Overlapping, chunked, derived, short-value & limit tests ==========
+
+do
+  -- 16a. NUL byte em .env real no disco + UTF-8 BOM sem executar shell
+  local nul_dir = tempdir("env-nul-bom")
+  local pwn_marker = nul_dir .. "/should_not_exist.txt"
+  local env_path = nul_dir .. "/.env"
+  local fd = assert(vim.uv.fs_open(env_path, "w", 384))
+  local raw_env = "\239\187\191VALID_KEY=SafeVal_123\n"
+    .. "BAD_NUL=before\0secret_nul_after\n"
+    .. "CMD_SUB=$(touch "
+    .. pwn_marker
+    .. ")\n"
+  assert(vim.uv.fs_write(fd, raw_env, 0))
+  vim.uv.fs_close(fd)
+
+  local nul_res = run_config.load_env(nul_dir)
+  assert(nul_res.exists == true)
+  assert(vim.fn.filereadable(pwn_marker) == 0, ".env com BOM/NUL não pode executar comandos")
+  assert(nul_res.env.VALID_KEY == "SafeVal_123", "UTF-8 BOM na linha 1 não deveria quebrar VALID_KEY")
+  assert(nul_res.env.BAD_NUL == nil, "linha com byte NUL no disco deveria ser rejeitada")
+  assert(#nul_res.warnings == 1, "deveria emitir exatamente 1 aviso para byte NUL: " .. vim.inspect(nul_res.warnings))
+  assert(nul_res.warnings[1]:find("NUL byte", 1, true), "aviso de NUL divergiu: " .. nul_res.warnings[1])
+  assert(not nul_res.warnings[1]:find("secret_nul_after", 1, true), "aviso de NUL vazou valor!")
+
+  -- 16b. Segredos sobrepostos e auto-sobrepostos não vazam sufixos
+  local overlap_reds = run_config.collect_redactions({
+    LEFT = "ab_cd",
+    RIGHT = "cd_secret_xyz",
+    NUM_A = "12345",
+    NUM_B = "45678",
+    SELF = "ababa",
+    ADJ_A = "foo",
+    ADJ_B = "bar",
+  })
+  assert(run_config.redact("ab_cd_secret_xyz", overlap_reds) == "[REDACTED]", "sobreposição vazou sufixo")
+  assert(run_config.redact("x=12345678!", overlap_reds) == "x=[REDACTED]!", "sobreposição numérica vazou sufixo")
+  assert(run_config.redact("abababa", overlap_reds) == "[REDACTED]", "auto-sobreposição vazou sufixo")
+  assert(
+    run_config.redact("foobar", overlap_reds) == "[REDACTED][REDACTED]",
+    "segredos adjacentes não-sobrepostos devem redigir ambos"
+  )
+
+  -- 16c. Variantes percent-encoded e JSON-escaped (>= 6 chars) vs valores curtos (< 6 chars)
+  local derived_reds = run_config.collect_redactions({
+    DB_PASS = "p@ss#1/a+b=c",
+    JSON_PASS = 'sec"ret\\val',
+    SHORT_SYM = "@",
+  })
+  local url_redacted = run_config.redact("url=p%40ss%231%2Fa%2Bb%3Dc lower=p%40ss%231%2fa%2bb%3dc", derived_reds)
+  assert(
+    url_redacted == "url=[REDACTED] lower=[REDACTED]",
+    "URL percent-encoded deveria ser redigido: " .. url_redacted
+  )
+  local json_redacted = run_config.redact('{"pw":"sec\\"ret\\\\val"}', derived_reds)
+  assert(json_redacted == '{"pw":"[REDACTED]"}', "JSON-escaped deveria ser redigido: " .. json_redacted)
+  assert(
+    run_config.redact("email%40example.com a@b", derived_reds) == "email%40example.com a[REDACTED]b",
+    "valor curto (< 6) não deve gerar variantes %XX e causar falso positivo em %40"
+  )
+
+  -- 16d. Valor .env com espaço dividido entre tokens de argv (table)
+  local space_env = { PHRASE = "hello world", SHORT = "42" }
+  assert(run_config.overlaps_env({ "hello", "world" }, space_env), "table argv com frase dividida deve colidir")
+  assert(
+    run_config.overlaps_env({ "-Dmsg=hello", "world" }, space_env),
+    "table argv com frase parcial+seguinte deve colidir"
+  )
+  local space_root = tempdir("space-env")
+  fixtures.write(space_root .. "/.env", { 'PHRASE="hello world"' })
+  local ok_space_build, space_err = run_config.save_last_build(space_root, { "hello", "world" })
+  assert(not ok_space_build and space_err ~= nil, "save_last_build não pode persistir frase .env dividida em argv")
+
+  -- 16e. Bufferização determinística por chunks (_feed / _finish): split lines, CRLF, EOF sem newline, seq stale
+  local test_buf = vim.api.nvim_create_buf(false, true)
+  build._state.seq = build._state.seq + 1
+  local cur_seq = build._state.seq
+  build._state.buf = test_buf
+  build._state.running = true
+  build._state.kind = "build"
+  build._reset_streams()
+
+  local chunk_reds = run_config.collect_redactions({
+    TOK = "TopSecret_9988",
+    OV_A = "left_mid",
+    OV_B = "mid_right_secret",
+  })
+  -- Chunk 1 & 2: linha incompleta ainda não vai para o buffer
+  build._feed(cur_seq, test_buf, "stdout", { "pre_Top" }, chunk_reds)
+  build._feed(cur_seq, test_buf, "stdout", { "Secret_" }, chunk_reds)
+  vim.wait(30, function()
+    return false
+  end)
+  assert(buf_text(test_buf) == "", "chunk incompleto não deve vazar antes de newline/EOF: " .. buf_text(test_buf))
+  assert(
+    build._pending_text("stdout") == "pre_TopSecret_",
+    "pending.stdout divergiu: " .. build._pending_text("stdout")
+  )
+
+  -- Chunk 3: completa a linha + inicia segunda linha com CRLF dividido + linha de sobreposição
+  build._feed(cur_seq, test_buf, "stdout", { "9988_post", "crlf=TopSecret_9988\r" }, chunk_reds)
+  build._feed(cur_seq, test_buf, "stdout", { "", "ov=left_mid_right_secret", "eof_tail=Top" }, chunk_reds)
+  build._feed(cur_seq, test_buf, "stdout", { "Secret_9988" }, chunk_reds)
+  -- Chunk stale de outra seq deve ser ignorado
+  build._feed(cur_seq - 1, test_buf, "stdout", { "stale_TopSecret_9988", "" }, chunk_reds)
+
+  assert(
+    fixtures.wait_for(2000, function()
+      return buf_text(test_buf):find("ov=[REDACTED]", 1, true) ~= nil
+    end),
+    "linhas completas de _feed não chegaram ao buffer: " .. buf_text(test_buf)
+  )
+  -- EOF sem newline: _finish deve descarregar e redigir pending.stdout
+  build._finish(cur_seq, 0, chunk_reds)
+  local fed_text = buf_text(test_buf)
+  assert(fed_text:find("pre_[REDACTED]_post", 1, true), "segredo em 3 chunks não foi redigido: " .. fed_text)
+  assert(fed_text:find("crlf=[REDACTED]\r", 1, true), "segredo com CRLF dividido não foi redigido: " .. fed_text)
+  assert(fed_text:find("ov=[REDACTED]", 1, true), "sobreposição cross-chunk não foi redigida: " .. fed_text)
+  assert(fed_text:find("eof_tail=[REDACTED]", 1, true), "cauda no EOF sem newline não foi redigida: " .. fed_text)
+  assert(not fed_text:find("TopSecret_9988", 1, true), "segredo vazou no teste determinístico de chunks!")
+  assert(not fed_text:find("right_secret", 1, true), "sufixo sobreposto vazou no teste de chunks!")
+  assert(not fed_text:find("stale_", 1, true), "chunk de seq stale foi aplicado!")
+  vim.api.nvim_buf_delete(test_buf, { force = true })
+
+  -- 16f. Processo real (jobstart): chunks temporizados, EOF sem newline, URL/JSON, curto (falso positivo) e limites documentados
+  local root_i6, main_i6 = fixtures.maven_project("run7d-issue6", "com.demo.i6", "App")
+  local api_tok = "TopSecret/A+B=C#99"
+  local json_sec = 'sec"ret\\val'
+  fixtures.write(root_i6 .. "/.env", {
+    "API_TOKEN=" .. api_tok,
+    "OV_L=left_mid",
+    "OV_R=mid_right_secret",
+    "JSON_SEC=" .. json_sec,
+    "CROSS_STREAM=cross1_cross2",
+    "SHORT_CODE=42",
+    "RUNNER_WORD=mvnw",
+  })
+  fixtures.write(root_i6 .. "/mvnw", {
+    "#!/bin/sh",
+    'printf "chunk="',
+    "sleep 0.05",
+    'printf "TopSecret/A+B"',
+    "sleep 0.05",
+    'printf "=C#99\\n"',
+    'printf "overlap=left_mid_right_secret\\n"',
+    'printf "url_u=TopSecret%%2FA%%2BB%%3DC%%2399 url_l=TopSecret%%2fA%%2bB%%3dC%%2399\\n"',
+    'printf \'json={"k":"sec\\"ret\\\\val"}\\n\'',
+    'printf "ordinary port 4200\\n"',
+    'printf "split_nl_a=TopSecret/A+B\\nsplit_nl_b==C#99\\n"',
+    'printf "cross_a=cross1_\\n"',
+    'printf "cross_b=cross2\\n" >&2',
+    'printf "eof_nolf=%s" "TopSecret/A+B=C#99"',
+  })
+  vim.fn.system({ "chmod", "+x", root_i6 .. "/mvnw" })
+
+  open_file(main_i6)
+  notices = {}
+  local seq_i6 = build._state.seq
+  build.build()
+  ask_script = { "compile" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > seq_i6 and not build._state.running and not build._is_draining()
+    end),
+    "build real do issue #6 não concluiu"
+  )
+
+  local out_i6 = buf_text(build._state.buf)
+  assert(out_i6:find("chunk=[REDACTED]", 1, true), "chunk temporizado real não redigiu segredo: " .. out_i6)
+  assert(out_i6:find("overlap=[REDACTED]", 1, true), "sobreposição real não redigiu completo: " .. out_i6)
+  assert(out_i6:find("url_u=[REDACTED] url_l=[REDACTED]", 1, true), "URL-encoded real não redigiu: " .. out_i6)
+  assert(out_i6:find('json={"k":"[REDACTED]"}', 1, true), "JSON-escaped real não redigiu: " .. out_i6)
+  assert(out_i6:find("eof_nolf=[REDACTED]", 1, true), "EOF sem newline real não redigiu: " .. out_i6)
+  assert(not out_i6:find(api_tok, 1, true), "API_TOKEN vazou no output real!")
+  assert(not out_i6:find("right_secret", 1, true), "OV_R vazou no output real!")
+  assert(not out_i6:find('sec\\"ret\\\\val', 1, true), "JSON_SEC vazou no output real!")
+
+  -- Trade-off de valor curto: saída comum contendo '42' é redigida, mas 'compile' sem '42'/'mvnw' nos user_args persiste
+  assert(
+    out_i6:find("ordinary port [REDACTED]00", 1, true),
+    "trade-off de falso positivo em saída com valor curto divergiu: " .. out_i6
+  )
+  assert(not has_notice("overlap"), "RUNNER_WORD=mvnw no .env não deve causar falso positivo em user_args={compile}")
+  assert(
+    vim.deep_equal(build._last_builds[run_config.canonical(root_i6)], { "compile" }),
+    "compile limpo deveria ser gravado mesmo com RUNNER_WORD=mvnw no .env"
+  )
+
+  -- Trade-off de valor curto em argumentos do usuário: --port=4200 colide com SHORT_CODE=42 e não sobrescreve histórico
+  notices = {}
+  local seq_i6_fp = build._state.seq
+  build.build()
+  ask_script = { "compile -Dport=4200" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > seq_i6_fp and not build._state.running and not build._is_draining()
+    end),
+    "choose_goal com falso positivo curto não concluiu"
+  )
+  assert(has_notice("overlap"), "SHORT_CODE=42 deveria sinalizar overlap em -Dport=4200")
+  assert(
+    vim.deep_equal(build._last_builds[run_config.canonical(root_i6)], { "compile" }),
+    "histórico anterior não pode ser sobrescrito por arg com substring curta"
+  )
+
+  -- Limites inerentes documentados: fragmentos separados por '\n' ou entre stdout/stderr não são reconstruídos
+  assert(
+    out_i6:find("split_nl_a=TopSecret/A+B\nsplit_nl_b==C#99", 1, true),
+    "comportamento esperado (limite): linhas separadas por \\n permanecem independentes"
+  )
+  assert(
+    out_i6:find("cross_a=cross1_", 1, true) and out_i6:find("cross_b=cross2", 1, true),
+    "comportamento esperado (limite): fluxos stdout/stderr permanecem independentes: " .. out_i6
+  )
+end
+
+-- ========== 17. Issue #6 review fixes: parsed token join, mixed-case percent-encoding & span-arg state.cmd ==========
+
+do
+  -- 17a. overlaps_env em string deve checar junção de tokens parseados e forma bruta (save/load)
+  local join_root = tempdir("issue6-token-join")
+  fixtures.write(join_root .. "/.env", {
+    'PHRASE="hello world"',
+    'RAW_QUOTED="alpha" "beta"',
+  })
+  local join_env = run_config.load_env(join_root).env
+
+  assert(
+    run_config.overlaps_env('"hello" "world"', join_env),
+    'overlaps_env(string) deve detectar junção de tokens parseados: "hello" "world"'
+  )
+  assert(
+    run_config.overlaps_env('-Dmsg="hello" "world"', join_env),
+    "overlaps_env(string) deve detectar junção com prefixo de flag"
+  )
+  assert(
+    run_config.overlaps_env("hello   world", join_env),
+    "overlaps_env(string) deve detectar múltiplos espaços normalizados pela junção de tokens"
+  )
+  assert(
+    run_config.overlaps_env('"alpha" "beta"', join_env),
+    "overlaps_env(string) deve continuar checando entrada bruta além dos tokens parseados"
+  )
+  assert(
+    not run_config.overlaps_env('"HELLO" "world"', join_env),
+    "overlaps_env deve manter comparação case-sensitive para tokens parseados"
+  )
+
+  -- save/load recusam/limpam strings como '"hello" "world"'
+  assert(
+    run_config.save(join_root, { profile = "dev", jvm_args = "-Xmx512m", app_args = "--port=8080", use_env = true })
+  )
+  local ok_join_save, join_save_err =
+    run_config.save(join_root, { profile = "dev", jvm_args = '"hello" "world"', app_args = "", use_env = true })
+  assert(not ok_join_save and join_save_err ~= nil, 'run_config.save deve recusar jvm_args=\'"hello" "world"\'')
+  assert(
+    not read_raw(run_config.storage_path(join_root)):find('"hello"', 1, true),
+    "fragmento recusado não pode vazar para o disco"
+  )
+  assert(run_config.load(join_root).jvm_args == "-Xmx512m", "config segura anterior deve permanecer intacta")
+
+  local canon_join = run_config.canonical(join_root)
+  vim.fn.writefile({
+    vim.json.encode({
+      version = 2,
+      root = canon_join,
+      profile = "dev",
+      jvm_args = '"hello" "world"',
+      app_args = '--tag="alpha" "beta"',
+      use_env = true,
+    }),
+  }, run_config.storage_path(join_root))
+  local loaded_join, loaded_join_err = run_config.load(join_root)
+  assert(loaded_join_err ~= nil, "run_config.load deve avisar ao limpar configurações com overlap por token join")
+  assert(loaded_join.jvm_args == "", 'run_config.load deve limpar jvm_args=\'"hello" "world"\'')
+  assert(loaded_join.app_args == "", "run_config.load deve limpar app_args com overlap em entrada bruta")
+  assert(loaded_join.profile == "dev", "campo sem overlap deve ser preservado")
+
+  -- 17b. Percent-encoding misto por escape (apenas dígitos hex case-insensitive; bytes ao redor case-sensitive)
+  local pct_root = tempdir("issue6-mixed-pct")
+  local many_special = string.rep("/+", 25) -- 50 chars especiais -> evitaria explosão 2^50
+  fixtures.write(pct_root .. "/.env", {
+    "MIXED_TOK=abc/+def",
+    "LIT_PCT=ab%2Fcd",
+    "SHORT_PCT=a/+b",
+    "MANY_PCT=" .. many_special,
+  })
+  local pct_env = run_config.load_env(pct_root).env
+  local pct_reds = run_config.collect_redactions(pct_env)
+  assert(#pct_reds <= 16, "collect_redactions não pode gerar explosão combinatória: " .. tostring(#pct_reds))
+
+  local mixed_out =
+    run_config.redact("m1=abc%2F%2bdef m2=abc%2f%2Bdef u=ABC%2F%2bDEF p=abc%2F%2bDEF lit=ab%2fcd sh=a%2F%2bb", pct_reds)
+  assert(
+    mixed_out == "m1=[REDACTED] m2=[REDACTED] u=ABC%2F%2bDEF p=abc%2F%2bDEF lit=ab%2fcd sh=a%2F%2bb",
+    "redação mixed-case percent-encoded divergiu: " .. mixed_out
+  )
+
+  local many_mixed = many_special:gsub("/%+", "%%2F%%2b")
+  assert(
+    run_config.redact("big=" .. many_mixed .. "!", pct_reds) == "big=[REDACTED]!",
+    "redação não-combinatória deveria casar sequência longa com hex misto"
+  )
+
+  -- Limites documentados: partial percent-encoding não casa
+  assert(
+    run_config.redact("part=abc/%2bdef unres=%61bc%2F%2bdef", pct_reds) == "part=abc/%2bdef unres=%61bc%2F%2bdef",
+    "limite documentado: encoding parcial não deve casar"
+  )
+
+  -- Histórico / overlaps_env / save / load / last_build com hex misto e bytes ao redor case-sensitive
+  assert(run_config.overlaps_env("abc%2F%2bdef", pct_env), "overlaps_env(string) deve detectar hex misto %2F%2b")
+  assert(run_config.overlaps_env("abc%2f%2Bdef", pct_env), "overlaps_env(string) deve detectar hex misto %2f%2B")
+  assert(
+    run_config.overlaps_env({ "compile", "-Durl=https://x/abc%2F%2bdef" }, pct_env),
+    "overlaps_env(table) deve detectar hex misto"
+  )
+  assert(
+    not run_config.overlaps_env("ABC%2F%2bDEF", pct_env),
+    "bytes planos ao redor devem permanecer case-sensitive em overlaps_env"
+  )
+  assert(
+    not run_config.overlaps_env("ab%2fcd", pct_env),
+    "valor literal ab%2Fcd no .env não deve tornar %2F case-insensitive fora de escapes derivados"
+  )
+
+  local ok_pct_save, pct_save_err =
+    run_config.save(pct_root, { profile = "", jvm_args = "-Dcb=abc%2F%2bdef", app_args = "", use_env = true })
+  assert(not ok_pct_save and pct_save_err ~= nil, "run_config.save deve recusar escape percent-encoded misto")
+  local ok_pct_build, pct_build_err = run_config.save_last_build(pct_root, { "compile", "-Dcb=abc%2f%2Bdef" })
+  assert(not ok_pct_build and pct_build_err ~= nil, "save_last_build deve recusar escape percent-encoded misto")
+
+  local canon_pct = run_config.canonical(pct_root)
+  vim.fn.writefile({
+    vim.json.encode({
+      version = 2,
+      root = canon_pct,
+      profile = "",
+      jvm_args = "",
+      app_args = "--cb=abc%2F%2bdef",
+      use_env = true,
+    }),
+  }, run_config.storage_path(pct_root))
+  local loaded_pct, loaded_pct_err = run_config.load(pct_root)
+  assert(loaded_pct_err ~= nil and loaded_pct.app_args == "", "run_config.load deve limpar hex misto persistido")
+
+  vim.fn.writefile({
+    vim.json.encode({ version = 2, root = canon_pct, args = { "compile", "-Dcb=abc%2f%2Bdef" } }),
+  }, run_config.last_build_path(pct_root))
+  local loaded_pct_build, loaded_pct_build_err = run_config.load_last_build(pct_root)
+  assert(
+    loaded_pct_build == nil and loaded_pct_build_err ~= nil,
+    "load_last_build deve ignorar histórico persistido com hex misto"
+  )
+
+  -- 17c. Processo real com segredo dividido entre args: state.cmd nunca retém fragmentos reconstruíveis
+  local span_root, span_main = fixtures.maven_project("run7d-span-cmd", "com.demo.span", "App")
+  local span_canon = run_config.canonical(span_root)
+  local span_capture = span_root .. "/span_args.txt"
+  local span_ready = span_root .. "/span_ready.txt"
+  fixtures.write(span_root .. "/pom.xml", {
+    '<project xmlns="http://maven.apache.org/POM/4.0.0">',
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.demo</groupId>",
+    "  <artifactId>span</artifactId>",
+    "  <version>1.0</version>",
+    "  <dependencies>",
+    "    <dependency>",
+    "      <groupId>org.springframework.boot</groupId>",
+    "      <artifactId>spring-boot-starter</artifactId>",
+    "    </dependency>",
+    "  </dependencies>",
+    "</project>",
+  })
+  fixtures.write(span_root .. "/.env", {
+    'SPAN_SECRET="fragAlpha fragBeta"',
+    "MIXED_TOK=abc/+def",
+  })
+  fixtures.write(span_root .. "/mvnw", {
+    "#!/bin/sh",
+    'printf "%s\\n" "$@" > ' .. vim.fn.shellescape(span_capture),
+    'printf "ready\\n" > ' .. vim.fn.shellescape(span_ready),
+    'printf "out_mix=abc%%2F%%2bdef\\n"',
+    "exec sleep 30",
+  })
+  vim.fn.system({ "chmod", "+x", span_root .. "/mvnw" })
+
+  open_file(span_main)
+  notices = {}
+  local seq_span = build._state.seq
+  build.build()
+  ask_script = { "compile fragAlpha fragBeta -Dcb=abc%2F%2bdef" }
+  menu_cb(entry("choose_goal"))
+
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > seq_span
+        and build._state.running
+        and vim.fn.filereadable(span_ready) == 1
+        and buf_text(build._state.buf):find("out_mix=[REDACTED]", 1, true) ~= nil
+    end),
+    "processo real com segredo entre args não iniciou ou não redigiu saída"
+  )
+
+  -- Enquanto o processo real está em execução, state.cmd não pode reter fragmentos crus (fragAlpha / fragBeta / abc%2F%2bdef)
+  assert(type(build._state.cmd) == "table", "state.cmd deve existir enquanto processo roda")
+  local active_cmd_str = table.concat(build._state.cmd, " ")
+  assert(not active_cmd_str:find("fragAlpha", 1, true), "state.cmd vazou fragAlpha em execução: " .. active_cmd_str)
+  assert(not active_cmd_str:find("fragBeta", 1, true), "state.cmd vazou fragBeta em execução: " .. active_cmd_str)
+  assert(
+    not active_cmd_str:find("abc%2F%2bdef", 1, true),
+    "state.cmd vazou hex misto em execução: " .. active_cmd_str
+  )
+  assert(
+    vim.deep_equal(build._state.cmd, { span_root .. "/mvnw", "[REDACTED]" }),
+    "state.cmd deveria redigir metadados inteiros do comando: " .. vim.inspect(build._state.cmd)
+  )
+
+  local span_buf_text = buf_text(build._state.buf)
+  assert(not span_buf_text:find("fragAlpha", 1, true), "buffer vazou fragAlpha!")
+  assert(not span_buf_text:find("fragBeta", 1, true), "buffer vazou fragBeta!")
+  assert(not span_buf_text:find("abc%2F%2bdef", 1, true), "buffer vazou hex misto!")
+  assert(not any_notice_contains("fragAlpha"), "notificação vazou fragAlpha!")
+  assert(not any_notice_contains("fragBeta"), "notificação vazou fragBeta!")
+  assert(not any_notice_contains("abc%2F%2bdef"), "notificação vazou hex misto!")
+  assert(has_notice("overlap"), "usuário deve ser avisado do overlap")
+
+  -- Processo real ainda recebeu os argumentos reais intactos
+  local span_received = read_raw(span_capture)
+  assert(
+    span_received == "compile\nfragAlpha\nfragBeta\n-Dcb=abc%2F%2bdef\n",
+    "processo real não recebeu argumentos esperados: " .. span_received
+  )
+
+  build.stop(true)
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining()
+    end),
+    "stop do processo com segredo entre args não concluiu"
+  )
+  assert(build._state.cmd == nil, "state.cmd deve ser limpo após saída")
+  assert(build._last_builds[span_canon] == nil, "_last_builds não pode registrar comando com segredo entre args")
+  assert(build._last_runs[span_canon] == nil, "_last_runs não pode registrar comando com segredo entre args")
+  assert(run_config.load_last_build(span_canon) == nil, "last_build em disco não pode ser salvo")
+
+  -- Também verifica run_spring com segredo espalhado entre jvm_args ('"fragAlpha"') e app_args ('"fragBeta"')
+  vim.fn.delete(span_ready)
+  vim.fn.delete(span_capture)
+  notices = {}
+  local seq_spring_span = build._state.seq
+  build.build()
+  ask_script = { "", '"fragAlpha"', '"fragBeta"' }
+  menu_cb(entry("run_spring"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > seq_spring_span and build._state.running and vim.fn.filereadable(span_ready) == 1
+    end),
+    "run_spring com segredo entre campos não iniciou"
+  )
+  local spring_cmd_str = table.concat(build._state.cmd, " ")
+  assert(not spring_cmd_str:find("fragAlpha", 1, true), "run_spring state.cmd vazou fragAlpha: " .. spring_cmd_str)
+  assert(not spring_cmd_str:find("fragBeta", 1, true), "run_spring state.cmd vazou fragBeta: " .. spring_cmd_str)
+  assert(not buf_text(build._state.buf):find("fragAlpha", 1, true), "run_spring buffer vazou fragAlpha!")
+  assert(not buf_text(build._state.buf):find("fragBeta", 1, true), "run_spring buffer vazou fragBeta!")
+  assert(not any_notice_contains("fragAlpha"), "run_spring notificação vazou fragAlpha!")
+  assert(not any_notice_contains("fragBeta"), "run_spring notificação vazou fragBeta!")
+  assert(build._last_runs[span_canon] == nil, "run_spring com segredo entre campos não pode gravar _last_runs")
+
+  build.stop(true)
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining()
+    end),
+    "stop do run_spring com segredo entre campos não concluiu"
+  )
+end
+
+-- ========== 18. Issue #6 re-review: split cfg save/load & bounded long-line stream policy ==========
+
+do
+  -- 18a. cfg save/load: segredos .env divididos entre profile, jvm_args e app_args (argv parseado + bruto)
+  local split_root, split_main = fixtures.maven_project("run7d-cfg-split", "com.demo.csplit", "App")
+  local split_canon = run_config.canonical(split_root)
+  fixtures.write(split_root .. "/pom.xml", {
+    '<project xmlns="http://maven.apache.org/POM/4.0.0">',
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.demo</groupId>",
+    "  <artifactId>csplit</artifactId>",
+    "  <version>1.0</version>",
+    "  <dependencies>",
+    "    <dependency>",
+    "      <groupId>org.springframework.boot</groupId>",
+    "      <artifactId>spring-boot-starter</artifactId>",
+    "    </dependency>",
+    "  </dependencies>",
+    "</project>",
+  })
+  fixtures.write(split_root .. "/.env", {
+    'SPAN_SECRET="fragAlpha fragBeta"',
+    'TRI_SECRET="triOne triTwo triThree"',
+    'RAW_QUOTED="rawA" "rawB"',
+    "TIGHT_SECRET=TightLeftTightRight",
+  })
+  local split_ready = split_root .. "/split_ready.txt"
+  fixtures.write(split_root .. "/mvnw", {
+    "#!/bin/sh",
+    'printf "ready\\n" > ' .. vim.fn.shellescape(split_ready),
+    "exec sleep 30",
+  })
+  vim.fn.system({ "chmod", "+x", split_root .. "/mvnw" })
+
+  -- Salva baseline seguro no disco
+  assert(
+    run_config.save(split_root, { profile = "dev", jvm_args = "-Xmx512m", app_args = "--port=8080", use_env = true })
+  )
+  local cfg_path = run_config.storage_path(split_root)
+
+  local rejected_cases = {
+    {
+      name = "jvm_args + app_args parsed argv",
+      cfg = { profile = "dev", jvm_args = '"fragAlpha"', app_args = '"fragBeta"', use_env = true },
+      leaks = { "fragAlpha", "fragBeta" },
+    },
+    {
+      name = "profile + jvm_args parsed argv",
+      cfg = { profile = "fragAlpha", jvm_args = '"fragBeta"', app_args = "--port=8080", use_env = true },
+      leaks = { "fragAlpha", "fragBeta" },
+    },
+    {
+      name = "profile + app_args parsed argv with unrelated jvm_args",
+      cfg = { profile = "fragAlpha", jvm_args = "-Xmx512m", app_args = '"fragBeta"', use_env = true },
+      leaks = { "fragAlpha", "fragBeta" },
+    },
+    {
+      name = "all three fields parsed argv",
+      cfg = { profile = "triOne", jvm_args = '"triTwo"', app_args = '"triThree"', use_env = true },
+      leaks = { "triOne", "triTwo", "triThree" },
+    },
+    {
+      name = "raw quoted across fields",
+      cfg = { profile = "dev", jvm_args = '"rawA"', app_args = '"rawB"', use_env = true },
+      leaks = { "rawA", "rawB" },
+    },
+    {
+      name = "tight concat across fields",
+      cfg = { profile = "dev", jvm_args = '"TightLeft"', app_args = '"TightRight"', use_env = true },
+      leaks = { "TightLeft", "TightRight" },
+    },
+  }
+
+  for _, tc in ipairs(rejected_cases) do
+    local ok_s, err_s = run_config.save(split_root, tc.cfg)
+    assert(not ok_s and type(err_s) == "string" and err_s ~= "", "save deveria recusar: " .. tc.name)
+    local disk = read_raw(cfg_path)
+    for _, leak in ipairs(tc.leaks) do
+      assert(not err_s:find(leak, 1, true), "erro de save vazou " .. leak .. " em " .. tc.name)
+      assert(not disk:find(leak, 1, true), "disco vazou " .. leak .. " após recusa de " .. tc.name)
+    end
+    local intact = run_config.load(split_root)
+    assert(
+      intact.profile == "dev" and intact.jvm_args == "-Xmx512m" and intact.app_args == "--port=8080",
+      "config segura anterior foi alterada após recusa: " .. tc.name
+    )
+  end
+
+  -- load: limpa apenas os campos afetados preservando campos não envolvidos, sem vazar valores
+  local load_cases = {
+    {
+      name = "load clears jvm+app preserving profile",
+      disk = { profile = "dev", jvm_args = '-Dmsg="fragAlpha"', app_args = '"fragBeta"', use_env = true },
+      expect = { profile = "dev", jvm_args = "", app_args = "" },
+      leaks = { "fragAlpha", "fragBeta" },
+    },
+    {
+      name = "load clears profile+jvm preserving app",
+      disk = { profile = '"fragAlpha"', jvm_args = '"fragBeta"', app_args = "--port=8080", use_env = false },
+      expect = { profile = "", jvm_args = "", app_args = "--port=8080" },
+      leaks = { "fragAlpha", "fragBeta" },
+    },
+    {
+      name = "load clears profile+app preserving jvm",
+      disk = { profile = "fragAlpha", jvm_args = "-Xmx512m", app_args = '"fragBeta"', use_env = true },
+      expect = { profile = "", jvm_args = "-Xmx512m", app_args = "" },
+      leaks = { "fragAlpha", "fragBeta" },
+    },
+    {
+      name = "load clears all 3 when all required",
+      disk = { profile = "triOne", jvm_args = '"triTwo"', app_args = '"triThree"', use_env = true },
+      expect = { profile = "", jvm_args = "", app_args = "" },
+      leaks = { "triOne", "triTwo", "triThree" },
+    },
+    {
+      name = "load clears raw quoted across jvm+app",
+      disk = { profile = "dev", jvm_args = '"rawA"', app_args = '"rawB"', use_env = true },
+      expect = { profile = "dev", jvm_args = "", app_args = "" },
+      leaks = { "rawA", "rawB" },
+    },
+    {
+      name = "load clears tampered unclosed quote split across jvm+app",
+      disk = { profile = "dev", jvm_args = '-Dx="fragAlpha', app_args = 'fragBeta"', use_env = true },
+      expect = { profile = "dev", jvm_args = "", app_args = "" },
+      leaks = { "fragAlpha", "fragBeta" },
+    },
+  }
+
+  for _, tc in ipairs(load_cases) do
+    vim.fn.writefile({
+      vim.json.encode({
+        version = 2,
+        root = split_canon,
+        profile = tc.disk.profile,
+        jvm_args = tc.disk.jvm_args,
+        app_args = tc.disk.app_args,
+        use_env = tc.disk.use_env,
+      }),
+    }, cfg_path)
+    local loaded, load_err = run_config.load(split_root)
+    assert(type(load_err) == "string" and load_err ~= "", "load deveria avisar em: " .. tc.name)
+    for _, leak in ipairs(tc.leaks) do
+      assert(not load_err:find(leak, 1, true), "aviso de load vazou " .. leak .. " em " .. tc.name)
+    end
+    assert(loaded.profile == tc.expect.profile, tc.name .. " profile divergiu: " .. loaded.profile)
+    assert(loaded.jvm_args == tc.expect.jvm_args, tc.name .. " jvm_args divergiu: " .. loaded.jvm_args)
+    assert(loaded.app_args == tc.expect.app_args, tc.name .. " app_args divergiu: " .. loaded.app_args)
+    assert(loaded.use_env == tc.disk.use_env, tc.name .. " use_env não deveria ser alterado")
+  end
+
+  -- Fluxo real run_spring com segredo dividido entre profile e app_args (com jvm_args no meio):
+  -- não persiste em disco, mantém config segura anterior, e não grava last_runs/state.cmd
+  assert(
+    run_config.save(split_root, { profile = "dev", jvm_args = "-Xmx512m", app_args = "--port=8080", use_env = true })
+  )
+  open_file(split_main)
+  notices = {}
+  local seq_sp = build._state.seq
+  build.build()
+  ask_script = { "fragAlpha", "-Xmx256m", '"fragBeta"' }
+  menu_cb(entry("run_spring"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > seq_sp and build._state.running and vim.fn.filereadable(split_ready) == 1
+    end),
+    "run_spring com segredo split profile+app não iniciou"
+  )
+  local active_sp_cmd = table.concat(build._state.cmd, " ")
+  assert(not active_sp_cmd:find("fragAlpha", 1, true), "state.cmd vazou fragAlpha: " .. active_sp_cmd)
+  assert(not active_sp_cmd:find("fragBeta", 1, true), "state.cmd vazou fragBeta: " .. active_sp_cmd)
+  assert(not buf_text(build._state.buf):find("fragAlpha", 1, true), "buffer vazou fragAlpha")
+  assert(not buf_text(build._state.buf):find("fragBeta", 1, true), "buffer vazou fragBeta")
+  assert(not any_notice_contains("fragAlpha") and not any_notice_contains("fragBeta"), "notice vazou segredo split")
+  assert(has_notice("overlap"), "usuário deve ser avisado do overlap entre campos")
+  assert(build._last_runs[split_canon] == nil, "_last_runs não pode registrar run_spring com segredo split")
+  local persisted_sp = run_config.load(split_root)
+  assert(
+    persisted_sp.profile == "dev" and persisted_sp.jvm_args == "-Xmx512m" and persisted_sp.app_args == "--port=8080",
+    "run_spring com segredo split sobrescreveu config segura em disco"
+  )
+  build.stop(true)
+  assert(fixtures.wait_for(10000, function()
+    return not build._state.running and not build._is_draining()
+  end))
+
+  -- 18b. Unitário: redact_prefix e política limitada de linha longa (>1MiB sem newline, segredo na fronteira, EOF, streams/seq)
+  local b_reds = run_config.collect_redactions({
+    TOK = "BoundarySecret_9988",
+    ENC = "p@ss/1+2",
+    OV_A = "left_mid",
+    OV_B = "mid_right_secret",
+  })
+
+  -- Secret straddling prefix_len = 16
+  local rp_cross = run_config.redact_prefix("0123456789BoundarySecret_9988zzzz", b_reds, 16)
+  assert(rp_cross == "0123456789[REDACTED]", "redact_prefix vazou fragmento na fronteira: " .. rp_cross)
+  -- Secret starting right at prefix_len = 11
+  local rp_at = run_config.redact_prefix("0123456789BoundarySecret_9988zzzz", b_reds, 11)
+  assert(rp_at == "0123456789[REDACTED]", "redact_prefix vazou primeiro byte no limite: " .. rp_at)
+  -- Secret starting AFTER prefix_len = 10
+  local rp_after = run_config.redact_prefix("0123456789BoundarySecret_9988zzzz", b_reds, 10)
+  assert(rp_after == "0123456789", "redact_prefix não deveria emitir bytes após limite: " .. rp_after)
+  -- Mixed-case percent-encoded secret straddling prefix_len = 16
+  local rp_pct = run_config.redact_prefix("0123456789p%40ss%2f1%2B2zzzz", b_reds, 16)
+  assert(rp_pct == "0123456789[REDACTED]", "redact_prefix vazou %XX misto na fronteira: " .. rp_pct)
+  -- Overlapping secrets straddling prefix_len = 15
+  local rp_ov = run_config.redact_prefix("0123456789left_mid_right_secretzzzz", b_reds, 15)
+  assert(rp_ov == "0123456789[REDACTED]", "redact_prefix vazou sobreposição na fronteira: " .. rp_ov)
+
+  -- Simulação determinística com limite pequeno (32 bytes) + >1MiB sem newline e segredo na fronteira
+  local orig_limit = build._max_line_bytes
+  local orig_look = build._max_lookahead_bytes
+  build._max_line_bytes = 32
+  build._max_lookahead_bytes = 64
+
+  local long_buf = vim.api.nvim_create_buf(false, true)
+  build._state.seq = build._state.seq + 1
+  local lseq = build._state.seq
+  build._state.buf = long_buf
+  build._state.running = true
+  build._state.kind = "build"
+  build._reset_streams()
+  notices = {}
+
+  -- Segredo BoundarySecret_9988 começa no byte 25 e termina no byte 43 (cruzando limite 32!)
+  build._feed(lseq, long_buf, "stdout", { ("a"):rep(24) .. "Boundary" }, b_reds)
+  assert(buf_text(long_buf) == "", "chunk exatamente no limite 32 com lookahead não pode vazar fragmento!")
+  build._feed(lseq, long_buf, "stdout", { "Secret_9988" .. ("b"):rep(100) }, b_reds)
+  -- Alimenta > 1 MiB adicional sem newline (em chunks de 64 KiB)
+  local big_chunk = ("x"):rep(65536)
+  for _ = 1, 17 do
+    build._feed(lseq, long_buf, "stdout", { big_chunk }, b_reds)
+  end
+  assert(
+    #build._pending_text("stdout") == 0 and build._pending.stdout.dropping == true,
+    "pending.stdout deve permanecer limitado em memória durante supressão"
+  )
+  assert(build._pending.stdout.dropped_bytes > 1048576, "dropped_bytes deveria contabilizar >1MiB suprimido")
+
+  -- Stream stderr independente continua funcionando normalmente enquanto stdout suprime
+  build._feed(lseq, long_buf, "stderr", { "err=BoundarySecret_9988", "" }, b_reds)
+  -- Entradas inválidas / stale seq são ignoradas sem erro
+  build._feed(lseq, long_buf, "invalid_stream", { "BoundarySecret_9988", "" }, b_reds)
+  build._feed(lseq, long_buf, "stdout", "not-a-table", b_reds)
+  build._feed(lseq - 1, long_buf, "stdout", { "stale_BoundarySecret_9988", "" }, b_reds)
+
+  -- Newline encerra supressão de stdout e permite próxima linha normal + teste síncrono feed+finish
+  build._feed(lseq, long_buf, "stdout", { "tail_dropped", "after=p%40ss%2f1%2B2", "eof_tok=Boundary" }, b_reds)
+  build._feed(lseq, long_buf, "stdout", { "Secret_9988" }, b_reds)
+  -- Sem wait_for antes de _finish: _finish deve drenar fila pendente em ordem antes do EOF e banner
+  build._finish(lseq, 0, b_reds)
+  -- Chamada duplicada de _finish após running=false deve ser ignorada
+  build._finish(lseq, 1, b_reds)
+  -- _feed tardio após _finish (running=false) deve ser ignorado
+  build._feed(lseq, long_buf, "stdout", { "late_after_finish", "" }, b_reds)
+
+  local unit_out = buf_text(long_buf)
+  assert(
+    unit_out:find(("a"):rep(24) .. "%[REDACTED%] %.%.%. %[line truncated at 32 bytes; remainder suppressed%]"),
+    "linha truncada na fronteira divergiu: " .. unit_out
+  )
+  assert(not unit_out:find("Boundary", 1, true), "prefixo Boundary vazou no unitário!")
+  assert(not unit_out:find("Secret_9988", 1, true), "sufixo Secret_9988 vazou no unitário!")
+  assert(not unit_out:find("bbbb", 1, true) and not unit_out:find("xxxx", 1, true), "resto suprimido vazou no buffer!")
+  assert(unit_out:find("err=[REDACTED]", 1, true), "stderr independente não recebeu/redigiu linha: " .. unit_out)
+  assert(unit_out:find("after=[REDACTED]", 1, true), "linha pós-newline não recuperou após supressão: " .. unit_out)
+  assert(unit_out:find("eof_tok=[REDACTED]", 1, true), "EOF sem newline pós-supressão falhou: " .. unit_out)
+  assert(not unit_out:find("stale_", 1, true), "chunk stale vazou!")
+  assert(not unit_out:find("late_after_finish", 1, true), "chunk após finish vazou!")
+  local _, exit_count = unit_out:gsub("%[build%] exit ", "")
+  assert(exit_count == 1, "finish duplicado emitiu múltiplos banners de exit: " .. tostring(exit_count))
+  assert(has_notice("line exceeded 32 bytes"), "notificação clara de truncamento ausente")
+  local trunc_notices = 0
+  for _, n in ipairs(notices) do
+    if n.msg:find("line exceeded", 1, true) then
+      trunc_notices = trunc_notices + 1
+    end
+  end
+  assert(trunc_notices == 1, "notificação de truncamento não pode spammar: " .. tostring(trunc_notices))
+  vim.api.nvim_buf_delete(long_buf, { force = true })
+
+  -- EOF dentro da janela de lookahead (limit < len < trigger_len)
+  local eof_buf = vim.api.nvim_create_buf(false, true)
+  build._state.seq = build._state.seq + 1
+  local eseq = build._state.seq
+  build._state.buf = eof_buf
+  build._state.running = true
+  build._state.kind = "build"
+  build._reset_streams()
+  notices = {}
+  -- len = 24 + 19 = 43 (> 32, < 32 + 18 = 50)
+  build._feed(eseq, eof_buf, "stdout", { ("a"):rep(24) .. "BoundarySecret_9988" }, b_reds)
+  build._finish(eseq, 0, b_reds)
+  local eof_out = buf_text(eof_buf)
+  assert(
+    eof_out:find(("a"):rep(24) .. "%[REDACTED%] %.%.%. %[line truncated at 32 bytes; remainder suppressed%]"),
+    "EOF na janela de lookahead divergiu: " .. eof_out
+  )
+  assert(not eof_out:find("Boundary", 1, true) and not eof_out:find("Secret_9988", 1, true), "EOF vazou fragmento!")
+  assert(has_notice("line exceeded 32 bytes"), "EOF truncado deveria notificar")
+  vim.api.nvim_buf_delete(eof_buf, { force = true })
+
+  -- Segredo maior que (limit + max_lookahead): nunca vaza bytes crus ao truncar
+  local huge_reds = run_config.collect_redactions({ HUGE = ("S"):rep(120) })
+  local huge_buf = vim.api.nvim_create_buf(false, true)
+  build._state.seq = build._state.seq + 1
+  local hseq = build._state.seq
+  build._state.buf = huge_buf
+  build._state.running = true
+  build._state.kind = "build"
+  build._reset_streams()
+  build._feed(hseq, huge_buf, "stdout", { ("S"):rep(150) }, huge_reds)
+  build._finish(hseq, 0, huge_reds)
+  local huge_out = buf_text(huge_buf)
+  assert(not huge_out:find("SSSS", 1, true), "segredo maior que buffer vazou bytes crus: " .. huge_out)
+  assert(huge_out:find("line truncated", 1, true), "deveria sinalizar truncamento para segredo gigante")
+  vim.api.nvim_buf_delete(huge_buf, { force = true })
+
+  -- Callback agendado com seq antiga não pode escrever após nova seq
+  local stale_buf = vim.api.nvim_create_buf(false, true)
+  build._state.seq = build._state.seq + 1
+  local old_s = build._state.seq
+  build._state.buf = stale_buf
+  build._state.running = true
+  build._reset_streams()
+  build._feed(old_s, stale_buf, "stdout", { "must_not_appear_stale", "" }, b_reds)
+  build._state.seq = old_s + 1
+  vim.wait(40, function()
+    return false
+  end)
+  assert(buf_text(stale_buf) == "", "vim.schedule de seq antiga escreveu após troca de seq!")
+  build._state.running = false
+  build._reset_streams()
+  vim.api.nvim_buf_delete(stale_buf, { force = true })
+
+  build._max_line_bytes = orig_limit
+  build._max_lookahead_bytes = orig_look
+
+  -- 18c. Processo real (>1.1 MiB sem newline) + segredo na fronteira de 64 KiB + recuperação pós-newline + infinito + stop
+  local root_huge, main_huge = fixtures.maven_project("run7d-huge-nolf", "com.demo.huge", "App")
+  local boundary_tok = "BoundaryRealSecret_64KiB!"
+  local pct_boundary = "enc@a/b+c" -- percent-encoded: enc%40a%2Fb%2Bc (17 bytes)
+  fixtures.write(root_huge .. "/.env", {
+    "BOUNDARY_TOK=" .. boundary_tok,
+    "PCT_BOUNDARY=" .. pct_boundary,
+  })
+  -- Emite:
+  -- 1) prefix=BOUNDARY_TOK + 'a' até byte 65530 + BOUNDARY_TOK cruzando byte 65536 + >1.1 MiB 'b' sem \n
+  -- 2) \n + "after_nl_pct=enc%40a%2fB%2bc\n" (ou enc%40a%2fb%2Bc)
+  -- 3) stderr com BOUNDARY_TOK
+  fixtures.write(root_huge .. "/mvnw", {
+    "#!/bin/sh",
+    'TOK="BoundaryRealSecret_64KiB!"',
+    'awk -v tok="$TOK" \'BEGIN {',
+    '  head = "start=" tok "_";',
+    '  printf "%s", head;',
+    "  pad = 65530 - length(head);",
+    '  for (i = 0; i < int(pad / 10); i++) printf "aaaaaaaaaa";',
+    '  for (i = 0; i < (pad % 10); i++) printf "a";',
+    '  printf "%s", tok;',
+    '  for (i = 0; i < 18000; i++) printf "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";',
+    '  printf "\\nafter_nl_ok=%s\\n", tok;',
+    "}'",
+    'awk -v tok="$TOK" \'BEGIN {',
+    '  for (i = 0; i < 6553; i++) printf "cccccccccc";',
+    '  printf "enc%%40a%%2fb%%2Bc";',
+    '  for (i = 0; i < 18000; i++) printf "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";',
+    '  printf "\\nstderr_ok=%s\\n", tok;',
+    "}' >&2",
+  })
+  vim.fn.system({ "chmod", "+x", root_huge .. "/mvnw" })
+
+  open_file(main_huge)
+  notices = {}
+  local seq_huge = build._state.seq
+  build.build()
+  ask_script = { "compile" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > seq_huge and not build._state.running and not build._is_draining()
+    end),
+    "processo real >1MiB sem newline não concluiu a tempo"
+  )
+
+  local huge_real_out = buf_text(build._state.buf)
+  assert(#huge_real_out < 140000, "buffer cresceu além do limite esperado: " .. tostring(#huge_real_out))
+  assert(huge_real_out:find("start=[REDACTED]_", 1, true), "segredo no início da linha longa não foi redigido")
+  assert(
+    huge_real_out:find("[REDACTED] ... [line truncated at 65536 bytes; remainder suppressed]", 1, true),
+    "segredo cruzando fronteira de 64 KiB deveria virar [REDACTED] antes do marcador de truncamento"
+  )
+  assert(
+    not huge_real_out:find("BoundaryRealSecret", 1, true),
+    "prefixo do segredo na fronteira vazou no processo real!"
+  )
+  assert(not huge_real_out:find("64KiB!", 1, true), "sufixo do segredo na fronteira vazou no processo real!")
+  assert(not huge_real_out:find("enc%40a", 1, true), "prefixo percent-encoded na fronteira vazou no stderr real!")
+  assert(not huge_real_out:find("%2fb%2Bc", 1, true), "sufixo percent-encoded na fronteira vazou no stderr real!")
+  assert(not huge_real_out:find("bbbbbbbb", 1, true), "MBs suprimidos do stdout vazaram para o buffer!")
+  assert(not huge_real_out:find("dddddddd", 1, true), "MBs suprimidos do stderr vazaram para o buffer!")
+  assert(huge_real_out:find("after_nl_ok=[REDACTED]", 1, true), "stdout pós-newline não recuperou!")
+  assert(huge_real_out:find("stderr_ok=[REDACTED]", 1, true), "stderr pós-newline não recuperou!")
+  assert(
+    has_notice("stdout line exceeded 65536 bytes"),
+    "processo real >1MiB deveria emitir notificação de truncamento stdout"
+  )
+  assert(
+    has_notice("stderr line exceeded 65536 bytes"),
+    "processo real >1MiB deveria emitir notificação de truncamento stderr"
+  )
+
+  -- Processo real com saída infinita sem newline: permanece responsivo, limitado e é encerrado por stop(true)
+  fixtures.write(root_huge .. "/mvnw", {
+    "#!/bin/sh",
+    "exec awk 'BEGIN { while (1) printf \"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\" }'",
+  })
+  vim.fn.system({ "chmod", "+x", root_huge .. "/mvnw" })
+  notices = {}
+  local seq_inf = build._state.seq
+  build.build()
+  ask_script = { "compile" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > seq_inf
+        and build._state.running
+        and has_notice("line exceeded 65536 bytes")
+        and buf_text(build._state.buf):find("line truncated at 65536 bytes", 1, true) ~= nil
+    end),
+    "processo real infinito sem newline não disparou truncamento limitado"
+  )
+  local inf_pid = build._state.pid
+  assert(#buf_text(build._state.buf) < 131072, "processo infinito excedeu limite de buffer")
+  build.stop(true)
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining()
+    end),
+    "stop do processo infinito sem newline não concluiu"
+  )
+  assert(not pid_alive(inf_pid), "processo infinito sobreviveu ao stop!")
+end
+
+-- Bound completed-line output and avoid cutting a UTF-8 codepoint in half.
+do
+  local original_limit = build._max_output_bytes
+  local original_line_limit = build._max_line_bytes
+  build._max_output_bytes = 256
+  build._max_line_bytes = 2
+  local buf = vim.api.nvim_create_buf(false, true)
+  build._state.seq = build._state.seq + 1
+  local seq = build._state.seq
+  build._state.buf = buf
+  build._state.running = true
+  build._state.kind = "run_main"
+  build._reset_streams()
+  build._feed(seq, buf, "stdout", { "€xxxx\n" }, {})
+  build._feed(seq, buf, "stdout", { ("x\n"):rep(10000) }, {})
+  build._finish(seq, 0, {})
+  local output = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+  assert(not output:find("\226\130", 1, true), "truncation left an incomplete UTF-8 sequence")
+  assert(output:find("output limit reached", 1, true), "missing total output limit marker")
+  assert(#output < 512, "output exceeded the bounded capture limit")
+  build._max_output_bytes = original_limit
+  build._max_line_bytes = original_line_limit
+end
+
 -- Limpeza e restauração
 ui.notify = real_notify
 ui.ask = real_ask

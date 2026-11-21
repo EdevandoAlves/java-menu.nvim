@@ -47,6 +47,8 @@ local state = {
 M._stop_grace_ms = 1000
 M._restart_timeout_ms = 5000
 M._background_grace_ms = 500
+M._max_line_bytes = 65536
+M._max_lookahead_bytes = 65536
 
 ---Last build arguments per canonical project root (repeat never crosses projects).
 local last_builds = {}
@@ -276,21 +278,323 @@ local function fill_quickfix(buf)
   ui.notify(("%d compilation error(s) in the quickfix list"):format(#valid), vim.log.levels.WARN)
 end
 
-local pending = { stdout = "", stderr = "" }
+local function new_stream_state()
+  return {
+    chunks = {},
+    len = 0,
+    dropping = false,
+    dropped_bytes = 0,
+    truncated_notified = false,
+  }
+end
 
-local function feed(seq, buf, stream, data, redactions)
-  if type(data) ~= "table" or seq ~= state.seq then
+local pending = {
+  stdout = new_stream_state(),
+  stderr = new_stream_state(),
+}
+
+local pending_append = {
+  seq = 0,
+  buf = nil,
+  lines = {},
+  notices = {},
+  bytes = 0,
+  capped = false,
+  scheduled = false,
+}
+
+-- Bound the entire captured output as well as individual lines.
+M._max_output_bytes = 4 * 1024 * 1024
+
+local function ensure_stream_state(stream)
+  local st = pending[stream]
+  if type(st) ~= "table" or type(st.chunks) ~= "table" then
+    st = new_stream_state()
+    pending[stream] = st
+  end
+  return st
+end
+
+local function reset_stream_state(stream)
+  local st = ensure_stream_state(stream)
+  st.chunks = {}
+  st.len = 0
+  st.dropping = false
+  st.dropped_bytes = 0
+  st.truncated_notified = false
+end
+
+local function reset_all_streams()
+  reset_stream_state("stdout")
+  reset_stream_state("stderr")
+  pending_append.seq = 0
+  pending_append.buf = nil
+  pending_append.lines = {}
+  pending_append.notices = {}
+  pending_append.bytes = 0
+  pending_append.capped = false
+  pending_append.scheduled = false
+end
+
+local function pending_text(stream)
+  if stream ~= "stdout" and stream ~= "stderr" then
+    return ""
+  end
+  local st = ensure_stream_state(stream)
+  return table.concat(st.chunks)
+end
+
+local function max_redaction_len(redactions)
+  if type(redactions) ~= "table" or #redactions == 0 then
+    return 0
+  end
+  local max_len = 0
+  for _, secret in ipairs(redactions) do
+    if type(secret) == "string" and #secret > max_len then
+      max_len = #secret
+    end
+  end
+  return max_len
+end
+
+local function drain_append(seq, buf)
+  if seq ~= state.seq or pending_append.seq ~= seq then
     return
   end
-  local text = pending[stream] .. table.concat(data, "\n")
-  local lines = vim.split(text, "\n", { plain = true })
-  pending[stream] = table.remove(lines) or ""
-  lines = run_config.redact_lines(lines, redactions)
-  vim.schedule(function()
-    if seq == state.seq then
-      append(buf, lines)
+  pending_append.scheduled = false
+  if #pending_append.lines > 0 then
+    local target = buf or pending_append.buf
+    local lines = pending_append.lines
+    pending_append.lines = {}
+    append(target, lines)
+  end
+  if #pending_append.notices > 0 then
+    local notices_list = pending_append.notices
+    pending_append.notices = {}
+    for _, msg in ipairs(notices_list) do
+      ui.notify(msg, vim.log.levels.WARN)
     end
+  end
+end
+
+local function enqueue_append(seq, buf, lines)
+  if #lines == 0 then
+    return
+  end
+  if pending_append.seq ~= seq or pending_append.buf ~= buf then
+    pending_append.seq = seq
+    pending_append.buf = buf
+    pending_append.lines = {}
+    pending_append.notices = {}
+    pending_append.bytes = 0
+    pending_append.capped = false
+    pending_append.scheduled = false
+  end
+  local limit = math.max(1, math.floor(tonumber(M._max_output_bytes) or 4 * 1024 * 1024))
+  for _, line in ipairs(lines) do
+    if not pending_append.capped then
+      if pending_append.bytes + #line + 1 > limit then
+        pending_append.lines[#pending_append.lines + 1] = "[output limit reached; remaining output suppressed]"
+        pending_append.capped = true
+      else
+        pending_append.lines[#pending_append.lines + 1] = line
+        pending_append.bytes = pending_append.bytes + #line + 1
+      end
+    end
+  end
+  if not pending_append.scheduled then
+    pending_append.scheduled = true
+    vim.schedule(function()
+      drain_append(seq, buf)
+    end)
+  end
+end
+
+local function notify_truncated(seq, buf, stream, limit, sync)
+  local st = ensure_stream_state(stream)
+  if st.truncated_notified then
+    return
+  end
+  st.truncated_notified = true
+  local kind = state.kind or "build"
+  local msg = ("[%s] %s line exceeded %d bytes — truncated and remainder suppressed"):format(kind, stream, limit)
+  if sync then
+    if seq == state.seq then
+      ui.notify(msg, vim.log.levels.WARN)
+    end
+    return
+  end
+  local target_buf = buf or state.buf
+  if pending_append.seq ~= seq or pending_append.buf ~= target_buf then
+    pending_append.seq = seq
+    pending_append.buf = target_buf
+    pending_append.lines = {}
+    pending_append.notices = { msg }
+  else
+    pending_append.notices[#pending_append.notices + 1] = msg
+  end
+  vim.schedule(function()
+    drain_append(seq, target_buf)
   end)
+end
+
+local function emit_truncated(raw, redactions, safe_prefix, limit, out_lines)
+  if safe_prefix <= 0 then
+    out_lines[#out_lines + 1] = ("[line truncated at 0/%d bytes — secret exceeds buffer; remainder suppressed]"):format(
+      limit
+    )
+    return
+  end
+  local prefix_redacted = run_config.redact_prefix(raw, redactions, safe_prefix)
+  out_lines[#out_lines + 1] = prefix_redacted
+    .. (" ... [line truncated at %d bytes; remainder suppressed]"):format(safe_prefix)
+end
+
+local function process_segment(st, seq, buf, stream, seg, has_nl_after, redactions, out_lines)
+  if st.dropping then
+    st.dropped_bytes = st.dropped_bytes + #seg
+    if has_nl_after then
+      st.dropping = false
+    end
+    return
+  end
+
+  local limit = math.max(1, math.floor(tonumber(M._max_line_bytes) or 65536))
+  local total = st.len + #seg
+
+  if not has_nl_after then
+    if total <= limit then
+      if #seg > 0 then
+        st.chunks[#st.chunks + 1] = seg
+        st.len = total
+      end
+      return
+    end
+    local max_len = max_redaction_len(redactions)
+    local max_lookahead = math.max(0, math.floor(tonumber(M._max_lookahead_bytes) or 65536))
+    local need_guard = math.max(3, max_len - 1)
+    local guard = math.min(max_lookahead, need_guard)
+    local trigger_len = limit + guard
+    if total < trigger_len then
+      if #seg > 0 then
+        st.chunks[#st.chunks + 1] = seg
+        st.len = total
+      end
+      return
+    end
+    local need = math.max(0, trigger_len - st.len)
+    if need > 0 and #seg > 0 then
+      st.chunks[#st.chunks + 1] = (#seg > need) and seg:sub(1, need) or seg
+    end
+    local raw = table.concat(st.chunks)
+    st.chunks = {}
+    st.len = 0
+    st.dropping = true
+    st.dropped_bytes = st.dropped_bytes + math.max(0, #seg - need)
+    local safe_prefix = math.min(limit, math.max(0, trigger_len - need_guard))
+    emit_truncated(raw, redactions, safe_prefix, limit, out_lines)
+    notify_truncated(seq, buf, stream, limit, false)
+    return
+  end
+
+  if total == 0 then
+    out_lines[#out_lines + 1] = ""
+    return
+  end
+
+  if total <= limit then
+    local line
+    if st.len == 0 then
+      line = seg
+    else
+      if #seg > 0 then
+        st.chunks[#st.chunks + 1] = seg
+      end
+      line = table.concat(st.chunks)
+      st.chunks = {}
+      st.len = 0
+    end
+    out_lines[#out_lines + 1] = run_config.redact(line, redactions)
+    return
+  end
+
+  local max_len = max_redaction_len(redactions)
+  local max_lookahead = math.max(0, math.floor(tonumber(M._max_lookahead_bytes) or 65536))
+  local need_guard = math.max(3, max_len - 1)
+  local cap = limit + math.min(max_lookahead, need_guard)
+  local need = math.max(0, cap - st.len)
+  local clipped = #seg > need
+  if need > 0 and #seg > 0 then
+    st.chunks[#st.chunks + 1] = clipped and seg:sub(1, need) or seg
+  end
+  local raw = table.concat(st.chunks)
+  st.chunks = {}
+  st.len = 0
+  st.dropped_bytes = st.dropped_bytes + math.max(0, #seg - need)
+  local safe_prefix = clipped and math.min(limit, math.max(0, cap - need_guard)) or limit
+  emit_truncated(raw, redactions, safe_prefix, limit, out_lines)
+  notify_truncated(seq, buf, stream, limit, false)
+end
+
+local function feed(seq, buf, stream, data, redactions)
+  if
+    seq ~= state.seq
+    or not state.running
+    or (stream ~= "stdout" and stream ~= "stderr")
+    or type(data) ~= "table"
+    or #data == 0
+  then
+    return
+  end
+  local st = ensure_stream_state(stream)
+  -- Fast O(1) drop path for chunks with no newline while suppressing an oversized line.
+  if st.dropping and #data == 1 and type(data[1]) == "string" and not data[1]:find("\n", 1, true) then
+    st.dropped_bytes = st.dropped_bytes + #data[1]
+    return
+  end
+
+  local out_lines = {}
+  local function flush_batch()
+    if #out_lines >= 128 then
+      enqueue_append(seq, buf, out_lines)
+      out_lines = {}
+    end
+    return pending_append.capped
+  end
+  local n = #data
+  for i = 1, n do
+    local piece = data[i]
+    if type(piece) == "string" then
+      local has_next = (i < n)
+      if not piece:find("\n", 1, true) then
+        process_segment(st, seq, buf, stream, piece, has_next, redactions, out_lines)
+        if flush_batch() then
+          return
+        end
+      else
+        local pos = 1
+        while true do
+          local nl = piece:find("\n", pos, true)
+          if not nl then
+            process_segment(st, seq, buf, stream, piece:sub(pos), has_next, redactions, out_lines)
+            if flush_batch() then
+              return
+            end
+            break
+          end
+          process_segment(st, seq, buf, stream, piece:sub(pos, nl - 1), true, redactions, out_lines)
+          if flush_batch() then
+            return
+          end
+          pos = nl + 1
+        end
+      end
+    end
+  end
+
+  if #out_lines > 0 then
+    enqueue_append(seq, buf, out_lines)
+  end
 end
 
 local function read_proc_info(pid)
@@ -402,15 +706,6 @@ local function stop_drain_timer()
   end
 end
 
-local function redact_cmd_list(cmd, redactions)
-  local out = {}
-  for i, arg in ipairs(cmd) do
-    out[i] = run_config.redact(arg, redactions)
-  end
-  return out
-end
-
----Kill the process tree started by this job (children first).
 local function kill_tree(pid, sig)
   if not pid or pid <= 0 then
     return
@@ -546,12 +841,14 @@ local function start_drain_monitor(seq, pgid, start_ticks, opts)
 end
 
 local function finish(seq, code, redactions)
-  if seq ~= state.seq then
+  if seq ~= state.seq or not state.running then
     return
   end
   local buf = state.buf
   local pgid = state.pgid
   local start_ticks = state.pgid_start_ticks
+
+  drain_append(seq, buf)
 
   state.running = false
   state.job = nil
@@ -561,11 +858,21 @@ local function finish(seq, code, redactions)
   state.pgid_start_ticks = nil
   state.status = code == 0 and "success" or "failed"
 
+  local limit = math.max(1, math.floor(tonumber(M._max_line_bytes) or 65536))
   for _, stream in ipairs({ "stdout", "stderr" }) do
-    if pending[stream] ~= "" then
-      append(buf, { run_config.redact(pending[stream], redactions) })
-      pending[stream] = ""
+    local st = ensure_stream_state(stream)
+    if st.len > 0 then
+      local tail = table.concat(st.chunks)
+      if st.len > limit then
+        local truncated_lines = {}
+        emit_truncated(tail, redactions, limit, limit, truncated_lines)
+        append(buf, truncated_lines)
+        notify_truncated(seq, buf, stream, limit, true)
+      else
+        append(buf, { run_config.redact(tail, redactions) })
+      end
     end
+    reset_stream_state(stream)
   end
 
   append(buf, {
@@ -665,8 +972,15 @@ local function start(kind, cmd, cwd, root, opts)
       user_args[#user_args + 1] = cmd[i]
     end
   end
-  local cmd_has_secret = env_res.exists and run_config.overlaps_env(user_args, env_res.env)
-  local cmd_display = run_config.redact(table.concat(cmd, " "), redactions)
+  local cmd_has_secret = (opts._force_secret == true)
+    or (env_res.exists and run_config.overlaps_env(user_args, env_res.env))
+  local safe_runner = run_config.redact(cmd[1] or "", redactions)
+  -- When user args overlap `.env`, redact the command arguments wholesale so
+  -- secrets spanning multiple arguments or wrapped in quotes never leave
+  -- reconstructable fragments in `state.cmd`, headers, or notifications.
+  local redacted_cmd = safe_runner ~= "" and { safe_runner, "[REDACTED]" } or { "[REDACTED]" }
+  local cmd_display = cmd_has_secret and table.concat(redacted_cmd, " ")
+    or run_config.redact(table.concat(cmd, " "), redactions)
   local buf = open_output(kind)
   local header = {
     ("$ %s"):format(cmd_display),
@@ -681,7 +995,7 @@ local function start(kind, cmd, cwd, root, opts)
   local full = cmd
   state.seq = state.seq + 1
   local seq = state.seq
-  pending.stdout, pending.stderr = "", ""
+  reset_all_streams()
   local prev_win = vim.api.nvim_get_current_win() ---@type integer|nil
   for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
     if vim.api.nvim_win_get_buf(win) == context_buf() then
@@ -730,7 +1044,7 @@ local function start(kind, cmd, cwd, root, opts)
   state.buf = buf
   state.last_output = buf
   state.kind = kind
-  state.cmd = cmd_has_secret and redact_cmd_list(cmd, redactions) or cmd
+  state.cmd = cmd_has_secret and redacted_cmd or cmd
   state.cwd = cwd
   state.root = project_root
   state.last_output_root = project_root
@@ -1280,6 +1594,7 @@ local function run_main(root, bufnr, mains)
           start("run_main", cmd, cp.project_root or entry.module or root, root, {
             use_env = next_cfg.use_env ~= false,
             _secret_warned = secret_warned,
+            _force_secret = secret_warned,
             user_args = user_args,
           })
         end)
@@ -1361,18 +1676,29 @@ local function run_spring(root, bufnr, spring)
           if next_cfg.profile ~= "" then
             cmd[#cmd + 1] = "-Dspring-boot.run.profiles=" .. next_cfg.profile
             user_args[#user_args + 1] = next_cfg.profile
+            local prof_tokens = split_args(next_cfg.profile)
+            if prof_tokens then
+              vim.list_extend(user_args, prof_tokens)
+            end
           end
           if next_cfg.jvm_args ~= "" then
             cmd[#cmd + 1] = "-Dspring-boot.run.jvmArguments=" .. next_cfg.jvm_args
-            user_args[#user_args + 1] = next_cfg.jvm_args
+            vim.list_extend(user_args, jvm_list)
           end
           if next_cfg.app_args ~= "" then
             cmd[#cmd + 1] = "-Dspring-boot.run.arguments=" .. next_cfg.app_args
+            vim.list_extend(user_args, app_list)
+          end
+          if next_cfg.jvm_args ~= "" then
+            user_args[#user_args + 1] = next_cfg.jvm_args
+          end
+          if next_cfg.app_args ~= "" then
             user_args[#user_args + 1] = next_cfg.app_args
           end
           start("spring", cmd, root, root, {
             use_env = next_cfg.use_env ~= false,
             _secret_warned = secret_warned,
+            _force_secret = secret_warned,
             user_args = user_args,
           })
         end)
@@ -1647,5 +1973,10 @@ M._last_builds = last_builds
 M._last_runs = last_runs
 M._is_draining = is_draining
 M._verify_own_pgid = verify_own_pgid
+M._feed = feed
+M._finish = finish
+M._pending = pending
+M._pending_text = pending_text
+M._reset_streams = reset_all_streams
 
 return M

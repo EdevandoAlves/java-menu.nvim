@@ -216,10 +216,15 @@ Run Settings stores JVM and application arguments per project and offers
 Spring profiles discovered from application-* files. Restart Last Process
 relaunches the project's recorded command. Run Main and Spring load the
 project-root .env by default when present; toggle it in Run Settings.
-The parser accepts simple KEY=VALUE lines without shell execution. Literal
-values are redacted from captured output, but encoded, transformed or
-separately printed fragments cannot be detected; short values can redact
-ordinary output. Arguments are stored locally: put secrets in .env instead.
+The parser accepts simple KEY=VALUE lines without shell execution. Captured
+output redacts literal values and selected URL-encoded or JSON-escaped forms
+of values at least six bytes long. Redaction cannot guarantee protection from
+arbitrary transformations or fragments split across lines or streams; short
+values can redact ordinary output. Arguments are stored locally: put secrets
+in .env instead.
+Output lines longer than 64 KiB are truncated and the remainder is suppressed
+until the next newline. Captured process output is limited to 4 MiB per run.
+Partial lines can be delayed until newline or exit.
 Restart refuses automatic termination if the process group cannot be verified.
 Background processes left after normal exit can outlive Java Menu's stop
 controls. Repeat Last uses Java Menu's own canonical-root history only and

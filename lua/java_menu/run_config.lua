@@ -75,13 +75,130 @@ local function sanitize(raw)
   return cfg
 end
 
+local CFG_FIELDS = { "profile", "jvm_args", "app_args" }
+
+local function parse_field_tokens(val)
+  if type(val) ~= "string" or vim.trim(val) == "" then
+    return {}
+  end
+  local parsed = M.split_args(val)
+  if parsed then
+    return parsed
+  end
+  return vim.split(vim.trim(val), "%s+", { trimempty = true })
+end
+
+local function field_subset_overlaps_env(cfg, indices, env_map)
+  local raw_parts = {}
+  local argv_tokens = {}
+  for _, idx in ipairs(indices) do
+    local val = cfg[CFG_FIELDS[idx]]
+    if type(val) ~= "string" or val == "" then
+      return false
+    end
+    raw_parts[#raw_parts + 1] = val
+    for _, tok in ipairs(parse_field_tokens(val)) do
+      argv_tokens[#argv_tokens + 1] = tok
+    end
+  end
+
+  if #indices == 1 then
+    if indices[1] == 1 and M.overlaps_env({ raw_parts[1] }, env_map) then
+      return true
+    end
+    return M.overlaps_env(raw_parts[1], env_map) or (#argv_tokens > 0 and M.overlaps_env(argv_tokens, env_map))
+  end
+
+  if #argv_tokens > 0 and M.overlaps_env(argv_tokens, env_map) then
+    return true
+  end
+  local raw_joined_space = table.concat(raw_parts, " ")
+  if M.overlaps_env(raw_joined_space, env_map) then
+    return true
+  end
+  local argv_joined_tight = table.concat(argv_tokens, "")
+  if argv_joined_tight ~= "" and M.overlaps_env(argv_joined_tight, env_map) then
+    return true
+  end
+  local raw_joined_tight = table.concat(raw_parts, "")
+  if raw_joined_tight ~= raw_joined_space and M.overlaps_env(raw_joined_tight, env_map) then
+    return true
+  end
+  return false
+end
+
+local CFG_SUBSETS = {
+  { 1 },
+  { 2 },
+  { 3 },
+  { 1, 2 },
+  { 1, 3 },
+  { 2, 3 },
+  { 1, 2, 3 },
+}
+
 local function cfg_overlaps_env(cfg, env_map)
   if type(env_map) ~= "table" or next(env_map) == nil then
     return false
   end
-  return M.overlaps_env({ cfg.profile }, env_map)
-    or M.overlaps_env(cfg.jvm_args, env_map)
-    or M.overlaps_env(cfg.app_args, env_map)
+  for _, subset in ipairs(CFG_SUBSETS) do
+    if field_subset_overlaps_env(cfg, subset, env_map) then
+      return true
+    end
+  end
+  return false
+end
+
+---Clear only the minimal affected fields in `cfg` whose raw values or parsed
+---argv combinations overlap `.env` values (never leaking secret values).
+---@param cfg table
+---@param env_map table<string, string>|nil
+---@return boolean cleared
+local function clear_overlapping_cfg_fields(cfg, env_map)
+  if type(env_map) ~= "table" or next(env_map) == nil then
+    return false
+  end
+  local marked = {}
+  -- Check size 1 first, then size 2 among remaining, then size 3 if all remain.
+  for idx = 1, #CFG_FIELDS do
+    if field_subset_overlaps_env(cfg, { idx }, env_map) then
+      marked[idx] = true
+    end
+  end
+  local rem = {}
+  for idx = 1, #CFG_FIELDS do
+    if not marked[idx] then
+      rem[#rem + 1] = idx
+    end
+  end
+  if #rem >= 2 then
+    local pair_marked = {}
+    for i = 1, #rem - 1 do
+      for j = i + 1, #rem do
+        if field_subset_overlaps_env(cfg, { rem[i], rem[j] }, env_map) then
+          pair_marked[rem[i]] = true
+          pair_marked[rem[j]] = true
+        end
+      end
+    end
+    for idx, flag in pairs(pair_marked) do
+      if flag then
+        marked[idx] = true
+      end
+    end
+  end
+  if next(marked) == nil and field_subset_overlaps_env(cfg, { 1, 2, 3 }, env_map) then
+    marked[1], marked[2], marked[3] = true, true, true
+  end
+
+  local cleared = false
+  for idx, flag in pairs(marked) do
+    if flag then
+      cfg[CFG_FIELDS[idx]] = ""
+      cleared = true
+    end
+  end
+  return cleared
 end
 
 ---Load persisted non-secret run settings for `root`.
@@ -110,23 +227,8 @@ function M.load(root)
   end
   local cfg = sanitize(decoded)
   local env_res = M.load_env(canon)
-  if env_res.exists and next(env_res.env) ~= nil then
-    local cleared = false
-    if M.overlaps_env({ cfg.profile }, env_res.env) then
-      cfg.profile = ""
-      cleared = true
-    end
-    if M.overlaps_env(cfg.jvm_args, env_res.env) then
-      cfg.jvm_args = ""
-      cleared = true
-    end
-    if M.overlaps_env(cfg.app_args, env_res.env) then
-      cfg.app_args = ""
-      cleared = true
-    end
-    if cleared then
-      return cfg, "persisted run settings overlapped with .env values (including short substrings) and were cleared"
-    end
+  if env_res.exists and clear_overlapping_cfg_fields(cfg, env_res.env) then
+    return cfg, "persisted run settings overlapped with .env values (including short substrings) and were cleared"
   end
   return cfg, nil
 end
@@ -359,6 +461,8 @@ function M.parse_env_lines(lines)
           end
           if val:find("\0", 1, true) then
             warnings[#warnings + 1] = (".env line %d: NUL byte not allowed (ignored)"):format(idx)
+          elseif val:find("\n", 1, true) then
+            warnings[#warnings + 1] = (".env line %d: newline not allowed in value (ignored)"):format(idx)
           else
             env[key] = val
           end
@@ -394,8 +498,8 @@ function M.load_env(root)
       warnings = {},
     }
   end
-  local ok, lines = pcall(vim.fn.readfile, path)
-  if not ok or type(lines) ~= "table" then
+  local fd = vim.uv.fs_open(path, "r", 0)
+  if not fd then
     return {
       exists = true,
       path = path,
@@ -404,6 +508,32 @@ function M.load_env(root)
       warnings = { ".env could not be read (ignored)" },
     }
   end
+  local chunks = {}
+  local offset = 0
+  while true do
+    local chunk = vim.uv.fs_read(fd, 65536, offset)
+    if type(chunk) ~= "string" then
+      vim.uv.fs_close(fd)
+      return {
+        exists = true,
+        path = path,
+        env = {},
+        keys = {},
+        warnings = { ".env could not be read (ignored)" },
+      }
+    end
+    if chunk == "" then
+      break
+    end
+    chunks[#chunks + 1] = chunk
+    offset = offset + #chunk
+  end
+  vim.uv.fs_close(fd)
+  local raw = table.concat(chunks)
+  if raw:sub(1, 3) == "\239\187\191" then
+    raw = raw:sub(4)
+  end
+  local lines = raw == "" and {} or vim.split(raw, "\n", { plain = true })
   local parsed = M.parse_env_lines(lines)
   return {
     exists = true,
@@ -414,18 +544,93 @@ function M.load_env(root)
   }
 end
 
----Collect sorted secret values from an env table for literal redaction.
+local MIN_DERIVED_REDACTION_LEN = 6
+
+---Weak-keyed map from `collect_redactions(env_map)` return list to its derived
+---Lua patterns (for mixed-case percent-encoded escapes with case-sensitive
+---plain surrounding bytes). Keeps `collect_redactions`'s return value a pure `string[]`.
+local derived_patterns = setmetatable({}, { __mode = "k" })
+
+local function percent_encode(str, lower_hex)
+  local fmt = lower_hex and "%%%02x" or "%%%02X"
+  return (str:gsub("[^A-Za-z0-9._~-]", function(ch)
+    return fmt:format(string.byte(ch))
+  end))
+end
+
+---Build a single non-backtracking Lua pattern matching full RFC 3986
+---percent-encoding of `str`: each `%XX` escape matches case-insensitively per
+---hex digit, while plain unreserved bytes (`[A-Za-z0-9._~-]`) stay case-sensitive.
+---@param str string
+---@return string
+local function percent_encode_lua_pattern(str)
+  return (
+    str:gsub(".", function(ch)
+      if ch == "." or ch == "-" then
+        return "%" .. ch
+      end
+      if ch:match("^[A-Za-z0-9_~]$") then
+        return ch
+      end
+      local hx = ("%02X"):format(string.byte(ch))
+      local h1 = hx:sub(1, 1)
+      local h2 = hx:sub(2, 2)
+      if h1 >= "A" and h1 <= "F" then
+        h1 = "[" .. h1:lower() .. h1 .. "]"
+      end
+      if h2 >= "A" and h2 <= "F" then
+        h2 = "[" .. h2:lower() .. h2 .. "]"
+      end
+      return "%%" .. h1 .. h2
+    end)
+  )
+end
+
+local function json_escape(str)
+  return (
+    str:gsub('[\\"\b\f\n\r\t]', {
+      ["\\"] = "\\\\",
+      ['"'] = '\\"',
+      ["\b"] = "\\b",
+      ["\f"] = "\\f",
+      ["\n"] = "\\n",
+      ["\r"] = "\\r",
+      ["\t"] = "\\t",
+    })
+  )
+end
+
 ---@param env_map table<string, string>|nil
----@return string[]
-function M.collect_redactions(env_map)
+---@return { literals: string[], patterns: string[] }
+local function collect_redaction_specs(env_map)
   if type(env_map) ~= "table" then
-    return {}
+    return { literals = {}, patterns = {} }
   end
   local seen, list = {}, {}
+  local seen_pat, patterns = {}, {}
+  local function add(s)
+    if type(s) == "string" and s ~= "" and not seen[s] then
+      seen[s] = true
+      list[#list + 1] = s
+    end
+  end
   for _, val in pairs(env_map) do
-    if type(val) == "string" and val ~= "" and not seen[val] then
-      seen[val] = true
-      list[#list + 1] = val
+    if type(val) == "string" and val ~= "" then
+      add(val)
+      if #val >= MIN_DERIVED_REDACTION_LEN then
+        local pct_upper = percent_encode(val, false)
+        local pct_lower = percent_encode(val, true)
+        add(pct_upper)
+        add(pct_lower)
+        if pct_upper ~= pct_lower then
+          local pat = percent_encode_lua_pattern(val)
+          if not seen_pat[pat] then
+            seen_pat[pat] = true
+            patterns[#patterns + 1] = pat
+          end
+        end
+        add(json_escape(val))
+      end
     end
   end
   table.sort(list, function(a, b)
@@ -434,10 +639,109 @@ function M.collect_redactions(env_map)
     end
     return a < b
   end)
-  return list
+  return { literals = list, patterns = patterns }
 end
 
----Replace literal occurrences of any secret in `text` with `[REDACTED]`.
+---Collect sorted secret values from an env table for redaction.
+---For values with length >= 6, also includes RFC 3986 percent-encoded (upper/lower
+---literals, plus a non-combinatoric per-escape case-insensitive matcher used by
+---`redact`/`overlaps_env` with case-sensitive plain bytes) and standard JSON-escaped
+---variants (`\\`, `\"`, `\b`, `\f`, `\n`, `\r`, `\t`).
+---Limits: values < 6 bytes only match literally; partial percent-encoding (some
+---reserved chars unencoded or unreserved `[A-Za-z0-9._~-]` chars encoded),
+---`application/x-www-form-urlencoded` `+` spaces, double-encoding, and JSON `\uXXXX`
+---escapes are not matched.
+---@param env_map table<string, string>|nil
+---@return string[]
+function M.collect_redactions(env_map)
+  local specs = collect_redaction_specs(env_map)
+  derived_patterns[specs.literals] = specs.patterns
+  return specs.literals
+end
+
+local function find_merged_spans(text, secrets)
+  local spans = {}
+  local function collect_spans(needle, plain)
+    if type(needle) ~= "string" or needle == "" then
+      return
+    end
+    local pos = 1
+    while pos <= #text do
+      local a, b = text:find(needle, pos, plain)
+      if not a then
+        break
+      end
+      spans[#spans + 1] = { a, b }
+      pos = a + 1
+    end
+  end
+  for _, secret in ipairs(secrets) do
+    collect_spans(secret, true)
+  end
+  local patterns = derived_patterns[secrets]
+  if patterns then
+    for _, pat in ipairs(patterns) do
+      collect_spans(pat, false)
+    end
+  end
+  if #spans == 0 then
+    return nil
+  end
+  table.sort(spans, function(x, y)
+    if x[1] ~= y[1] then
+      return x[1] < y[1]
+    end
+    return x[2] > y[2]
+  end)
+
+  local merged = { spans[1] }
+  for i = 2, #spans do
+    local cur = merged[#merged]
+    local nxt = spans[i]
+    if nxt[1] <= cur[2] then
+      if nxt[2] > cur[2] then
+        cur[2] = nxt[2]
+      end
+    else
+      merged[#merged + 1] = nxt
+    end
+  end
+  return merged
+end
+
+local function render_redacted(text, secrets, limit)
+  local merged = find_merged_spans(text, secrets)
+  if not merged then
+    return limit < #text and text:sub(1, limit) or text
+  end
+  local parts = {}
+  local pos = 1
+  for _, span in ipairs(merged) do
+    if span[1] > limit then
+      break
+    end
+    if span[1] > pos then
+      parts[#parts + 1] = text:sub(pos, span[1] - 1)
+    end
+    parts[#parts + 1] = "[REDACTED]"
+    pos = span[2] + 1
+    if span[2] >= limit then
+      break
+    end
+  end
+  if pos <= limit then
+    parts[#parts + 1] = text:sub(pos, limit)
+  end
+  return table.concat(parts)
+end
+
+---Replace occurrences of any secret in `text` with `[REDACTED]`.
+---Matches all literal entries in `secrets` and, when `secrets` was returned by
+---`collect_redactions`, mixed-case percent-encoded escapes for values >= 6 bytes
+---(with case-sensitive plain surrounding bytes).
+---Overlapping matches (across distinct secrets or self-overlapping occurrences)
+---are merged so no trailing fragment of an overlapped secret can leak.
+---Operates per string/line; secrets split across newlines or streams are not matched.
 ---@param text string
 ---@param secrets string[]|nil
 ---@return string
@@ -445,26 +749,40 @@ function M.redact(text, secrets)
   if type(text) ~= "string" or text == "" or type(secrets) ~= "table" or #secrets == 0 then
     return text
   end
-  local parts, pos = {}, 1
-  while pos <= #text do
-    local first, last
-    for _, secret in ipairs(secrets) do
-      if type(secret) == "string" and secret ~= "" then
-        local a, b = text:find(secret, pos, true)
-        if a and (not first or a < first or (a == first and b > last)) then
-          first, last = a, b
-        end
-      end
-    end
-    if not first then
-      parts[#parts + 1] = text:sub(pos)
-      break
-    end
-    parts[#parts + 1] = text:sub(pos, first - 1)
-    parts[#parts + 1] = "[REDACTED]"
-    pos = last + 1
+  return render_redacted(text, secrets, #text)
+end
+
+---Redact `text` while truncating output to at most original byte index `prefix_len`.
+---`text` may include lookahead bytes past `prefix_len`; any secret starting at or
+---before `prefix_len` and crossing `prefix_len` is replaced wholesale with
+---`[REDACTED]` and nothing after that span (or after `prefix_len`) is emitted,
+---so partial secret fragments can never leak at a truncation boundary.
+---@param text string
+---@param secrets string[]|nil
+---@param prefix_len integer
+---@return string
+function M.redact_prefix(text, secrets, prefix_len)
+  if type(text) ~= "string" then
+    return text
   end
-  return table.concat(parts)
+  local limit = math.max(0, math.min(#text, math.floor(tonumber(prefix_len) or 0)))
+  -- If the cut falls inside a UTF-8 sequence, omit the entire character.
+  if limit < #text then
+    while limit > 0 do
+      local next_byte = text:byte(limit + 1)
+      if not next_byte or next_byte < 128 or next_byte >= 192 then
+        break
+      end
+      limit = limit - 1
+    end
+  end
+  if limit == 0 then
+    return ""
+  end
+  if type(secrets) ~= "table" or #secrets == 0 then
+    return text:sub(1, limit)
+  end
+  return render_redacted(text, secrets, limit)
 end
 
 ---Redact a list of lines.
@@ -590,28 +908,43 @@ function M.format_jc_args(argv)
   return table.concat(out, " ")
 end
 
-local function token_overlaps_secret(token, secret)
+local function text_matches_parsed(text, needle, plain)
+  local sub_args = M.split_args(text)
+  if not sub_args then
+    return false
+  end
+  for _, sub in ipairs(sub_args) do
+    if sub:find(needle, 1, plain) then
+      return true
+    end
+  end
+  local sub_joined = table.concat(sub_args, " ")
+  return sub_joined ~= "" and sub_joined:find(needle, 1, plain) ~= nil
+end
+
+local function token_overlaps_secret(token, secret, is_pattern)
   if type(token) ~= "string" or token == "" or type(secret) ~= "string" or secret == "" then
     return false
   end
-  if token:find(secret, 1, true) then
+  local plain = not is_pattern
+  if token:find(secret, 1, plain) then
+    return true
+  end
+  if text_matches_parsed(token, secret, plain) then
     return true
   end
   local rhs = token:match("^[^=]+=(.+)$")
-  if rhs then
-    local sub_args = M.split_args(rhs)
-    if sub_args then
-      for _, sub in ipairs(sub_args) do
-        if sub:find(secret, 1, true) then
-          return true
-        end
-      end
-    end
+  if rhs and text_matches_parsed(rhs, secret, plain) then
+    return true
   end
   return false
 end
 
 ---Return true when `input` (argument string or argv list) overlaps a `.env` value.
+---Checks parsed tokens, the space-joined parsed token string, raw string input,
+---and `KEY=VALUE` right-hand sides against literal `.env` values and (for values
+--->= 6 bytes) RFC 3986 percent-encoded (per-escape case-insensitive hex digits
+---with case-sensitive plain surrounding bytes) and standard JSON-escaped forms.
 ---Protects even short `.env` substrings (length >= 1) in user arguments/settings/history,
 ---accepting possible false positives to prevent leaking `.env` values.
 ---@param input string|string[]|nil
@@ -623,12 +956,14 @@ function M.overlaps_env(input, env_map)
   end
 
   local tokens
+  local raw_input = nil
   if type(input) == "table" then
     tokens = input
   elseif type(input) == "string" then
     if vim.trim(input) == "" then
       return false
     end
+    raw_input = input
     local parsed = M.split_args(input)
     if parsed then
       tokens = parsed
@@ -639,14 +974,32 @@ function M.overlaps_env(input, env_map)
     return false
   end
 
-  local secrets = M.collect_redactions(env_map)
-  for _, secret in ipairs(secrets) do
+  local specs = collect_redaction_specs(env_map)
+  local joined_tokens = table.concat(tokens, " ")
+
+  local function matches(needle, is_pattern)
+    local plain = not is_pattern
     for _, tok in ipairs(tokens) do
-      if token_overlaps_secret(tok, secret) then
+      if token_overlaps_secret(tok, needle, is_pattern) then
         return true
       end
     end
-    if type(input) == "string" and input:find(secret, 1, true) then
+    if joined_tokens ~= "" and joined_tokens:find(needle, 1, plain) then
+      return true
+    end
+    if raw_input and raw_input ~= "" and raw_input ~= joined_tokens and raw_input:find(needle, 1, plain) then
+      return true
+    end
+    return false
+  end
+
+  for _, secret in ipairs(specs.literals) do
+    if matches(secret, false) then
+      return true
+    end
+  end
+  for _, pat in ipairs(specs.patterns) do
+    if matches(pat, true) then
       return true
     end
   end
