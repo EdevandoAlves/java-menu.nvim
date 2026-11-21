@@ -1909,7 +1909,7 @@ do
     'printf "=C#99\\n"',
     'printf "overlap=left_mid_right_secret\\n"',
     'printf "url_u=TopSecret%%2FA%%2BB%%3DC%%2399 url_l=TopSecret%%2fA%%2bB%%3dC%%2399\\n"',
-    'printf \'json={"k":"sec\\"ret\\\\val"}\\n\'',
+    "printf '%s\\n' 'json={\"k\":" .. vim.json.encode(json_sec) .. "}'",
     'printf "ordinary port 4200\\n"',
     'printf "split_nl_a=TopSecret/A+B\\nsplit_nl_b==C#99\\n"',
     'printf "cross_a=cross1_\\n"',
