@@ -1563,16 +1563,17 @@ local function interactive_spec()
   )
   lsp.client = real_client
 
-  -- ---------- 14. shell: menu (Gradle desabilita Add, Maven habilita) ----------
+  -- ---------- 14. shell: menu (Gradle estático habilita Add, parcial/dinâmico desabilita; Maven habilita) ----------
 
+  local gradle_before_menu = read_raw(gradle_root .. "/build.gradle")
   stub_ui({ "Add dependency" }, {})
   notices = {}
   deps.menu(gradle_buf)
-  assert(#select_calls == 1, "menu Gradle deveria abrir uma vez: " .. #select_calls)
+  assert(#select_calls == 2, "menu Gradle estático deveria abrir menu + submenu add: " .. #select_calls)
   local gradle_menu = table.concat(select_calls[1].items, "\n")
   assert(
-    gradle_menu:find("Add dependency…  (unavailable: Gradle build file editing is not supported", 1, true),
-    "Add dependency deveria estar desabilitado no Gradle: " .. gradle_menu
+    not gradle_menu:find("Add dependency…  (unavailable", 1, true),
+    "Add dependency deveria estar habilitado em Gradle estático: " .. gradle_menu
   )
   assert(gradle_menu:find("Open build.gradle\n", 1, true) or gradle_menu:find("Open build.gradle", 1, true))
   assert(not gradle_menu:find("Open build.gradle[^\n]*(unavailable", 1), "Open build file deveria estar habilitado")
@@ -1580,7 +1581,7 @@ local function interactive_spec()
     gradle_menu:find("Sync JDTLS  (unavailable: jdtls is not attached to this buffer)", 1, true),
     "Sync deveria estar desabilitado sem cliente"
   )
-  assert(has_notice("read-only MVP"), "escolher a entrada desabilitada deveria avisar: " .. last_notice())
+  assert(read_raw(gradle_root .. "/build.gradle") == gradle_before_menu, "cancelar no submenu add escreveu em disco")
 
   vim.api.nvim_set_current_buf(buf)
   stub_ui({ "List dependencies" }, {})
@@ -1593,18 +1594,43 @@ local function interactive_spec()
   assert(list_lines:find("Build file: pom.xml", 1, true), "List não abriu o relatório do POM")
   assert(list_lines:find("Dependencies: 0", 1, true))
 
-  -- Kotlin DSL: menu mantém Add desabilitado e List abre relatório estático
+  -- Kotlin DSL estático: menu habilita Add e List abre relatório estático
+  local kts_before_menu = read_raw(kts_dir .. "/build.gradle.kts")
   stub_ui({ "Add dependency" }, {})
   notices = {}
   deps.menu(kts_buf)
-  assert(#select_calls == 1, "menu Kotlin DSL deveria abrir uma vez")
+  assert(#select_calls == 2, "menu Kotlin DSL estático deveria abrir menu + submenu add")
   local kts_menu = table.concat(select_calls[1].items, "\n")
   assert(
-    kts_menu:find("Add dependency…  (unavailable: Gradle build file editing is not supported", 1, true),
-    "Add dependency deveria seguir desabilitado no Kotlin DSL: " .. kts_menu
+    not kts_menu:find("Add dependency…  (unavailable", 1, true),
+    "Add dependency deveria estar habilitado no Kotlin DSL estático: " .. kts_menu
   )
   assert(kts_menu:find("Open build.gradle.kts", 1, true), "Open build.gradle.kts ausente no menu")
-  assert(has_notice("read-only MVP"), "escolher Add no Kotlin DSL deveria avisar")
+  assert(read_raw(kts_dir .. "/build.gradle.kts") == kts_before_menu, "cancelar no submenu .kts escreveu em disco")
+
+  -- Kotlin DSL com construto dinâmico/não suportado: Add fica desabilitado com motivo claro
+  local dyn_menu_dir = tempdir("kts-dyn-menu")
+  write_raw(dyn_menu_dir .. "/settings.gradle.kts", 'rootProject.name = "dyn-menu"\n')
+  local dyn_menu_text = table.concat({
+    "dependencies {",
+    '  implementation("org.slf4j:slf4j-api:2.0.20")',
+    '  implementation("com.dyn:$ver")',
+    "}",
+    "",
+  }, "\n")
+  write_raw(dyn_menu_dir .. "/build.gradle.kts", dyn_menu_text)
+  local dyn_menu_buf = buffer_for(dyn_menu_dir .. "/build.gradle.kts")
+  stub_ui({ "Add dependency" }, {})
+  notices = {}
+  deps.menu(dyn_menu_buf)
+  assert(#select_calls == 1, "menu Kotlin DSL dinâmico deveria abrir apenas o menu principal")
+  local dyn_menu_str = table.concat(select_calls[1].items, "\n")
+  assert(
+    dyn_menu_str:find("Add dependency…  (unavailable: dynamic version or variable not resolved", 1, true),
+    "Add dependency deveria estar desabilitado em projeto dinâmico: " .. dyn_menu_str
+  )
+  assert(has_notice("dynamic version or variable not resolved"), "escolher Add desabilitado deveria avisar")
+  assert(read_raw(dyn_menu_dir .. "/build.gradle.kts") == dyn_menu_text, "arquivo dinâmico foi alterado")
 
   stub_ui({ "List dependencies" }, {})
   deps.menu(kts_buf)
@@ -3237,6 +3263,1335 @@ end
 
 maven_self_closing_dependencies_spec()
 
+local function gradle_edit_core_spec()
+  -- ---------- 20. Gradle editing core: Groovy + Kotlin, comentários, estilo, CRLF, catálogo, recusa segura ----------
+
+  local cat_toml = table.concat({
+    "[versions]",
+    'junit = "5.10.2"',
+    'guava = "33.1.0-jre"',
+    "",
+    "[libraries]",
+    'junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }',
+    'guava = { group = "com.google.guava", name = "guava", version.ref = "guava" }',
+    'slf4j-api = "org.slf4j:slf4j-api:2.0.20"',
+    'bundles-placeholder = "com.example:placeholder:1.0.0"',
+    "",
+    "[bundles]",
+    'testing = ["junit-jupiter"]',
+  }, "\n")
+  local cat = deps._parse_version_catalog(cat_toml)
+
+  -- A) Groovy DSL: inserção preservando comentários, buildscript, indentação e estilo
+  local groovy_src = table.concat({
+    "// header comment",
+    "plugins {",
+    "    id 'java'",
+    "}",
+    "",
+    "buildscript {",
+    "    dependencies {",
+    "        classpath 'com.example:plugin:1.0.0'",
+    "    }",
+    "}",
+    "",
+    "/* block comment before dependencies",
+    "   dependencies { implementation 'fake:commented:1.0' } */",
+    "dependencies { // keep opening comment",
+    "    // keep leading comment",
+    "    implementation 'org.slf4j:slf4j-api:2.0.20' // keep inline",
+    "    testImplementation(libs.junit.jupiter)",
+    "    implementation group: 'com.fasterxml.jackson.core', name: 'jackson-core', version: '2.17.1'",
+    "    implementation project(':core')",
+    "    // keep trailing comment",
+    "} // keep closing comment",
+    "",
+  }, "\n")
+
+  local g_out, g_meta, g_err = deps._insert_gradle_dependency(groovy_src, {
+    groupId = "com.google.guava",
+    artifactId = "guava",
+    version = "33.1.0-jre",
+    configuration = "api",
+  }, { is_kotlin_dsl = false, catalog = cat, build_file = "build.gradle" })
+  assert(g_err == nil and g_out, "inserção Groovy falhou: " .. tostring(g_err))
+  assert(g_meta.created_section == false and g_meta.version_omitted == false)
+  assert(g_meta.configuration == "api")
+  assert(g_meta.rendered_line == "    api 'com.google.guava:guava:33.1.0-jre'")
+  assert(g_meta.catalog_note and g_meta.catalog_note:find("libs.guava", 1, true))
+  local g_expected = groovy_src:gsub(
+    "    // keep trailing comment\n} // keep closing comment",
+    "    // keep trailing comment\n    api 'com.google.guava:guava:33.1.0-jre'\n} // keep closing comment",
+    1
+  )
+  assert(g_out == g_expected, "inserção Groovy alterou bytes fora do alvo:\n" .. g_out)
+
+  -- Groovy estilos: parens + aspas duplas, tabs, bloco vazio e inline
+  local groovy_parens_dq = table.concat({
+    "dependencies {",
+    '  implementation("org.slf4j:slf4j-api:2.0.20")',
+    "}",
+    "",
+  }, "\n")
+  local gp_out = deps._insert_gradle_dependency(groovy_parens_dq, {
+    groupId = "junit",
+    artifactId = "junit",
+    version = "4.13.2",
+    configuration = "testImplementation",
+  }, { is_kotlin_dsl = false })
+  assert(
+    gp_out
+      == 'dependencies {\n  implementation("org.slf4j:slf4j-api:2.0.20")\n  testImplementation("junit:junit:4.13.2")\n}\n',
+    "estilo Groovy parens+dq não foi preservado: " .. tostring(gp_out)
+  )
+
+  local groovy_tabs = "plugins {\n\tid 'java'\n}\ndependencies {}\n"
+  local gt_out = deps._insert_gradle_dependency(groovy_tabs, {
+    groupId = "com.example",
+    artifactId = "tabbed",
+    version = "1.0.0",
+  }, { is_kotlin_dsl = false })
+  assert(
+    gt_out == "plugins {\n\tid 'java'\n}\ndependencies {\n\timplementation 'com.example:tabbed:1.0.0'\n}\n",
+    "expansão de dependencies {} com tabs divergiu: " .. tostring(gt_out)
+  )
+
+  local groovy_inline = "dependencies { implementation 'a:b:1.0' }\n"
+  local gi_out = deps._insert_gradle_dependency(groovy_inline, {
+    groupId = "c",
+    artifactId = "d",
+    version = "2.0",
+  }, { is_kotlin_dsl = false })
+  assert(
+    gi_out == "dependencies { implementation 'a:b:1.0' \n  implementation 'c:d:2.0'\n}\n",
+    "expansão de dependencies inline divergiu: " .. tostring(gi_out)
+  )
+
+  local groovy_inline_ws = "  dependencies { implementation 'a:b:1.0'\t  } // keep\n"
+  local gi_ws_out = deps._insert_gradle_dependency(groovy_inline_ws, {
+    groupId = "c",
+    artifactId = "d",
+    version = "2.0",
+  }, { is_kotlin_dsl = false })
+  assert(
+    gi_ws_out == "  dependencies { implementation 'a:b:1.0'\t  \n    implementation 'c:d:2.0'\n  } // keep\n",
+    "trailing whitespace antes de } não preservado em bloco inline: " .. tostring(gi_ws_out)
+  )
+
+  local groovy_empty_ws = "dependencies {   }\n"
+  local gew_out = deps._insert_gradle_dependency(groovy_empty_ws, {
+    groupId = "c",
+    artifactId = "d",
+    version = "2.0",
+  }, { is_kotlin_dsl = false })
+  assert(
+    gew_out == "dependencies {   \n  implementation 'c:d:2.0'\n}\n",
+    "trailing whitespace antes de } não preservado em bloco vazio com espaços: " .. tostring(gew_out)
+  )
+
+  -- Criação de nova seção dependencies quando ausente (sem alterar buildscript)
+  local no_deps_groovy = table.concat({
+    "plugins {",
+    "    id 'java'",
+    "}",
+    "buildscript {",
+    "    dependencies {",
+    "        classpath 'com.example:tool:1.0'",
+    "    }",
+    "}",
+    "",
+  }, "\n")
+  local nd_out, nd_meta, nd_err = deps._insert_gradle_dependency(no_deps_groovy, {
+    groupId = "org.slf4j",
+    artifactId = "slf4j-api",
+    version = "2.0.20",
+  }, { is_kotlin_dsl = false })
+  assert(nd_err == nil and nd_meta.created_section == true)
+  assert(
+    nd_out == no_deps_groovy .. "\ndependencies {\n    implementation 'org.slf4j:slf4j-api:2.0.20'\n}\n",
+    "criação de seção dependencies falhou:\n" .. tostring(nd_out)
+  )
+
+  -- B) Kotlin DSL: comentários aninhados, CRLF, argumentos nomeados/posicionais, platform/BOM
+  local kts_src = table.concat({
+    '/* outer /* nested dependencies { implementation("x:y:1") } */ end */',
+    "plugins {",
+    '    id("java")',
+    "}",
+    "",
+    "dependencies {",
+    '    implementation("org.slf4j:slf4j-api:2.0.20") // inline',
+    "    testImplementation(libs.junit.jupiter)",
+    '    api(group = "com.example", name = "named-lib", version = "1.1.0")',
+    '    compileOnly("com.example", "pos-lib", "2.0.0")',
+    '    implementation(project(":shared"))',
+    "}",
+    "",
+  }, "\n")
+  local kts_crlf = kts_src:gsub("\n", "\r\n")
+  local k_out, k_meta, k_err = deps._insert_gradle_dependency(kts_crlf, {
+    groupId = "com.google.guava",
+    artifactId = "guava",
+    version = "33.1.0-jre",
+    configuration = "runtimeOnly",
+  }, { is_kotlin_dsl = true, catalog = cat, build_file = "build.gradle.kts" })
+  assert(k_err == nil and k_out, "inserção Kotlin CRLF falhou: " .. tostring(k_err))
+  assert(k_out:find("[^\r]\n") == nil, "inserção Kotlin CRLF introduziu LF puro")
+  assert(k_meta.rendered_line == '    runtimeOnly("com.google.guava:guava:33.1.0-jre")')
+  assert(
+    k_out:find(
+      '    implementation(project(":shared"))\r\n    runtimeOnly("com.google.guava:guava:33.1.0-jre")\r\n}',
+      1,
+      true
+    ),
+    "bloco Kotlin CRLF mal posicionado:\n" .. k_out
+  )
+
+  -- CRLF na criação de nova seção
+  local kts_no_deps_crlf = 'plugins {\r\n  kotlin("jvm")\r\n}'
+  local knd_out, knd_meta = deps._insert_gradle_dependency(kts_no_deps_crlf, {
+    groupId = "org.slf4j",
+    artifactId = "slf4j-api",
+    version = "2.0.20",
+  }, { is_kotlin_dsl = true })
+  assert(knd_out and knd_meta.created_section == true)
+  assert(knd_out:find("[^\r]\n") == nil, "criação de seção CRLF introduziu LF puro")
+  assert(
+    knd_out
+      == 'plugins {\r\n  kotlin("jvm")\r\n}\r\n\r\ndependencies {\r\n  implementation("org.slf4j:slf4j-api:2.0.20")\r\n}',
+    "criação de seção CRLF sem newline final divergiu"
+  )
+
+  -- Platform/BOM permite omitir versão com ressalva honesta; sem BOM exige versão
+  local _, _, no_ver_err = deps._insert_gradle_dependency(kts_src, {
+    groupId = "com.example",
+    artifactId = "unmanaged",
+  }, { is_kotlin_dsl = true, catalog = cat })
+  assert(no_ver_err and no_ver_err:find("version is required", 1, true))
+
+  local bom_kts = table.concat({
+    "dependencies {",
+    '  implementation(platform("org.springframework.boot:spring-boot-dependencies:3.2.5"))',
+    "}",
+    "",
+  }, "\n")
+  local bom_out, bom_meta, bom_err = deps._insert_gradle_dependency(bom_kts, {
+    groupId = "org.springframework.boot",
+    artifactId = "spring-boot-starter-web",
+  }, { is_kotlin_dsl = true })
+  assert(bom_err == nil and bom_out and bom_meta.version_omitted == true)
+  assert(bom_meta.bom_note and bom_meta.bom_note:find("platform/BOM", 1, true))
+  assert(bom_out:find('  implementation("org.springframework.boot:spring-boot-starter-web")\n', 1, true))
+  local bom_dup, _, bom_dup_err = deps._insert_gradle_dependency(bom_kts, {
+    groupId = "org.springframework.boot",
+    artifactId = "spring-boot-dependencies",
+    version = "3.2.5",
+  }, { is_kotlin_dsl = true })
+  assert(bom_dup == nil and bom_dup_err and bom_dup_err:find("already declared", 1, true))
+
+  -- C) Dedupe (literal, catálogo libs.*, map/named/posicional, platform)
+  for _, dup in ipairs({
+    { groupId = "org.slf4j", artifactId = "slf4j-api", version = "2.0.99" },
+    { groupId = "org.junit.jupiter", artifactId = "junit-jupiter", version = "5.11.0" },
+    { groupId = "com.fasterxml.jackson.core", artifactId = "jackson-core", version = "2.18.0" },
+  }) do
+    local res, _, err = deps._insert_gradle_dependency(groovy_src, dup, { is_kotlin_dsl = false, catalog = cat })
+    assert(
+      res == nil and err and err:find("already declared", 1, true),
+      "duplicata Groovy não recusada: " .. tostring(err)
+    )
+  end
+  for _, dup in ipairs({
+    { groupId = "org.slf4j", artifactId = "slf4j-api", version = "2.0.99" },
+    { groupId = "org.junit.jupiter", artifactId = "junit-jupiter", version = "5.11.0" },
+    { groupId = "com.example", artifactId = "named-lib", version = "9.9.9" },
+    { groupId = "com.example", artifactId = "pos-lib", version = "9.9.9" },
+  }) do
+    local res, _, err = deps._insert_gradle_dependency(kts_src, dup, { is_kotlin_dsl = true, catalog = cat })
+    assert(
+      res == nil and err and err:find("already declared", 1, true),
+      "duplicata Kotlin não recusada: " .. tostring(err)
+    )
+  end
+
+  -- D) Validação / bloqueio de injeção e configuração inválida
+  for _, bad in ipairs({
+    { groupId = "com.bad$x", artifactId = "a", version = "1.0" },
+    { groupId = 'com.bad"x', artifactId = "a", version = "1.0" },
+    { groupId = "com.bad'x", artifactId = "a", version = "1.0" },
+    { groupId = "com.bad:x", artifactId = "a", version = "1.0" },
+    { groupId = "com.bad", artifactId = "a", version = "1.0", configuration = "classpath" },
+    { groupId = "com.bad", artifactId = "a", version = "1.0", configuration = "weirdConfig" },
+  }) do
+    local res, _, err = deps._insert_gradle_dependency(kts_src, bad, { is_kotlin_dsl = true })
+    assert(res == nil and err ~= nil, "entrada inválida aceita: " .. vim.inspect(bad))
+  end
+
+  -- E) Recusa de construtos ambíguos, dinâmicos e parciais não suportados (Groovy e Kotlin)
+  local amb_cat = deps._parse_version_catalog('[libraries]\nfoo-bar = "com.example:a:1"\nfoo_bar = "com.example:b:2"\n')
+  local unsupported_cases = {
+    {
+      "multiple blocks",
+      false,
+      "dependencies {\n  implementation 'a:b:1'\n}\ndependencies {\n  implementation 'c:d:2'\n}\n",
+    },
+    {
+      "multiple blocks kts",
+      true,
+      'dependencies {\n  implementation("a:b:1")\n}\ndependencies {\n  implementation("c:d:2")\n}\n',
+    },
+    { "subprojects", false, "subprojects {\n  dependencies {\n    implementation 'a:b:1'\n  }\n}\n" },
+    { "allprojects", true, 'allprojects {\n  dependencies {\n    implementation("a:b:1")\n  }\n}\n' },
+    { "qualified receiver", true, 'other.dependencies {\n  implementation("a:b:1")\n}\n' },
+    { "dependencies.apply", true, 'dependencies.apply {\n  implementation("a:b:1")\n}\n' },
+    { "with(dependencies)", true, 'with(dependencies) {\n  implementation("a:b:1")\n}\n' },
+    { "dependencies({ ... })", true, 'dependencies({\n  implementation("a:b:1")\n})\n' },
+    { "apply from groovy", false, "apply from: 'deps.gradle'\ndependencies {\n  implementation 'a:b:1'\n}\n" },
+    { "apply(from) kts", true, 'apply(from = "deps.gradle.kts")\ndependencies {\n  implementation("a:b:1")\n}\n' },
+    { "apply { from }", false, "apply {\n  from 'deps.gradle'\n}\ndependencies {\n  implementation 'a:b:1'\n}\n" },
+    { "dynamic interpolation groovy", false, 'dependencies {\n  implementation "com.dyn:$ver"\n}\n' },
+    {
+      "dynamic interpolation kts",
+      true,
+      'dependencies {\n  implementation("org.slf4j:slf4j-api:2.0.20")\n  implementation("com.dyn:${ver}")\n}\n',
+    },
+    { "concat kts", true, 'dependencies {\n  implementation("com.dyn:a:" + ver)\n}\n' },
+    {
+      "if inside deps",
+      true,
+      'dependencies {\n  implementation("org.slf4j:slf4j-api:2.0.20")\n  if (hasProperty("x")) {\n    implementation("a:b:1")\n  }\n}\n',
+    },
+    { "val inside deps", true, 'dependencies {\n  val v = "1.0"\n  implementation("a:b:1")\n}\n' },
+    { "def inside deps", false, "dependencies {\n  def v = '1.0'\n  implementation 'a:b:1'\n}\n" },
+    {
+      "constraints block",
+      true,
+      'dependencies {\n  implementation("org.slf4j:slf4j-api:2.0.20")\n  constraints {\n    implementation("a:b:1")\n  }\n}\n',
+    },
+    {
+      "files()",
+      false,
+      "dependencies {\n  implementation 'org.slf4j:slf4j-api:2.0.20'\n  runtimeOnly files('libs/a.jar')\n}\n",
+    },
+    { "bundle accessor", true, "dependencies {\n  implementation(libs.bundles.testing)\n}\n" },
+    { "unknown catalog alias", true, "dependencies {\n  implementation(libs.missing.alias)\n}\n" },
+    { "ambiguous catalog alias", true, "dependencies {\n  implementation(libs.foo.bar)\n}\n", amb_cat },
+    { "custom configuration", true, 'dependencies {\n  customConfig("a:b:1")\n}\n' },
+    { "unterminated comment", true, 'dependencies {\n  /* unclosed\n  implementation("a:b:1")\n}\n' },
+    { "unterminated string", false, "dependencies {\n  implementation 'a:b:1\n}\n" },
+    { "unbalanced brace", true, 'dependencies {\n  implementation("a:b:1")\n' },
+  }
+
+  for _, case in ipairs(unsupported_cases) do
+    local label, is_kts, text, custom_cat = case[1], case[2], case[3], case[4] or cat
+    local out, _, err = deps._insert_gradle_dependency(text, {
+      groupId = "com.example",
+      artifactId = "safe",
+      version = "1.0.0",
+    }, { is_kotlin_dsl = is_kts, catalog = custom_cat })
+    assert(
+      out == nil and type(err) == "string" and err ~= "",
+      ("caso não suportado '%s' deveria ter sido recusado"):format(label)
+    )
+  end
+end
+
+gradle_edit_core_spec()
+
+local function gradle_edit_interactive_spec()
+  -- ---------- 21. Gradle editing shell: preview, confirmação, cancelamentos, unsaved, symlinks, multi-módulo ----------
+
+  local real_client = lsp.client
+  local real_search = deps._search_maven
+
+  -- A) Groovy DSL fluxo interativo completo + preview + no-overwrite + cancelamentos
+  local g_dir = tempdir("gradle-edit-groovy")
+  write_raw(g_dir .. "/settings.gradle", 'rootProject.name = "groovy-edit"\n')
+  local g_initial = table.concat({
+    "// keep top comment",
+    "plugins {",
+    "  id 'java'",
+    "}",
+    "",
+    "dependencies {",
+    "  // keep existing comment",
+    "  implementation 'org.slf4j:slf4j-api:2.0.20'",
+    "}",
+    "",
+  }, "\n")
+  local g_build = g_dir .. "/build.gradle"
+  write_raw(g_build, g_initial)
+  local g_buf = buffer_for(g_build)
+
+  -- Cancelamento na confirmação final não altera nada em disco
+  stub_ui(
+    { "Add dependency", "Enter coordinates manually", "testImplementation", "✖ Cancel" },
+    { "junit", "junit", "4.13.2" }
+  )
+  notices = {}
+  deps.menu(g_buf)
+  assert(read_raw(g_build) == g_initial, "cancelar na confirmação alterou build.gradle")
+  assert(not has_notice("added "), "cancelamento não pode notificar sucesso")
+  local confirm_items = table.concat(select_calls[4].items, "\n")
+  assert(confirm_items:find("configuration: testImplementation", 1, true), "preview sem configuration")
+  assert(
+    confirm_items:find("preview: testImplementation 'junit:junit:4.13.2'", 1, true),
+    "preview sem linha renderizada"
+  )
+  assert(confirm_items:find("target: build.gradle", 1, true), "preview sem target")
+
+  -- Cancelamento no meio (Esc na versão) não altera nada
+  stub_ui({ "Add dependency", "Enter coordinates manually" }, { "junit", "junit", false })
+  deps.menu(g_buf)
+  assert(read_raw(g_build) == g_initial, "cancelar na versão alterou build.gradle")
+
+  -- Confirmação insere cirurgicamente preservando comentários + recarrega buffer limpo
+  stub_ui(
+    { "Add dependency", "Enter coordinates manually", "testImplementation", "✔ Add dependency" },
+    { "junit", "junit", "4.13.2" }
+  )
+  notices = {}
+  deps.menu(g_buf)
+  local g_after = read_raw(g_build)
+  assert(g_after:find("// keep top comment", 1, true), "comentário de topo perdido")
+  assert(
+    g_after:find(
+      "  // keep existing comment\n  implementation 'org.slf4j:slf4j-api:2.0.20'\n  testImplementation 'junit:junit:4.13.2'\n}",
+      1,
+      true
+    )
+  )
+  assert(has_notice("added junit:junit:4.13.2 to build.gradle"), "sucesso Groovy não notificado: " .. last_notice())
+
+  -- Buffer modificado (unsaved) recusa escrita sem tocar o arquivo
+  vim.bo[g_buf].modified = true
+  notices = {}
+  stub_ui({ "Enter coordinates manually", "api", "✔ Add dependency" }, { "com.example", "unsaved-block", "1.0.0" })
+  deps.add(g_buf)
+  assert(has_notice("unsaved changes"), "buffer modificado em Gradle não foi recusado: " .. last_notice())
+  assert(read_raw(g_build) == g_after, "build.gradle foi modificado apesar de buffer unsaved")
+  vim.bo[g_buf].modified = false
+
+  -- B) Kotlin DSL + Version Catalog (read-only) + Maven Central search + JDTLS sync
+  local k_dir = tempdir("gradle-edit-kts")
+  write_raw(k_dir .. "/settings.gradle.kts", 'rootProject.name = "kts-edit"\n')
+  local k_cat_initial = table.concat({
+    "[versions]",
+    'slf4j = "2.0.20"',
+    "",
+    "[libraries]",
+    'slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }',
+    'guava = "com.google.guava:guava:33.1.0-jre"',
+    "",
+  }, "\n")
+  write_raw(k_dir .. "/gradle/libs.versions.toml", k_cat_initial)
+  local k_initial = table.concat({
+    "plugins {",
+    "  java",
+    "}",
+    "",
+    "dependencies {",
+    "  implementation(libs.slf4j.api)",
+    "}",
+    "",
+  }, "\n")
+  local k_build = k_dir .. "/build.gradle.kts"
+  write_raw(k_build, k_initial)
+  local k_buf = buffer_for(k_build)
+
+  -- Duplicata de dependência declarada via libs.slf4j.api é recusada sem escrever
+  stub_ui({ "Enter coordinates manually", "implementation (default)" }, { "org.slf4j", "slf4j-api", "2.0.21" })
+  notices = {}
+  deps.add(k_buf)
+  assert(has_notice("already declared"), "duplicata via libs.slf4j.api não foi recusada: " .. last_notice())
+  assert(read_raw(k_build) == k_initial, "duplicata alterou build.gradle.kts")
+  assert(read_raw(k_dir .. "/gradle/libs.versions.toml") == k_cat_initial, "catálogo foi alterado")
+
+  -- Busca Maven Central + nota de catálogo + JDTLS sync quando cliente anexado
+  deps._search_maven = function(_, on_done)
+    on_done({ { groupId = "com.google.guava", artifactId = "guava", version = "33.1.0-jre", packaging = "jar" } }, nil)
+  end
+  local synced_req
+  lsp.client = function()
+    return {
+      request = function(_, method, params, handler, request_buf)
+        synced_req = { method = method, params = params, buf = request_buf }
+        handler(nil)
+      end,
+    }
+  end
+  stub_ui({ "Add dependency", "Search Maven Central", "guava:", "api", "✔ Add dependency" }, { "guava" })
+  notices = {}
+  deps.menu(k_buf)
+  deps._search_maven = real_search
+  assert(
+    vim.wait(2000, function()
+      return synced_req ~= nil
+    end),
+    "sync JDTLS não disparou após edição Gradle"
+  )
+  assert(synced_req.method == "java/projectConfigurationUpdate")
+  assert(synced_req.params.uri == vim.uri_from_fname(k_build))
+  lsp.client = real_client
+  local k_after = read_raw(k_build)
+  assert(
+    k_after:find('  api("com.google.guava:guava:33.1.0-jre")', 1, true),
+    "busca Maven Central não inseriu em .kts"
+  )
+  assert(read_raw(k_dir .. "/gradle/libs.versions.toml") == k_cat_initial, "libs.versions.toml não pode ser alterado")
+
+  -- C) Symlinks: recusa symlink no arquivo de build e detecta buffer modificado via caminho symlinkado
+  local sym_dir = tempdir("gradle-symlink")
+  local outside_target = tempdir("gradle-symlink-outside") .. "/shared.gradle"
+  write_raw(outside_target, "dependencies {\n  implementation 'org.slf4j:slf4j-api:2.0.20'\n}\n")
+  write_raw(sym_dir .. "/settings.gradle", 'rootProject.name = "sym"\n')
+  assert(vim.uv.fs_symlink(outside_target, sym_dir .. "/build.gradle"), "falha ao criar symlink de teste")
+  local sym_buf = buffer_for(sym_dir .. "/build.gradle")
+  local can_edit_sym, sym_reason = deps._can_edit_target(deps._resolve_target(sym_buf))
+  assert(can_edit_sym == false and sym_reason and sym_reason:find("symlink", 1, true), "symlink deveria ser recusado")
+  notices = {}
+  deps.add(sym_buf)
+  assert(has_notice("symlink"), "M.add deveria recusar symlink: " .. last_notice())
+  assert(
+    read_raw(outside_target) == "dependencies {\n  implementation 'org.slf4j:slf4j-api:2.0.20'\n}\n",
+    "alvo externo do symlink foi modificado"
+  )
+  local _, write_sym_err = deps._write_build_file(sym_dir .. "/build.gradle", "corrupted")
+  assert(write_sym_err and write_sym_err:find("symlink", 1, true), "_write_build_file não recusou symlink")
+
+  -- Symlink quebrado (dangling) em build.gradle.kts também é recusado
+  local dangling_dir = tempdir("gradle-dangling-sym")
+  write_raw(dangling_dir .. "/settings.gradle.kts", 'rootProject.name = "dangling"\n')
+  assert(vim.uv.fs_symlink(dangling_dir .. "/nonexistent.kts", dangling_dir .. "/build.gradle.kts"))
+  local dangling_buf = buffer_for(dangling_dir .. "/build.gradle.kts")
+  notices = {}
+  deps.add(dangling_buf)
+  assert(has_notice("symlink"), "symlink quebrado deveria ser recusado: " .. last_notice())
+  assert(vim.uv.fs_lstat(dangling_dir .. "/nonexistent.kts") == nil, "destino inexistente foi criado")
+
+  -- Buffer modificado aberto por diretório symlinkado ainda bloqueia _write_build_file
+  local real_dir = tempdir("gradle-dir-real")
+  local link_parent = tempdir("gradle-dir-link-parent")
+  local link_dir = link_parent .. "/link"
+  local real_build = real_dir .. "/build.gradle"
+  write_raw(real_build, "dependencies {\n}\n")
+  assert(vim.uv.fs_symlink(real_dir, link_dir), "falha ao criar symlink de diretório")
+  local via_link_buf = buffer_for(link_dir .. "/build.gradle")
+  vim.bo[via_link_buf].modified = true
+  local ok_link, err_link = deps._write_build_file(real_build, "dependencies {\n  implementation 'a:b:1'\n}\n")
+  assert(
+    ok_link == nil and err_link and err_link:find("unsaved changes", 1, true),
+    "buffer modificado via symlink não bloqueou"
+  )
+  assert(read_raw(real_build) == "dependencies {\n}\n")
+  vim.bo[via_link_buf].modified = false
+  vim.api.nvim_buf_delete(via_link_buf, { force = true })
+
+  -- D) Diretório ambíguo com build.gradle E build.gradle.kts recusa edição
+  local both_dir = tempdir("gradle-both-dsl")
+  write_raw(both_dir .. "/settings.gradle", 'rootProject.name = "both"\n')
+  write_raw(both_dir .. "/build.gradle", "dependencies {}\n")
+  write_raw(both_dir .. "/build.gradle.kts", "dependencies {}\n")
+  local both_buf = buffer_for(both_dir .. "/build.gradle")
+  notices = {}
+  deps.add(both_buf)
+  assert(has_notice("ambiguous"), "ambos DSL no mesmo módulo deveriam ser recusados: " .. last_notice())
+  assert(read_raw(both_dir .. "/build.gradle") == "dependencies {}\n")
+  assert(read_raw(both_dir .. "/build.gradle.kts") == "dependencies {}\n")
+
+  -- E) Parcial não suportado via M.add: recusa e preserva 100% do arquivo
+  local partial_dir = tempdir("gradle-partial-add")
+  write_raw(partial_dir .. "/settings.gradle", 'rootProject.name = "partial"\n')
+  local partial_text = table.concat({
+    "dependencies {",
+    "  implementation 'org.slf4j:slf4j-api:2.0.20'",
+    "  if (project.hasProperty('extra')) {",
+    "    implementation 'com.example:extra:1.0.0'",
+    "  }",
+    "}",
+    "",
+  }, "\n")
+  write_raw(partial_dir .. "/build.gradle", partial_text)
+  local partial_buf = buffer_for(partial_dir .. "/build.gradle")
+  notices = {}
+  deps.add(partial_buf)
+  assert(has_notice("dynamic or conditional"), "parcial não suportado não foi recusado: " .. last_notice())
+  assert(read_raw(partial_dir .. "/build.gradle") == partial_text, "arquivo parcial foi alterado")
+
+  -- F) Multi-módulo Gradle: edita apenas o módulo escolhido; módulo sem build file próprio é recusado
+  local mm_dir = tempdir("gradle-multimod")
+  write_raw(mm_dir .. "/settings.gradle.kts", 'rootProject.name = "mm"\ninclude(":app", ":lib", ":nobuild")\n')
+  write_raw(mm_dir .. "/build.gradle.kts", "// root\n")
+  local app_build = mm_dir .. "/app/build.gradle.kts"
+  local lib_build = mm_dir .. "/lib/build.gradle.kts"
+  write_raw(app_build, 'dependencies {\n  implementation(project(":lib"))\n}\n')
+  write_raw(lib_build, "dependencies {}\n")
+  vim.fn.mkdir(mm_dir .. "/nobuild/src/main/java", "p")
+  write_raw(mm_dir .. "/nobuild/src/main/java/Empty.java", "public class Empty {}\n")
+
+  local app_buf = buffer_for(app_build)
+  stub_ui({
+    "app (current)",
+    "Add dependency",
+    "Enter coordinates manually",
+    "implementation (default)",
+    "✔ Add dependency",
+  }, { "com.example", "app-only", "1.0.0" })
+  deps.menu(app_buf)
+  assert(read_raw(app_build):find('implementation("com.example:app-only:1.0.0")', 1, true), "módulo :app não editado")
+  assert(read_raw(lib_build) == "dependencies {}\n", "módulo irmão :lib foi alterado indevidamente")
+  assert(read_raw(mm_dir .. "/build.gradle.kts") == "// root\n", "root foi alterado indevidamente")
+
+  local nobuild_buf = buffer_for(mm_dir .. "/nobuild/src/main/java/Empty.java")
+  notices = {}
+  deps.add(nobuild_buf)
+  assert(
+    has_notice("no build.gradle or build.gradle.kts"),
+    "submódulo sem build file deveria recusar: " .. last_notice()
+  )
+  assert(read_raw(mm_dir .. "/build.gradle.kts") == "// root\n", "root foi alterado por submódulo sem build file")
+end
+
+gradle_edit_interactive_spec()
+
+local function review_findings_regression_spec()
+  -- ---------- 22. Regressões de revisão: stale snapshot, temp único, permissões, slashy/dollar-slashy, stat/inexistente ----------
+
+  -- 1) Non-existing path, directory stat e remoção zero de arquivos previsíveis de usuário
+  local reg_dir = tempdir("review-write")
+  local missing_path = reg_dir .. "/missing-pom.xml"
+  local miss_ok, miss_err = deps._write_build_file(missing_path, "<project/>")
+  assert(miss_ok == nil and miss_err and miss_err:find("does not exist", 1, true), "caminho inexistente deveria falhar")
+  assert(vim.uv.fs_lstat(missing_path) == nil, "caminho inexistente não deve ser criado")
+
+  local dir_ok, dir_err = deps._write_build_file(reg_dir, "bad")
+  assert(dir_ok == nil and dir_err and dir_err:find("not a regular file", 1, true), "diretório deveria ser recusado")
+
+  local pom_path = reg_dir .. "/pom.xml"
+  write_raw(pom_path, MINIMAL_POM)
+  local predictable_tmp = pom_path .. ".java-menu-tmp"
+  write_raw(predictable_tmp, "USER DATA DO NOT DELETE")
+  local expected_pom = MINIMAL_POM .. "\n<!-- safe -->"
+  local ok_pred, err_pred = deps._write_build_file(pom_path, expected_pom)
+  assert(ok_pred == true and err_pred == nil, "escrita deveria ignorar caminho previsível: " .. tostring(err_pred))
+  assert(
+    read_raw(predictable_tmp) == "USER DATA DO NOT DELETE",
+    "arquivo .java-menu-tmp do usuário foi apagado/alterado"
+  )
+
+  -- Também quando .java-menu-tmp é symlink, não é tocado nem bloqueia a escrita
+  vim.uv.fs_unlink(predictable_tmp)
+  assert(vim.uv.fs_symlink(reg_dir .. "/outside.txt", predictable_tmp))
+  write_raw(reg_dir .. "/outside.txt", "KEEP OUTSIDE")
+  local ok_pred_sym, err_pred_sym = deps._write_build_file(pom_path, MINIMAL_POM)
+  assert(
+    ok_pred_sym == true and err_pred_sym == nil,
+    "symlink previsível não deveria bloquear nem ser apagado: " .. tostring(err_pred_sym)
+  )
+  assert(vim.uv.fs_lstat(predictable_tmp).type == "link", "symlink .java-menu-tmp foi removido")
+  assert(read_raw(reg_dir .. "/outside.txt") == "KEEP OUTSIDE", "alvo do symlink previsível foi alterado")
+
+  -- Nenhum arquivo temporário .java-menu-* permanece após sucesso ou erro
+  local function count_temp_files(dir)
+    local count = 0
+    for name in vim.fs.dir(dir) do
+      if name:find("%.java%-menu") then
+        count = count + 1
+      end
+    end
+    return count
+  end
+  assert(count_temp_files(reg_dir) == 1, "sobraram arquivos temporários além do pom.xml.java-menu-tmp pré-existente")
+
+  -- 2) Preservação de permissões (0600 e modos não padrão 0640 / 0750) em atomic replace e M.add
+  local perm_dir = tempdir("review-perms")
+  local perm_pom = perm_dir .. "/pom.xml"
+  local function assert_perm_preserved(mode_octal, label)
+    write_raw(perm_pom, MINIMAL_POM)
+    assert(vim.uv.fs_chmod(perm_pom, mode_octal), "falha ao aplicar chmod " .. label)
+    local wrote_ok, wrote_err = deps._write_build_file(perm_pom, MINIMAL_POM .. "\n<!-- " .. label .. " -->")
+    assert(wrote_ok, "falha ao escrever com modo " .. label .. ": " .. tostring(wrote_err))
+    local st = assert(vim.uv.fs_lstat(perm_pom))
+    local got = st.mode % 512
+    assert(got == mode_octal, ("permissão %s não preservada: esperado %o, obtido %o"):format(label, mode_octal, got))
+  end
+  assert_perm_preserved(tonumber("600", 8), "0600")
+  assert_perm_preserved(tonumber("640", 8), "0640")
+  assert_perm_preserved(tonumber("750", 8), "0750")
+
+  -- Também via M.add em build.gradle com 0600
+  local perm_gradle_dir = tempdir("review-perms-gradle")
+  write_raw(perm_gradle_dir .. "/settings.gradle", 'rootProject.name = "perm-gradle"\n')
+  local perm_gradle = perm_gradle_dir .. "/build.gradle"
+  write_raw(perm_gradle, "dependencies {\n  implementation 'org.slf4j:slf4j-api:2.0.20'\n}\n")
+  assert(vim.uv.fs_chmod(perm_gradle, tonumber("600", 8)))
+  local perm_g_buf = buffer_for(perm_gradle)
+  stub_ui(
+    { "Enter coordinates manually", "implementation (default)", "✔ Add dependency" },
+    { "junit", "junit", "4.13.2" }
+  )
+  deps.add(perm_g_buf)
+  local pg_stat = assert(vim.uv.fs_lstat(perm_gradle))
+  assert((pg_stat.mode % 512) == tonumber("600", 8), "M.add não preservou permissão 0600 em build.gradle")
+  vim.api.nvim_buf_delete(perm_g_buf, { force = true })
+
+  -- 3) Stale snapshot direto em _write_build_file e durante M.add (Maven + Gradle) + buffer modificado no meio do fluxo
+  local stale_dir = tempdir("review-stale")
+  local stale_pom = stale_dir .. "/pom.xml"
+  write_raw(stale_pom, MINIMAL_POM)
+  local stale_ok, stale_err = deps._write_build_file(stale_pom, "<project/>", { expected_text = "different" })
+  assert(stale_ok == nil and stale_err and stale_err:find("changed on disk", 1, true))
+  assert(read_raw(stale_pom) == MINIMAL_POM, "snapshot obsoleto sobrescreveu pom.xml")
+  assert(count_temp_files(stale_dir) == 0, "arquivo temporário sobrou após recusa de snapshot obsoleto")
+
+  -- Alteração externa no disco entre leitura inicial e confirmação de M.add (Maven)
+  local race_mvn_dir = tempdir("review-race-mvn")
+  local race_pom = race_mvn_dir .. "/pom.xml"
+  write_raw(race_pom, MINIMAL_POM)
+  local race_pom_buf = buffer_for(race_pom)
+  local external_mvn = MINIMAL_POM:gsub("</project>", "  <!-- external edit -->\n</project>")
+  local real_sel_save, real_inp_save = vim.ui.select, vim.ui.input
+  local mvn_inputs = { "com.example", "demo", "1.0.0" }
+  local mvn_selects = { "Enter coordinates manually", "compile (default)", "✔ Add dependency" }
+  vim.ui.input = function(_, on_confirm)
+    on_confirm(table.remove(mvn_inputs, 1))
+  end
+  vim.ui.select = function(items, opts, on_choice)
+    local want = table.remove(mvn_selects, 1)
+    if opts and opts.prompt and opts.prompt:find("summary", 1, true) then
+      write_raw(race_pom, external_mvn)
+    end
+    for _, item in ipairs(items) do
+      if item:find(want, 1, true) then
+        return on_choice(item)
+      end
+    end
+  end
+  notices = {}
+  deps.add(race_pom_buf)
+  vim.ui.select, vim.ui.input = real_sel_save, real_inp_save
+  assert(has_notice("changed on disk"), "M.add Maven deveria abortar com snapshot obsoleto: " .. last_notice())
+  assert(read_raw(race_pom) == external_mvn, "M.add Maven sobrescreveu edição externa após confirmação")
+
+  -- Buffer modificado durante o fluxo (após início de M.add, antes da confirmação)
+  write_raw(race_pom, MINIMAL_POM)
+  vim.api.nvim_buf_call(race_pom_buf, function()
+    vim.cmd("silent edit!")
+  end)
+  local mod_inputs = { "com.example", "demo", "1.0.0" }
+  local mod_selects = { "Enter coordinates manually", "compile (default)", "✔ Add dependency" }
+  vim.ui.input = function(_, on_confirm)
+    on_confirm(table.remove(mod_inputs, 1))
+  end
+  vim.ui.select = function(items, opts, on_choice)
+    local want = table.remove(mod_selects, 1)
+    if opts and opts.prompt and opts.prompt:find("summary", 1, true) then
+      vim.bo[race_pom_buf].modified = true
+    end
+    for _, item in ipairs(items) do
+      if item:find(want, 1, true) then
+        return on_choice(item)
+      end
+    end
+  end
+  notices = {}
+  deps.add(race_pom_buf)
+  vim.ui.select, vim.ui.input = real_sel_save, real_inp_save
+  assert(has_notice("unsaved changes"), "modificação de buffer durante M.add deveria abortar: " .. last_notice())
+  assert(read_raw(race_pom) == MINIMAL_POM, "M.add sobrescreveu arquivo com buffer modificado durante prompt")
+  vim.bo[race_pom_buf].modified = false
+  vim.api.nvim_buf_delete(race_pom_buf, { force = true })
+
+  -- 4) Duas interações assíncronas concorrentes (Maven e Gradle): primeira vence, segunda aborta sem sobrescrever
+  local function run_two_concurrent_adds(build_file, initial_text, setup_fn)
+    local dir = tempdir("review-concurrent-" .. (build_file:match("%.gradle") and "gradle" or "maven"))
+    local path = dir .. "/" .. build_file
+    setup_fn(dir, path, initial_text)
+    local buf = buffer_for(path)
+
+    local pending = {}
+    local queue_idx = 0
+    local sessions = {
+      {
+        selects = { "Enter coordinates manually", "default", "✔ Add dependency" },
+        inputs = { "com.first", "one", "1.0.0" },
+      },
+      {
+        selects = { "Enter coordinates manually", "default", "✔ Add dependency" },
+        inputs = { "com.second", "two", "2.0.0" },
+      },
+    }
+    -- Para Gradle, o item é "implementation (default)" e para Maven "compile (default)"; ambos casam com "default".
+    local active_session
+    vim.ui.input = function(_, on_confirm)
+      local val = table.remove(active_session.inputs, 1)
+      on_confirm(val)
+    end
+    vim.ui.select = function(items, opts, on_choice)
+      local want = table.remove(active_session.selects, 1)
+      local matched
+      for _, item in ipairs(items) do
+        if item:find(want, 1, true) then
+          matched = item
+          break
+        end
+      end
+      assert(matched, "concorrência: item não encontrado para " .. tostring(want))
+      if opts and opts.prompt and opts.prompt:find("summary", 1, true) then
+        -- Pausa na confirmação final para permitir que ambas as sessões leiam o mesmo snapshot inicial
+        pending[#pending + 1] = function()
+          on_choice(matched)
+        end
+        return
+      end
+      on_choice(matched)
+    end
+
+    local real_client = lsp.client
+    local sync_calls = 0
+    lsp.client = function()
+      return {
+        request = function(_, _, _, handler)
+          sync_calls = sync_calls + 1
+          handler(nil)
+        end,
+      }
+    end
+
+    notices = {}
+    queue_idx = 1
+    active_session = sessions[queue_idx]
+    deps.add(buf)
+    queue_idx = 2
+    active_session = sessions[queue_idx]
+    deps.add(buf)
+
+    assert(#pending == 2, "ambas as interações concorrentes deveriam aguardar confirmação")
+    -- Primeira confirma e grava
+    pending[1]()
+    local after_first = read_raw(path)
+    assert(after_first:find("com.first", 1, true) and after_first:find("one", 1, true), "primeira interação falhou")
+    assert(sync_calls == 1, "primeira interação deveria sincronizar JDTLS")
+
+    -- Segunda confirma com snapshot antigo: deve abortar sem sobrescrever a primeira nem sincronizar JDTLS
+    notices = {}
+    pending[2]()
+    assert(has_notice("changed on disk"), "segunda interação concorrente deveria abortar: " .. last_notice())
+    assert(read_raw(path) == after_first, "segunda interação sobrescreveu a primeira")
+    assert(not read_raw(path):find("com.second", 1, true), "segunda dependência vazou para disco")
+    assert(sync_calls == 1, "segunda interação abortada não deve disparar sync JDTLS")
+
+    vim.ui.select, vim.ui.input = real_sel_save, real_inp_save
+    lsp.client = real_client
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end
+
+  run_two_concurrent_adds("pom.xml", MINIMAL_POM, function(_, path, text)
+    write_raw(path, text)
+  end)
+  run_two_concurrent_adds(
+    "build.gradle",
+    "dependencies {\n  implementation 'org.slf4j:slf4j-api:2.0.20'\n}\n",
+    function(dir, path, text)
+      write_raw(dir .. "/settings.gradle", 'rootProject.name = "concurrent-g"\n')
+      write_raw(path, text)
+    end
+  )
+
+  -- 5) Groovy slashy (/.../) e dollar-slashy ($/.../$) tratados com segurança: recusa antes de qualquer mutação
+  local slashy_cases = {
+    {
+      "dollar-slashy containing dependencies block",
+      "def tmpl = $/\ndependencies {\n  implementation 'com.trap:inside:1.0'\n}\n/$\n",
+    },
+    {
+      "dollar-slashy with comment-like tokens + real dependencies",
+      "def s = $/hello /* not comment /$\ndependencies {\n  implementation 'org.slf4j:slf4j-api:2.0.20'\n}\n",
+    },
+    {
+      "unterminated dollar-slashy",
+      "def s = $/unclosed\ndependencies {\n  implementation 'org.slf4j:slf4j-api:2.0.20'\n}\n",
+    },
+    {
+      "slashy regex containing dependencies block",
+      "def re = /dependencies { implementation 'com.trap:inside:1.0' }/\n",
+    },
+    {
+      "command expression slashy string",
+      "println /dependencies { implementation 'com.trap:inside:1.0' }/\n",
+    },
+    {
+      "slashy with embedded quote + real dependencies",
+      "def re = /foo \"bar/\ndependencies {\n  implementation 'org.slf4j:slf4j-api:2.0.20'\n}\n",
+    },
+  }
+  for _, case in ipairs(slashy_cases) do
+    local label, src = case[1], case[2]
+    local out, _, err = deps._insert_gradle_dependency(src, {
+      groupId = "com.example",
+      artifactId = "safe",
+      version = "1.0.0",
+    }, { is_kotlin_dsl = false })
+    assert(
+      out == nil and type(err) == "string" and err:find("slashy", 1, true),
+      ("caso Groovy '%s' deveria ser recusado com segurança, obtido err=%s"):format(label, tostring(err))
+    )
+  end
+
+  -- Também no fluxo interativo M.add: arquivo com dollar-slashy não é mutado
+  local sl_dir = tempdir("review-slashy")
+  write_raw(sl_dir .. "/settings.gradle", 'rootProject.name = "slashy"\n')
+  local sl_src = "def tmpl = $/\ndependencies {\n  implementation 'com.trap:inside:1.0'\n}\n/$\n"
+  local sl_build = sl_dir .. "/build.gradle"
+  write_raw(sl_build, sl_src)
+  local sl_buf = buffer_for(sl_build)
+  local can_sl, sl_reason = deps._can_edit_target(deps._resolve_target(sl_buf))
+  assert(can_sl == false and sl_reason and sl_reason:find("slashy", 1, true), "can_edit deveria recusar dollar-slashy")
+  notices = {}
+  deps.add(sl_buf)
+  assert(has_notice("slashy"), "M.add deveria recusar dollar-slashy: " .. last_notice())
+  assert(read_raw(sl_build) == sl_src, "arquivo com dollar-slashy foi alterado")
+  vim.api.nvim_buf_delete(sl_buf, { force = true })
+
+  -- URLs dentro de aspas, comentários e divisão em Kotlin DSL continuam permitidos
+  local groovy_url_ok, _, groovy_url_err = deps._insert_gradle_dependency(
+    "// https://example.com\nrepositories { maven { url 'https://repo.example.com/maven2' } }\ndependencies {\n  implementation 'a:b:1.0'\n}\n",
+    { groupId = "c", artifactId = "d", version = "2.0" },
+    { is_kotlin_dsl = false }
+  )
+  assert(groovy_url_ok ~= nil and groovy_url_err == nil, "URL em string Groovy não pode disparar recusa slashy")
+
+  local kts_div_ok, _, kts_div_err = deps._insert_gradle_dependency(
+    'val ratio = 10 / 2\ndependencies {\n  implementation("a:b:1.0")\n}\n',
+    { groupId = "c", artifactId = "d", version = "2.0" },
+    { is_kotlin_dsl = true }
+  )
+  assert(kts_div_ok ~= nil and kts_div_err == nil, "divisão em Kotlin DSL não pode disparar recusa slashy")
+end
+
+review_findings_regression_spec()
+
+local function write_build_file_race_regression_spec()
+  -- ---------- 23. Regressões de TOCTOU em _write_build_file (fd aberto, recheck de destino/temp, sem unlink estrangeiro) ----------
+  local function with_uv_mocks(overrides, fn)
+    local saved = {}
+    for k, v in pairs(overrides) do
+      saved[k] = vim.uv[k]
+      vim.uv[k] = v
+    end
+    local ok, err = pcall(fn, saved)
+    for k, orig in pairs(saved) do
+      vim.uv[k] = orig
+    end
+    if not ok then
+      error(err, 0)
+    end
+  end
+
+  local mode_0600 = tonumber("600", 8)
+
+  -- 1) tmp_fd permanece aberto durante fs_rename e é fechado depois (sucesso e falha), preservando 0600 e arquivos do usuário
+  do
+    local dir = tempdir("race-fd-lifecycle")
+    local pom = dir .. "/pom.xml"
+    local user_keep = dir .. "/pom.xml.java-menu-tmp"
+    local user_dot_keep = dir .. "/.pom.xml.java-menu-user"
+    write_raw(pom, MINIMAL_POM)
+    assert(vim.uv.fs_chmod(pom, mode_0600))
+    write_raw(user_keep, "USER KEEP 1")
+    write_raw(user_dot_keep, "USER KEEP 2")
+
+    local captured_fd, closed_before_rename, closed_after_rename, rename_called
+    local real_mkstemp = vim.uv.fs_mkstemp
+    local real_close = vim.uv.fs_close
+    local real_rename = vim.uv.fs_rename
+    with_uv_mocks({
+      fs_mkstemp = function(tmpl)
+        local fd, path, err = real_mkstemp(tmpl)
+        if fd then
+          captured_fd = fd
+        end
+        return fd, path, err
+      end,
+      fs_close = function(fd)
+        if captured_fd and fd == captured_fd then
+          if not rename_called then
+            closed_before_rename = true
+          else
+            closed_after_rename = true
+          end
+        end
+        return real_close(fd)
+      end,
+      fs_rename = function(src, dst)
+        rename_called = true
+        assert(not closed_before_rename, "tmp_fd não deveria ter sido fechado antes de fs_rename")
+        return real_rename(src, dst)
+      end,
+    }, function()
+      local next_pom = MINIMAL_POM .. "\n<!-- fd-open-ok -->"
+      local ok, err = deps._write_build_file(pom, next_pom)
+      assert(ok == true and err == nil, "escrita deveria suceder: " .. tostring(err))
+      assert(rename_called, "fs_rename deveria ter sido chamado")
+      assert(not closed_before_rename, "tmp_fd foi fechado antes de fs_rename")
+      assert(closed_after_rename, "tmp_fd deveria ser fechado após fs_rename")
+      assert(read_raw(pom) == next_pom)
+      assert((assert(vim.uv.fs_lstat(pom)).mode % 512) == mode_0600, "permissão 0600 não preservada")
+      assert(read_raw(user_keep) == "USER KEEP 1", "arquivo pré-existente do usuário foi alterado")
+      assert(read_raw(user_dot_keep) == "USER KEEP 2", "arquivo .java-menu pré-existente do usuário foi alterado")
+    end)
+
+    -- Também em erro de fs_rename: tmp_fd estava aberto na entrada de fs_rename e é fechado após cleanup
+    captured_fd, closed_before_rename, closed_after_rename, rename_called = nil, false, false, false
+    local before_fail = read_raw(pom)
+    with_uv_mocks({
+      fs_mkstemp = function(tmpl)
+        local fd, path, err = real_mkstemp(tmpl)
+        if fd then
+          captured_fd = fd
+        end
+        return fd, path, err
+      end,
+      fs_close = function(fd)
+        if captured_fd and fd == captured_fd then
+          if not rename_called then
+            closed_before_rename = true
+          else
+            closed_after_rename = true
+          end
+        end
+        return real_close(fd)
+      end,
+      fs_rename = function()
+        rename_called = true
+        assert(not closed_before_rename, "tmp_fd fechado antes de fs_rename em caso de falha")
+        return nil, "EIO: simulated"
+      end,
+    }, function()
+      local ok, err = deps._write_build_file(pom, "<project/>")
+      assert(
+        ok == nil and err and err:find("could not replace", 1, true),
+        "falha de rename esperada: " .. tostring(err)
+      )
+      assert(closed_after_rename, "tmp_fd deveria ser fechado no cleanup após erro de rename")
+      assert(read_raw(pom) == before_fail)
+      assert((assert(vim.uv.fs_lstat(pom)).mode % 512) == mode_0600)
+    end)
+  end
+
+  -- 2) Destino alterado imediatamente antes do rename (após fs_fsync): conteúdo diferente e mesmo tamanho/metadata simulado
+  do
+    local dir = tempdir("race-dest-changed")
+    local pom = dir .. "/pom.xml"
+    write_raw(pom, MINIMAL_POM)
+    assert(vim.uv.fs_chmod(pom, mode_0600))
+    local concurrent_pom = MINIMAL_POM:gsub("</project>", "  <!-- concurrent -->\n</project>")
+    local real_fsync = vim.uv.fs_fsync
+    local rename_called = false
+    with_uv_mocks({
+      fs_fsync = function(fd)
+        local ok, err = real_fsync(fd)
+        write_raw(pom, concurrent_pom)
+        assert(vim.uv.fs_chmod(pom, mode_0600))
+        return ok, err
+      end,
+      fs_rename = function()
+        rename_called = true
+        return true
+      end,
+    }, function()
+      local ok, err = deps._write_build_file(pom, MINIMAL_POM .. "\n<!-- stale -->")
+      assert(
+        ok == nil and err and err:find("changed concurrently", 1, true),
+        "deveria abortar mudança concorrente: " .. tostring(err)
+      )
+      assert(not rename_called, "fs_rename não deveria ser chamado após mudança no destino")
+      assert(read_raw(pom) == concurrent_pom, "conteúdo concorrente foi sobrescrito")
+      assert((assert(vim.uv.fs_lstat(pom)).mode % 512) == mode_0600)
+    end)
+
+    -- Mesmo tamanho + mesmos metadados (simula fs_read devolvendo conteúdo modificado na releitura pré-rename)
+    local same_len_a = "<project><!-- AAAA --></project>\n"
+    local same_len_b = "<project><!-- BBBB --></project>\n"
+    write_raw(pom, same_len_a)
+    assert(vim.uv.fs_chmod(pom, mode_0600))
+    local real_read = vim.uv.fs_read
+    local fsync_done = false
+    rename_called = false
+    with_uv_mocks({
+      fs_fsync = function(fd)
+        fsync_done = true
+        return real_fsync(fd)
+      end,
+      fs_read = function(fd, size, offset)
+        local data, err = real_read(fd, size, offset)
+        if fsync_done and data == same_len_a then
+          return same_len_b, nil
+        end
+        return data, err
+      end,
+      fs_rename = function()
+        rename_called = true
+        return true
+      end,
+    }, function()
+      local ok, err = deps._write_build_file(pom, "<project><!-- MINE --></project>\n")
+      assert(
+        ok == nil and err and err:find("changed concurrently", 1, true),
+        "releitura de conteúdo deveria abortar: " .. tostring(err)
+      )
+      assert(not rename_called, "fs_rename não deveria rodar quando releitura diverge")
+    end)
+    assert(read_raw(pom) == same_len_a)
+  end
+
+  -- 3) Destino trocado por symlink imediatamente antes do rename (após fs_fsync)
+  do
+    local dir = tempdir("race-dest-symlink")
+    local pom = dir .. "/pom.xml"
+    local outside = dir .. "/outside.xml"
+    write_raw(pom, MINIMAL_POM)
+    write_raw(outside, "OUTSIDE KEEP")
+    local real_fsync = vim.uv.fs_fsync
+    local rename_called = false
+    with_uv_mocks({
+      fs_fsync = function(fd)
+        local ok, err = real_fsync(fd)
+        assert(vim.uv.fs_unlink(pom))
+        assert(vim.uv.fs_symlink(outside, pom))
+        return ok, err
+      end,
+      fs_rename = function()
+        rename_called = true
+        return true
+      end,
+    }, function()
+      local ok, err = deps._write_build_file(pom, MINIMAL_POM .. "\n<!-- x -->")
+      assert(
+        ok == nil and err and err:find("symlink", 1, true),
+        "deveria recusar destino trocado para symlink: " .. tostring(err)
+      )
+      assert(not rename_called, "fs_rename não deveria rodar quando destino virou symlink")
+      assert(vim.uv.fs_lstat(pom).type == "link")
+      assert(read_raw(outside) == "OUTSIDE KEEP")
+    end)
+  end
+
+  -- 4) Temp trocado por symlink antes do rename: recusa sem sobrescrever build nem remover symlink/alvo
+  do
+    local dir = tempdir("race-tmp-symlink-prerename")
+    local pom = dir .. "/pom.xml"
+    local victim = dir .. "/victim.txt"
+    write_raw(pom, MINIMAL_POM)
+    assert(vim.uv.fs_chmod(pom, mode_0600))
+    write_raw(victim, "VICTIM KEEP")
+
+    local captured_tmp_path, captured_fd
+    local fd_closed, rename_called = false, false
+    local real_mkstemp = vim.uv.fs_mkstemp
+    local real_fsync = vim.uv.fs_fsync
+    local real_close = vim.uv.fs_close
+    with_uv_mocks({
+      fs_mkstemp = function(tmpl)
+        local fd, path, err = real_mkstemp(tmpl)
+        if fd then
+          captured_fd, captured_tmp_path = fd, path
+        end
+        return fd, path, err
+      end,
+      fs_fsync = function(fd)
+        local ok, err = real_fsync(fd)
+        if fd == captured_fd then
+          assert(vim.uv.fs_unlink(captured_tmp_path))
+          assert(vim.uv.fs_symlink(victim, captured_tmp_path))
+        end
+        return ok, err
+      end,
+      fs_close = function(fd)
+        if fd == captured_fd then
+          fd_closed = true
+        end
+        return real_close(fd)
+      end,
+      fs_rename = function()
+        rename_called = true
+        return true
+      end,
+    }, function()
+      local ok, err = deps._write_build_file(pom, MINIMAL_POM .. "\n<!-- hijack -->")
+      assert(ok == nil and err and err:find("symlink", 1, true), "temp symlink deveria abortar: " .. tostring(err))
+      assert(not rename_called, "fs_rename não pode ser chamado com temp symlink")
+      assert(read_raw(pom) == MINIMAL_POM, "pom.xml foi alterado")
+      assert((assert(vim.uv.fs_lstat(pom)).mode % 512) == mode_0600)
+      assert(vim.uv.fs_lstat(captured_tmp_path).type == "link", "symlink estrangeiro no temp_path foi removido")
+      assert(read_raw(victim) == "VICTIM KEEP", "alvo do symlink foi alterado")
+      assert(fd_closed, "tmp_fd deveria ser fechado após abortar")
+    end)
+  end
+
+  -- 5) Temp trocado por arquivo regular estrangeiro antes do rename: aborta e nunca remove arquivo estrangeiro
+  do
+    local dir = tempdir("race-tmp-foreign-prerename")
+    local pom = dir .. "/pom.xml"
+    write_raw(pom, MINIMAL_POM)
+    assert(vim.uv.fs_chmod(pom, mode_0600))
+
+    local captured_tmp_path, captured_fd
+    local fd_closed, rename_called = false, false
+    local real_mkstemp = vim.uv.fs_mkstemp
+    local real_fsync = vim.uv.fs_fsync
+    local real_close = vim.uv.fs_close
+    with_uv_mocks({
+      fs_mkstemp = function(tmpl)
+        local fd, path, err = real_mkstemp(tmpl)
+        if fd then
+          captured_fd, captured_tmp_path = fd, path
+        end
+        return fd, path, err
+      end,
+      fs_fsync = function(fd)
+        local ok, err = real_fsync(fd)
+        if fd == captured_fd then
+          assert(vim.uv.fs_unlink(captured_tmp_path))
+          write_raw(captured_tmp_path, "FOREIGN USER FILE")
+        end
+        return ok, err
+      end,
+      fs_close = function(fd)
+        if fd == captured_fd then
+          fd_closed = true
+        end
+        return real_close(fd)
+      end,
+      fs_rename = function()
+        rename_called = true
+        return true
+      end,
+    }, function()
+      local ok, err = deps._write_build_file(pom, MINIMAL_POM .. "\n<!-- foreign -->")
+      assert(
+        ok == nil and err and err:find("replaced", 1, true),
+        "temp substituído deveria abortar: " .. tostring(err)
+      )
+      assert(not rename_called, "fs_rename não pode rodar com temp substituído")
+      assert(read_raw(pom) == MINIMAL_POM)
+      assert(read_raw(captured_tmp_path) == "FOREIGN USER FILE", "arquivo estrangeiro no temp_path foi apagado")
+      assert(fd_closed)
+    end)
+  end
+
+  -- 6) Temp trocado no boundary de falha de fs_rename (symlink e arquivo estrangeiro): cleanup nunca apaga caminho alheio
+  for _, kind in ipairs({ "symlink", "foreign" }) do
+    local dir = tempdir("race-cleanup-" .. kind)
+    local pom = dir .. "/pom.xml"
+    local victim = dir .. "/victim.txt"
+    write_raw(pom, MINIMAL_POM)
+    write_raw(victim, "KEEP TARGET")
+
+    local captured_tmp_path, captured_fd
+    local fd_closed = false
+    local real_mkstemp = vim.uv.fs_mkstemp
+    local real_close = vim.uv.fs_close
+    with_uv_mocks({
+      fs_mkstemp = function(tmpl)
+        local fd, path, err = real_mkstemp(tmpl)
+        if fd then
+          captured_fd, captured_tmp_path = fd, path
+        end
+        return fd, path, err
+      end,
+      fs_rename = function(src)
+        assert(src == captured_tmp_path)
+        assert(vim.uv.fs_unlink(src))
+        if kind == "symlink" then
+          assert(vim.uv.fs_symlink(victim, src))
+        else
+          write_raw(src, "FOREIGN AT CLEANUP")
+        end
+        return nil, "EACCES: simulated"
+      end,
+      fs_close = function(fd)
+        if fd == captured_fd then
+          fd_closed = true
+        end
+        return real_close(fd)
+      end,
+    }, function()
+      local ok, err = deps._write_build_file(pom, MINIMAL_POM .. "\n<!-- rename-fail -->")
+      assert(ok == nil and err and err:find("could not replace", 1, true))
+      assert(read_raw(pom) == MINIMAL_POM)
+      if kind == "symlink" then
+        assert(vim.uv.fs_lstat(captured_tmp_path).type == "link", "cleanup removeu symlink no boundary do rename")
+        assert(read_raw(victim) == "KEEP TARGET")
+      else
+        assert(
+          read_raw(captured_tmp_path) == "FOREIGN AT CLEANUP",
+          "cleanup removeu arquivo estrangeiro no boundary do rename"
+        )
+      end
+      assert(fd_closed)
+    end)
+  end
+
+  -- 7) Falha fechada quando não é possível provar propriedade do arquivo temporário (fs_fstat(tmp_fd) == nil)
+  do
+    local dir = tempdir("race-tmp-no-ownership")
+    local pom = dir .. "/pom.xml"
+    write_raw(pom, MINIMAL_POM)
+
+    local captured_tmp_path, captured_fd
+    local fd_closed, unlink_called, rename_called = false, false, false
+    local real_mkstemp = vim.uv.fs_mkstemp
+    local real_fstat = vim.uv.fs_fstat
+    local real_unlink = vim.uv.fs_unlink
+    local real_close = vim.uv.fs_close
+    with_uv_mocks({
+      fs_mkstemp = function(tmpl)
+        local fd, path, err = real_mkstemp(tmpl)
+        if fd then
+          captured_fd, captured_tmp_path = fd, path
+        end
+        return fd, path, err
+      end,
+      fs_fstat = function(fd)
+        if captured_fd and not fd_closed and fd == captured_fd then
+          return nil
+        end
+        return real_fstat(fd)
+      end,
+      fs_unlink = function(path)
+        if path == captured_tmp_path then
+          unlink_called = true
+        end
+        return real_unlink(path)
+      end,
+      fs_close = function(fd)
+        if captured_fd and not fd_closed and fd == captured_fd then
+          fd_closed = true
+        end
+        return real_close(fd)
+      end,
+      fs_rename = function()
+        rename_called = true
+        return true
+      end,
+    }, function()
+      local ok, err = deps._write_build_file(pom, MINIMAL_POM .. "\n<!-- no-own -->")
+      assert(
+        ok == nil and err and err:find("ownership", 1, true),
+        "deveria falhar fechado sem propriedade: " .. tostring(err)
+      )
+      assert(not rename_called)
+      assert(not unlink_called, "não deve fazer unlink quando propriedade não foi estabelecida")
+      assert(vim.uv.fs_lstat(captured_tmp_path) ~= nil)
+      assert(fd_closed)
+    end)
+    assert(read_raw(pom) == MINIMAL_POM)
+  end
+end
+
+write_build_file_race_regression_spec()
+
 -- ---------- restauração ----------
 
 vim.ui.select = real_select
@@ -3249,6 +4604,6 @@ end
 
 print(
   "deps_spec: OK (parsing/dedupe/BOM, inserção byte-a-byte LF+CRLF+indentação, escrita atômica, "
-    .. "Maven Central, Gradle estático, sync só com cliente, add/menu sem escrita ao cancelar)"
+    .. "Maven Central, Gradle estático + edição segura Groovy/Kotlin, sync só com cliente, add/menu sem escrita ao cancelar)"
 )
 vim.cmd("qa!")

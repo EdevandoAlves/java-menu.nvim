@@ -306,13 +306,15 @@ jdtls. Four entries:
                       entries plus gradle/libs.versions.toml, and reports
                       dynamic, interpolated, helper or scoped forms as
                       partial notes without executing Gradle.
-                    - Add dependency... (Maven only; disabled on Gradle):
-                      optional Maven Central search or offline manual entry,
-                      dedupe by literal groupId+artifactId, honest BOM/parent
-                      version notes, refuses unsaved pom.xml buffers,
-                      byte/comment-preserving surgical insertion after
-                      confirmation, and per-buffer JDTLS sync
-                      (`java/projectConfigurationUpdate`) when attached.
+                    - Add dependency...: optional Maven Central search or
+                      offline manual entry. Maven respects exact local
+                      dependencyManagement and notes unresolved parent/BOM
+                      coverage. Gradle inserts literal coordinates in a
+                      conservative Groovy/Kotlin subset; version catalogs
+                      remain unchanged and ambiguous forms are refused. Both
+                      check duplicates and unsaved buffers, show confirmation,
+                      preserve comments and permissions, and request per-buffer
+                      JDTLS sync when attached.
                     - Open build file: opens pom.xml / build.gradle(.kts).
                     - Sync JDTLS: re-imports the build file on the buffer's
                       attached JDTLS client (disabled when not attached).
@@ -383,10 +385,11 @@ generate delegate methods.
   and notes this explicitly when <version> is omitted without an exact local
   <dependencyManagement> match. Maven <profiles> declarations are listed as
   conditional without evaluating activation, and ${...} properties are not
-  evaluated. Gradle is read-only
-  (editing disabled); static parsing covers Groovy build.gradle and Kotlin
-  DSL build.gradle.kts literal/catalog entries and reports dynamic,
-  interpolated, helper or scoped forms as partial without running Gradle.
+  evaluated. Gradle inspection and conservative editing are static: dynamic
+  or ambiguous forms are refused for editing, catalogs are not edited and
+  Gradle is not run. Files are rechecked before replacement, but path-based
+  APIs cannot guarantee conflict-free replacement against an uncooperative
+  concurrent writer in the final instant.
 - Project creation runs no git init and installs/configures no tools.
 - Rename Package / Move Package are disabled (see |java-menu-refactor|).
 - Tested on Linux only; no Windows/macOS validation.

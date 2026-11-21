@@ -1,21 +1,24 @@
 -- java_menu/deps.lua
--- <leader>jp → Dependencies: inspect declared dependencies and add one to a
--- Maven pom.xml with surgical, byte-preserving edits.
+-- <leader>jp → Dependencies: inspect declared dependencies and add one to
+-- Maven (pom.xml) or supported static Gradle (build.gradle / build.gradle.kts)
+-- build files with surgical, byte-preserving edits.
 --
 -- Two layers, like create.lua:
 --
---   * core  — pure, testable helpers exposed as M._*: comment-aware POM
---     scanning, dependencyManagement/BOM awareness, indentation detection,
---     insertion that preserves every byte outside the insertion point,
---     version-catalog/Gradle static parsing and the Maven Central helpers.
+--   * core  — pure, testable helpers exposed as M._*: comment-aware POM and
+--     Gradle (Groovy/Kotlin) scanning, dependencyManagement/BOM/platform
+--     awareness, indentation & style detection, surgical insertion that
+--     preserves every byte outside the insertion point, version-catalog static
+--     parsing (read-only) and the Maven Central helpers.
 --   * shell — the read-only report and the interactive add flow. Cancelling
 --     any step writes nothing; the write happens only after the final
---     confirmation and only for Maven.
+--     confirmation and refuses symlinks, unsaved buffers and ambiguous/dynamic
+--     Gradle constructs.
 --
 -- Nothing here runs Maven/Gradle to edit files, installs anything, parses XML
 -- with a real parser (comments are masked and byte offsets are kept, so the
--- original text is never re-serialized) or edits Gradle build files (read-only
--- MVP). The JDTLS re-import is the LSP request validated against nvim-jdtls
+-- original text is never re-serialized) or executes Groovy/Kotlin scripts.
+-- The JDTLS re-import is the LSP request validated against nvim-jdtls
 -- (`java/projectConfigurationUpdate`), issued per buffer on the attached
 -- client; no other client is touched.
 
@@ -48,16 +51,52 @@ local GRADLE_CONFIGS = {
   classpath = true,
 }
 
+local GRADLE_EDIT_CONFIGS = {
+  implementation = true,
+  api = true,
+  compileOnly = true,
+  compileOnlyApi = true,
+  runtimeOnly = true,
+  annotationProcessor = true,
+  testImplementation = true,
+  testCompileOnly = true,
+  testRuntimeOnly = true,
+  testAnnotationProcessor = true,
+  developmentOnly = true,
+  testAndDevelopmentOnly = true,
+}
+
 local MAVEN_SEARCH_BASE = "https://search.maven.org/solrsearch/select?q="
 
 local NO_PROJECT_REASON = "no Maven/Gradle project from this directory"
-local GRADLE_EDIT_REASON = "Gradle build file editing is not supported (read-only MVP) — use Open build file"
+local GRADLE_EDIT_REASON = "Gradle build file uses unsupported or dynamic constructs — use Open build file"
 local NO_CLIENT_REASON = "jdtls is not attached to this buffer"
 
 -- ---------- small helpers ----------
 
 local function trim(value)
   return vim.trim(value or "")
+end
+
+---Read all bytes from an already-open file descriptor starting at offset 0.
+---@param fd integer
+---@param path string
+---@return string|nil data, string|nil err
+local function read_fd_all(fd, path)
+  local chunks = {}
+  local offset = 0
+  while true do
+    local chunk, read_err = vim.uv.fs_read(fd, 65536, offset)
+    if not chunk then
+      return nil, "could not read " .. path .. (read_err and (": " .. read_err) or "")
+    end
+    if chunk == "" then
+      break
+    end
+    chunks[#chunks + 1] = chunk
+    offset = offset + #chunk
+  end
+  return table.concat(chunks)
 end
 
 ---Raw file contents (bytes preserved, unlike readfile + concat).
@@ -73,34 +112,101 @@ local function read_file(path)
     vim.uv.fs_close(fd)
     return nil, "could not stat " .. path
   end
-  local data = ""
-  if stat.size > 0 then
-    local chunk, read_err = vim.uv.fs_read(fd, stat.size, 0)
-    if not chunk then
-      vim.uv.fs_close(fd)
-      return nil, "could not read " .. path .. (read_err and (": " .. read_err) or "")
-    end
-    data = chunk
+  if stat.type ~= "file" then
+    vim.uv.fs_close(fd)
+    return nil, path .. " is not a regular file"
   end
+  local data, read_err = read_fd_all(fd, path)
   vim.uv.fs_close(fd)
-  return data
+  return data, read_err
 end
 
----Loaded buffer whose real path is `path` (nil when it is not open).
+---@param a table|nil
+---@param b table|nil
+---@return boolean
+local function stat_matches(a, b)
+  if not a or not b then
+    return false
+  end
+  if a.type ~= "file" or b.type ~= "file" or a.dev == nil or a.ino == nil then
+    return false
+  end
+  if a.dev ~= b.dev or a.ino ~= b.ino or a.size ~= b.size or a.mode ~= b.mode then
+    return false
+  end
+  local am, bm = a.mtime, b.mtime
+  if (am == nil) ~= (bm == nil) then
+    return false
+  end
+  if am and bm and (am.sec ~= bm.sec or am.nsec ~= bm.nsec) then
+    return false
+  end
+  local ac, bc = a.ctime, b.ctime
+  if (ac == nil) ~= (bc == nil) then
+    return false
+  end
+  if ac and bc and (ac.sec ~= bc.sec or ac.nsec ~= bc.nsec) then
+    return false
+  end
+  return true
+end
+
+---Read a regular non-symlink file, verifying the opened fd matches `fs_lstat`
+---before and after reading.
 ---@param path string
----@return integer|nil
-local function loaded_buffer(path)
+---@return string|nil data, string|nil err, table|nil stat
+local function read_regular_file(path)
+  local name = vim.fs.basename(path)
+  local lstat = vim.uv.fs_lstat(path)
+  if not lstat then
+    return nil, name .. " does not exist"
+  end
+  if lstat.type == "link" then
+    return nil, name .. " is a symlink — refusing to modify"
+  end
+  if lstat.type ~= "file" then
+    return nil, name .. " is not a regular file"
+  end
+  if lstat.dev == nil or lstat.ino == nil then
+    return nil, "could not establish ownership of " .. name
+  end
+  local fd, open_err = vim.uv.fs_open(path, "r", 0)
+  if not fd then
+    return nil, "could not open " .. name .. (open_err and (": " .. open_err) or "")
+  end
+  local fstat = vim.uv.fs_fstat(fd)
+  if not stat_matches(fstat, lstat) then
+    vim.uv.fs_close(fd)
+    return nil, name .. " changed or became a symlink while reading"
+  end
+  local data, read_err = read_fd_all(fd, path)
+  local post_fstat = vim.uv.fs_fstat(fd)
+  vim.uv.fs_close(fd)
+  if not data then
+    return nil, read_err
+  end
+  if not stat_matches(post_fstat, fstat) then
+    return nil, name .. " changed while reading"
+  end
+  return data, nil, post_fstat
+end
+
+---All loaded buffers whose real path is `path`.
+---@param path string
+---@return integer[]
+local function loaded_buffers(path)
   local target = vim.fs.normalize(vim.uv.fs_realpath(path) or path)
+  local matches = {}
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     local name = vim.api.nvim_buf_get_name(buf)
     if name ~= "" and vim.api.nvim_buf_is_loaded(buf) then
       local candidate = vim.fs.normalize(vim.uv.fs_realpath(name) or name)
       if candidate == target then
-        return buf
+        matches[#matches + 1] = buf
       end
     end
   end
-  return nil
+  return matches
 end
 
 local function relpath(root, path)
@@ -170,20 +276,39 @@ function M._resolve_target(bufnr, module_dir)
 
   local build_file
   local is_kotlin_dsl = false
+  local ambiguous_build_files = false
+  local missing_module_build_file = false
   if tool == "maven" then
     build_file = module .. "/pom.xml"
-  elseif vim.fn.filereadable(module .. "/build.gradle") == 1 then
-    build_file = module .. "/build.gradle"
-  elseif vim.fn.filereadable(module .. "/build.gradle.kts") == 1 then
-    build_file = module .. "/build.gradle.kts"
-    is_kotlin_dsl = true
-  elseif vim.fn.filereadable(root .. "/build.gradle") == 1 then
-    build_file = root .. "/build.gradle"
-  elseif vim.fn.filereadable(root .. "/build.gradle.kts") == 1 then
-    build_file = root .. "/build.gradle.kts"
-    is_kotlin_dsl = true
   else
-    build_file = module .. "/build.gradle"
+    local mod_groovy = vim.uv.fs_lstat(module .. "/build.gradle") ~= nil
+    local mod_kts = vim.uv.fs_lstat(module .. "/build.gradle.kts") ~= nil
+    if mod_groovy and mod_kts then
+      ambiguous_build_files = true
+    end
+    if vim.fn.filereadable(module .. "/build.gradle") == 1 then
+      build_file = module .. "/build.gradle"
+    elseif vim.fn.filereadable(module .. "/build.gradle.kts") == 1 then
+      build_file = module .. "/build.gradle.kts"
+      is_kotlin_dsl = true
+    else
+      if module ~= root and not mod_groovy and not mod_kts then
+        missing_module_build_file = true
+      end
+      local root_groovy = vim.uv.fs_lstat(root .. "/build.gradle") ~= nil
+      local root_kts = vim.uv.fs_lstat(root .. "/build.gradle.kts") ~= nil
+      if root_groovy and root_kts and not mod_groovy and not mod_kts then
+        ambiguous_build_files = true
+      end
+      if vim.fn.filereadable(root .. "/build.gradle") == 1 then
+        build_file = root .. "/build.gradle"
+      elseif vim.fn.filereadable(root .. "/build.gradle.kts") == 1 then
+        build_file = root .. "/build.gradle.kts"
+        is_kotlin_dsl = true
+      else
+        build_file = module .. "/build.gradle"
+      end
+    end
   end
 
   local catalog_file
@@ -198,6 +323,8 @@ function M._resolve_target(bufnr, module_dir)
     module = module,
     build_file = build_file,
     is_kotlin_dsl = is_kotlin_dsl,
+    ambiguous_build_files = ambiguous_build_files,
+    missing_module_build_file = missing_module_build_file,
     catalog_file = catalog_file,
   }
 end
@@ -953,45 +1080,182 @@ function M._insert_maven_dependency(text, dep)
   return new_text, meta, nil
 end
 
----Write a POM atomically, refusing to clobber unsaved buffer changes.
----@param pom_path string
+---Write a build file by temp-file + rename, refusing symlinks, unsaved buffer
+---changes, and concurrent/stale disk modifications while preserving file mode.
+---Note: Neovim's `vim.uv` exposes path-based `fs_rename`/`fs_open`/`fs_unlink`
+---without `O_NOFOLLOW`, `openat`/`unlinkat`, or `renameat2`, so a narrow TOCTOU
+---window remains between the final pre-rename checks and `fs_rename` against an
+---uncooperative external writer.
+---@param build_path string
 ---@param new_text string
+---@param opts { expected_text?: string }|nil
 ---@return boolean|nil ok, string|nil err
-function M._write_pom(pom_path, new_text)
-  if type(pom_path) ~= "string" or pom_path == "" or type(new_text) ~= "string" then
-    return nil, "pom path and content are required"
+function M._write_build_file(build_path, new_text, opts)
+  if type(build_path) ~= "string" or build_path == "" or type(new_text) ~= "string" then
+    return nil, "build file path and content are required"
+  end
+  opts = opts or {}
+  local expected_text = opts.expected_text
+  if expected_text ~= nil and type(expected_text) ~= "string" then
+    return nil, "expected_text must be a string"
   end
 
-  local buf = loaded_buffer(pom_path)
-  if buf and vim.bo[buf].modified then
-    return nil, "pom.xml has unsaved changes — save or discard them first"
+  local name = vim.fs.basename(build_path)
+  local current_bytes, read_err, orig_fstat = read_regular_file(build_path)
+  if not current_bytes or not orig_fstat or type(orig_fstat.mode) ~= "number" then
+    return nil, read_err or ("could not verify " .. name)
+  end
+  if expected_text ~= nil and current_bytes ~= expected_text then
+    return nil, name .. " changed on disk since it was read — aborting write without overwriting"
   end
 
-  local tmp = pom_path .. ".java-menu-tmp"
-  local fd, open_err = vim.uv.fs_open(tmp, "w", 420)
-  if not fd then
-    return nil, "could not write a temporary file next to " .. pom_path .. (open_err and (": " .. open_err) or "")
-  end
-  local written, write_err = vim.uv.fs_write(fd, new_text, 0)
-  vim.uv.fs_close(fd)
-  if not written then
-    vim.uv.fs_unlink(tmp)
-    return nil, "could not write the POM content" .. (write_err and (": " .. write_err) or "")
+  for _, buf in ipairs(loaded_buffers(build_path)) do
+    if vim.bo[buf].modified then
+      return nil, name .. " has unsaved changes — save or discard them first"
+    end
   end
 
-  local renamed, rename_err = vim.uv.fs_rename(tmp, pom_path)
+  local orig_perm = orig_fstat.mode % 512
+  local dir = vim.fs.dirname(build_path)
+  local prefix = name:sub(1, 64)
+  local tmp_fd, tmp_path, mk_err = vim.uv.fs_mkstemp(dir .. "/." .. prefix .. ".java-menu-XXXXXX")
+  if not tmp_fd or not tmp_path then
+    return nil, "could not create a temporary file next to " .. build_path .. (mk_err and (": " .. mk_err) or "")
+  end
+
+  local tmp_stat = vim.uv.fs_fstat(tmp_fd)
+  if not tmp_stat or tmp_stat.type ~= "file" or tmp_stat.dev == nil or tmp_stat.ino == nil then
+    -- Fail closed: ownership cannot be established, so never unlink `tmp_path`.
+    pcall(vim.uv.fs_close, tmp_fd)
+    return nil, "could not establish ownership of temporary file for " .. name
+  end
+
+  local function verify_tmp_owned()
+    local st = tmp_path and vim.uv.fs_lstat(tmp_path) or nil
+    if not st then
+      return false, "temporary file for " .. name .. " disappeared"
+    end
+    if st.type == "link" then
+      return false, "temporary file for " .. name .. " became a symlink — aborting"
+    end
+    if st.type ~= "file" then
+      return false, "temporary path for " .. name .. " is not a regular file — aborting"
+    end
+    if st.dev ~= tmp_stat.dev or st.ino ~= tmp_stat.ino then
+      return false, "temporary file for " .. name .. " was replaced — aborting"
+    end
+    return true, nil
+  end
+
+  local function cleanup_tmp()
+    -- Recheck lstat against recorded dev/ino while `tmp_fd` is still open so we
+    -- never unlink a symlink or foreign file that replaced `tmp_path`.
+    if tmp_path then
+      local ok_owned, owned = pcall(verify_tmp_owned)
+      if ok_owned and owned then
+        pcall(vim.uv.fs_unlink, tmp_path)
+      end
+      tmp_path = nil
+    end
+    if tmp_fd then
+      pcall(vim.uv.fs_close, tmp_fd)
+      tmp_fd = nil
+    end
+  end
+
+  local initial_tmp_ok, initial_tmp_err = verify_tmp_owned()
+  if not initial_tmp_ok then
+    cleanup_tmp()
+    return nil, initial_tmp_err
+  end
+
+  local offset = 0
+  local total = #new_text
+  while offset < total do
+    local chunk = offset == 0 and new_text or new_text:sub(offset + 1)
+    local written, write_err = vim.uv.fs_write(tmp_fd, chunk, offset)
+    if not written or written <= 0 then
+      cleanup_tmp()
+      return nil, "could not write the build file content" .. (write_err and (": " .. write_err) or "")
+    end
+    offset = offset + written
+  end
+
+  local chmod_ok, chmod_err = vim.uv.fs_fchmod(tmp_fd, orig_perm)
+  if not chmod_ok then
+    cleanup_tmp()
+    return nil, "could not preserve permissions on " .. name .. (chmod_err and (": " .. chmod_err) or "")
+  end
+
+  local sync_ok, sync_err = vim.uv.fs_fsync(tmp_fd)
+  if not sync_ok and sync_err and not sync_err:find("EINVAL", 1, true) then
+    cleanup_tmp()
+    return nil, "could not flush temporary file for " .. name .. ": " .. sync_err
+  end
+
+  for _, buf in ipairs(loaded_buffers(build_path)) do
+    if vim.bo[buf].modified then
+      cleanup_tmp()
+      return nil, name .. " has unsaved changes — save or discard them first"
+    end
+  end
+
+  local pre_bytes, pre_err, pre_fstat = read_regular_file(build_path)
+  if not pre_bytes or not pre_fstat then
+    cleanup_tmp()
+    return nil, pre_err or (name .. " changed or disappeared before replace — aborting")
+  end
+  if
+    not stat_matches(pre_fstat, orig_fstat)
+    or pre_bytes ~= current_bytes
+    or (expected_text ~= nil and pre_bytes ~= expected_text)
+  then
+    cleanup_tmp()
+    return nil, name .. " changed concurrently on disk — aborting write without overwriting"
+  end
+
+  local tmp_ok, tmp_err = verify_tmp_owned()
+  if not tmp_ok then
+    cleanup_tmp()
+    return nil, tmp_err
+  end
+  local tmp_fstat_now = vim.uv.fs_fstat(tmp_fd)
+  if
+    not tmp_fstat_now
+    or tmp_fstat_now.type ~= "file"
+    or tmp_fstat_now.dev ~= tmp_stat.dev
+    or tmp_fstat_now.ino ~= tmp_stat.ino
+    or tmp_fstat_now.size ~= total
+    or type(tmp_fstat_now.mode) ~= "number"
+    or (tmp_fstat_now.mode % 512) ~= orig_perm
+  then
+    cleanup_tmp()
+    return nil, "temporary file state changed before replace for " .. name
+  end
+
+  -- Keep `tmp_fd` open through `fs_rename` so the temp inode cannot be recycled
+  -- before rename or before `cleanup_tmp()` verifies ownership.
+  local renamed, rename_err = vim.uv.fs_rename(tmp_path, build_path)
   if not renamed then
-    vim.uv.fs_unlink(tmp)
-    return nil, "could not replace pom.xml" .. (rename_err and (": " .. rename_err) or "")
+    cleanup_tmp()
+    return nil, "could not replace " .. name .. (rename_err and (": " .. rename_err) or "")
   end
 
-  if buf and vim.api.nvim_buf_is_loaded(buf) then
-    vim.api.nvim_buf_call(buf, function()
-      vim.cmd("silent edit!")
-    end)
+  pcall(vim.uv.fs_close, tmp_fd)
+  tmp_fd = nil
+  tmp_path = nil
+
+  for _, buf in ipairs(loaded_buffers(build_path)) do
+    if vim.api.nvim_buf_is_loaded(buf) and not vim.bo[buf].modified then
+      vim.api.nvim_buf_call(buf, function()
+        vim.cmd("silent edit!")
+      end)
+    end
   end
   return true, nil
 end
+
+M._write_pom = M._write_build_file
 
 -- ---------- Maven Central (optional, async) ----------
 
@@ -1697,18 +1961,22 @@ local KOTLIN_NON_DEP_BLOCKS = {
   artifactTypes = true,
 }
 
----Shadow copy of `text` with Kotlin line (`//`) and nested block (`/* ... */`)
+---Shadow copy of `text` with C-like line (`//`) and block (`/* ... */`)
 ---comments replaced by spaces. Preserves byte length and line endings while
----respecting string (`"..."`, `"""..."""`) and char (`'...'`) literals.
+---respecting string and char literals.
 ---@param text string
+---@param opts { nested_comments: boolean, triple_single: boolean, groovy_slashy?: boolean }
 ---@return string masked
 ---@return boolean has_unterminated_comment
-function M._mask_kotlin(text)
+---@return boolean has_slashy
+local function mask_c_like_comments(text, opts)
   text = text or ""
   local n = #text
   local out = {}
   local i = 1
   local unterminated = false
+  local has_slashy = false
+  local special_pat = opts.groovy_slashy and "[\"'/$]" or "[\"'/]"
 
   while i <= n do
     local ch = text:sub(i, i)
@@ -1737,19 +2005,47 @@ function M._mask_kotlin(text)
         i = j
       end
     elseif ch == "'" then
-      local j = i + 1
+      if opts.triple_single and text:sub(i, i + 2) == "'''" then
+        local close_s = text:find("'''", i + 3, true)
+        local stop = close_s and (close_s + 2) or n
+        out[#out + 1] = text:sub(i, stop)
+        i = stop + 1
+      else
+        local j = i + 1
+        while j <= n do
+          local c = text:sub(j, j)
+          if c == "\\" then
+            j = j + 2
+          elseif c == "'" then
+            j = j + 1
+            break
+          elseif c == "\n" or c == "\r" then
+            break
+          else
+            j = j + 1
+          end
+        end
+        out[#out + 1] = text:sub(i, j - 1)
+        i = j
+      end
+    elseif opts.groovy_slashy and ch == "$" and text:sub(i + 1, i + 1) == "/" then
+      has_slashy = true
+      local j = i + 2
+      local closed = false
       while j <= n do
-        local c = text:sub(j, j)
-        if c == "\\" then
+        local pair = text:sub(j, j + 1)
+        if pair == "$$" or pair == "$/" then
           j = j + 2
-        elseif c == "'" then
-          j = j + 1
-          break
-        elseif c == "\n" or c == "\r" then
+        elseif pair == "/$" then
+          closed = true
+          j = j + 2
           break
         else
           j = j + 1
         end
+      end
+      if not closed then
+        unterminated = true
       end
       out[#out + 1] = text:sub(i, j - 1)
       i = j
@@ -1763,7 +2059,7 @@ function M._mask_kotlin(text)
       local j = i + 2
       while j <= n and depth > 0 do
         local pair = text:sub(j, j + 1)
-        if pair == "/*" then
+        if opts.nested_comments and pair == "/*" then
           depth = depth + 1
           j = j + 2
         elseif pair == "*/" then
@@ -1778,21 +2074,104 @@ function M._mask_kotlin(text)
       end
       out[#out + 1] = (text:sub(i, j - 1):gsub("[^\r\n]", " "))
       i = j
+    elseif opts.groovy_slashy and ch == "/" then
+      has_slashy = true
+      out[#out + 1] = ch
+      i = i + 1
     else
-      local next_special = text:find("[\"'/]", i + 1)
+      local next_special = text:find(special_pat, i + 1)
       local stop = next_special and (next_special - 1) or n
       out[#out + 1] = text:sub(i, stop)
       i = stop + 1
     end
   end
 
-  return table.concat(out), unterminated
+  return table.concat(out), unterminated, has_slashy
 end
 
----Tokenize a comment-masked Kotlin DSL string into a flat token list.
+---Shadow copy of `text` with Kotlin line (`//`) and nested block (`/* ... */`)
+---comments replaced by spaces. Preserves byte length and line endings while
+---respecting string (`"..."`, `"""..."""`) and char (`'...'`) literals.
+---@param text string
+---@return string masked
+---@return boolean has_unterminated_comment
+function M._mask_kotlin(text)
+  local masked, unterminated = mask_c_like_comments(text, { nested_comments = true, triple_single = false })
+  return masked, unterminated
+end
+
+---Shadow copy of `text` with Groovy line (`//`) and block (`/* ... */`)
+---comments replaced by spaces. Preserves byte length and line endings while
+---respecting Groovy single/double/triple-quoted strings and flagging slashy/dollar-slashy constructs.
+---@param text string
+---@return string masked
+---@return boolean has_unterminated_comment
+---@return boolean has_slashy
+function M._mask_groovy(text)
+  return mask_c_like_comments(text, { nested_comments = false, triple_single = true, groovy_slashy = true })
+end
+
 ---@param masked string
+---@param i integer
+---@param quote_char string
+---@param check_interp boolean
+---@return table token, integer next_pos
+local function scan_quoted_string(masked, i, quote_char, check_interp)
+  local n = #masked
+  local j = i + 1
+  local decoded = {}
+  local interpolated = false
+  local closed = false
+  while j <= n do
+    local c = masked:sub(j, j)
+    if c == "\\" then
+      if j + 1 <= n then
+        local nxt = masked:sub(j + 1, j + 1)
+        if nxt == "n" then
+          decoded[#decoded + 1] = "\n"
+        elseif nxt == "r" then
+          decoded[#decoded + 1] = "\r"
+        elseif nxt == "t" then
+          decoded[#decoded + 1] = "\t"
+        else
+          decoded[#decoded + 1] = nxt
+        end
+        j = j + 2
+      else
+        j = j + 1
+        break
+      end
+    elseif c == quote_char then
+      closed = true
+      j = j + 1
+      break
+    elseif c == "\n" or c == "\r" then
+      break
+    else
+      if check_interp and c == "$" and j + 1 <= n and masked:sub(j + 1, j + 1):match("[%a_{]") then
+        interpolated = true
+      end
+      decoded[#decoded + 1] = c
+      j = j + 1
+    end
+  end
+  return {
+    kind = "string",
+    quote = quote_char,
+    value = table.concat(decoded),
+    interpolated = interpolated,
+    unterminated = not closed,
+    start_pos = i,
+    end_pos = j - 1,
+  },
+    j
+end
+
+---Tokenize a comment-masked Gradle DSL string (Kotlin or Groovy) into a flat token list.
+---@param masked string
+---@param is_kotlin_dsl boolean
 ---@return table[]
-local function tokenize_kotlin(masked)
+local function tokenize_gradle(masked, is_kotlin_dsl)
   local n = #masked
   local tokens = {}
   local i = 1
@@ -1811,6 +2190,7 @@ local function tokenize_kotlin(masked)
         local content = close_s and masked:sub(i + 3, close_s - 1) or masked:sub(i + 3)
         tokens[#tokens + 1] = {
           kind = "string",
+          quote = '"',
           value = content,
           interpolated = content:find("%$[%a_{]") ~= nil,
           unterminated = close_s == nil,
@@ -1819,80 +2199,56 @@ local function tokenize_kotlin(masked)
         }
         i = stop + 1
       else
+        local tok, nxt = scan_quoted_string(masked, i, '"', true)
+        tokens[#tokens + 1] = tok
+        i = nxt
+      end
+    elseif ch == "'" then
+      if not is_kotlin_dsl and masked:sub(i, i + 2) == "'''" then
+        local close_s = masked:find("'''", i + 3, true)
+        local stop = close_s and (close_s + 2) or n
+        local content = close_s and masked:sub(i + 3, close_s - 1) or masked:sub(i + 3)
+        tokens[#tokens + 1] = {
+          kind = "string",
+          quote = "'",
+          value = content,
+          interpolated = false,
+          unterminated = close_s == nil,
+          start_pos = i,
+          end_pos = stop,
+        }
+        i = stop + 1
+      elseif not is_kotlin_dsl then
+        local tok, nxt = scan_quoted_string(masked, i, "'", false)
+        tokens[#tokens + 1] = tok
+        i = nxt
+      else
         local j = i + 1
-        local decoded = {}
-        local interpolated = false
-        local unterminated = false
+        local closed = false
         while j <= n do
           local c = masked:sub(j, j)
           if c == "\\" then
-            if j + 1 <= n then
-              local nxt = masked:sub(j + 1, j + 1)
-              if nxt == "n" then
-                decoded[#decoded + 1] = "\n"
-              elseif nxt == "r" then
-                decoded[#decoded + 1] = "\r"
-              elseif nxt == "t" then
-                decoded[#decoded + 1] = "\t"
-              else
-                decoded[#decoded + 1] = nxt
-              end
-              j = j + 2
-            else
-              unterminated = true
-              j = j + 1
-              break
-            end
-          elseif c == '"' then
+            j = j + 2
+          elseif c == "'" then
+            closed = true
             j = j + 1
             break
           elseif c == "\n" or c == "\r" then
-            unterminated = true
             break
           else
-            if c == "$" and j + 1 <= n and masked:sub(j + 1, j + 1):match("[%a_{]") then
-              interpolated = true
-            end
-            decoded[#decoded + 1] = c
             j = j + 1
           end
         end
-        if j > n and (n == 0 or masked:sub(n, n) ~= '"') then
-          unterminated = true
-        end
         tokens[#tokens + 1] = {
-          kind = "string",
-          value = table.concat(decoded),
-          interpolated = interpolated,
-          unterminated = unterminated,
+          kind = "char",
+          value = masked:sub(i, j - 1),
+          unterminated = not closed,
           start_pos = i,
           end_pos = j - 1,
         }
         i = j
       end
-    elseif ch == "'" then
-      local j = i + 1
-      while j <= n do
-        local c = masked:sub(j, j)
-        if c == "\\" then
-          j = j + 2
-        elseif c == "'" then
-          j = j + 1
-          break
-        elseif c == "\n" or c == "\r" then
-          break
-        else
-          j = j + 1
-        end
-      end
-      tokens[#tokens + 1] = {
-        kind = "char",
-        value = masked:sub(i, j - 1),
-        start_pos = i,
-        end_pos = j - 1,
-      }
-      i = j
-    elseif ch == "`" then
+    elseif ch == "`" and is_kotlin_dsl then
       local close_s = masked:find("`", i + 1, true)
       local nl = masked:find("[\r\n]", i + 1)
       local stop
@@ -1942,6 +2298,13 @@ local function tokenize_kotlin(masked)
   end
 
   return tokens
+end
+
+---Tokenize a comment-masked Kotlin DSL string into a flat token list.
+---@param masked string
+---@return table[]
+local function tokenize_kotlin(masked)
+  return tokenize_gradle(masked, true)
 end
 
 ---@param masked string
@@ -2696,6 +3059,967 @@ function M._parse_kotlin_gradle_dependencies(text, catalog)
   return deps, notes
 end
 
+-- ---------- Gradle safe static analysis & surgical editing ----------
+
+local GRADLE_EDIT_KEYWORDS = {
+  ["if"] = true,
+  ["else"] = true,
+  ["for"] = true,
+  ["while"] = true,
+  when = true,
+  switch = true,
+  try = true,
+  catch = true,
+  finally = true,
+  val = true,
+  var = true,
+  def = true,
+  final = true,
+  ["return"] = true,
+}
+
+---@param value any
+---@return boolean
+local function invalid_gradle_value(value)
+  if type(value) ~= "string" or value == "" then
+    return true
+  end
+  return value:find("[%s\"'%$:\\%c]") ~= nil
+end
+
+---@param tokens table[]
+---@return boolean
+local function check_balanced_delimiters(tokens)
+  local stack = {}
+  local closing = { [")"] = "(", ["]"] = "[", ["}"] = "{" }
+  for _, tok in ipairs(tokens) do
+    if tok.kind == "punct" then
+      if tok.value == "(" or tok.value == "[" or tok.value == "{" then
+        stack[#stack + 1] = tok.value
+      elseif closing[tok.value] then
+        if #stack == 0 or stack[#stack] ~= closing[tok.value] then
+          return false
+        end
+        stack[#stack] = nil
+      end
+    end
+  end
+  return #stack == 0
+end
+
+---@param stmt_tokens table[]
+---@return boolean
+local function is_gradle_apply_from_stmt(stmt_tokens)
+  if is_kotlin_apply_from_stmt(stmt_tokens) then
+    return true
+  end
+  for k = 1, #stmt_tokens - 2 do
+    if stmt_tokens[k].kind == "ident" and stmt_tokens[k].value == "apply" then
+      for j = k + 1, #stmt_tokens - 1 do
+        local cur = stmt_tokens[j]
+        local nxt = stmt_tokens[j + 1]
+        if
+          cur.kind == "ident"
+          and cur.value == "from"
+          and nxt.kind == "punct"
+          and (nxt.value == ":" or nxt.value == "=")
+        then
+          return true
+        end
+      end
+    end
+  end
+  return false
+end
+
+---@param tokens table[]
+---@param open_brace_idx integer
+---@param close_brace_idx integer|nil
+---@return boolean
+local function gradle_block_has_apply_from(tokens, open_brace_idx, close_brace_idx)
+  if block_has_apply_from(tokens, open_brace_idx, close_brace_idx) then
+    return true
+  end
+  local stop = close_brace_idx and (close_brace_idx - 1) or #tokens
+  for k = open_brace_idx + 1, stop do
+    local tok = tokens[k]
+    if tok.kind == "ident" and tok.value == "from" then
+      local nxt = next_non_newline(tokens, k + 1)
+      if nxt and (nxt.kind == "string" or (nxt.kind == "punct" and nxt.value == ":")) then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+---@param masked string
+---@return string
+local function detect_gradle_indent_unit(masked)
+  if masked:find("\n\t", 1, true) then
+    return "\t"
+  end
+  local min_spaces
+  local pos = masked:find("\n", 1, true)
+  while pos do
+    local line_start = pos + 1
+    local next_nl = masked:find("\n", line_start, true)
+    local line_end = next_nl and (next_nl - 1) or #masked
+    local line = masked:sub(line_start, line_end)
+    local spaces = line:match("^( +)%S")
+    if spaces and (min_spaces == nil or #spaces < min_spaces) then
+      min_spaces = #spaces
+    end
+    pos = next_nl
+  end
+  return min_spaces and string.rep(" ", min_spaces) or "  "
+end
+
+---@param arg_tokens table[]
+---@return boolean
+local function is_static_project_arg(arg_tokens)
+  if #arg_tokens >= 3 and arg_tokens[1].kind == "ident" and arg_tokens[1].value == "projects" then
+    for i = 2, #arg_tokens, 2 do
+      local dot = arg_tokens[i]
+      local seg = arg_tokens[i + 1]
+      if not dot or dot.kind ~= "punct" or dot.value ~= "." or not seg or seg.kind ~= "ident" then
+        return false
+      end
+    end
+    return #arg_tokens % 2 == 1
+  end
+  if
+    #arg_tokens >= 4
+    and arg_tokens[1].kind == "ident"
+    and arg_tokens[1].value == "project"
+    and arg_tokens[2].kind == "punct"
+    and arg_tokens[2].value == "("
+    and find_matching_delim(arg_tokens, 2, "(", ")") == #arg_tokens
+  then
+    local inner = vim.list_slice(arg_tokens, 3, #arg_tokens - 1)
+    if #inner == 1 and inner[1].kind == "string" and not inner[1].interpolated and not inner[1].value:find("%$") then
+      return inner[1].value ~= ""
+    end
+    if
+      #inner == 3
+      and inner[1].kind == "ident"
+      and inner[1].value == "path"
+      and inner[2].kind == "punct"
+      and (inner[2].value == "=" or inner[2].value == ":")
+      and inner[3].kind == "string"
+      and not inner[3].interpolated
+      and not inner[3].value:find("%$")
+    then
+      return inner[3].value ~= ""
+    end
+  end
+  return false
+end
+
+---@param conf string
+---@param arg_list table[]
+---@param snippet string
+---@param state table
+---@param parens boolean
+local function parse_edit_multi_arg_dep(conf, arg_list, snippet, state, parens)
+  local values = {}
+  local seen_named = false
+  local first_quote
+
+  for idx, arg in ipairs(arg_list) do
+    local key, val_tokens
+    local sep = arg[2] and arg[2].kind == "punct" and arg[2].value or nil
+    local is_named = #arg >= 3
+      and arg[1].kind == "ident"
+      and ((state.is_kotlin_dsl and sep == "=") or (not state.is_kotlin_dsl and sep == ":"))
+
+    if is_named then
+      seen_named = true
+      key = arg[1].value
+      if not KOTLIN_ALLOWED_DEP_PARAMS[key] then
+        state.unsupported_reason = "unsupported dependency notation: " .. snippet
+        return
+      end
+      val_tokens = vim.list_slice(arg, 3)
+    elseif seen_named or not state.is_kotlin_dsl then
+      state.unsupported_reason = "unsupported dependency notation: " .. snippet
+      return
+    else
+      key = KOTLIN_NAMED_DEP_PARAMS[idx]
+      if not key then
+        state.unsupported_reason = "unsupported dependency notation: " .. snippet
+        return
+      end
+      val_tokens = arg
+    end
+
+    if #val_tokens == 1 and val_tokens[1].kind == "string" then
+      local tok = val_tokens[1]
+      if tok.interpolated or tok.value:find("%$") then
+        state.unsupported_reason = "dynamic version or variable not resolved: " .. snippet
+        return
+      end
+      if tok.value == "" or tok.value:find("%s") or tok.value:find(":", 1, true) then
+        state.unsupported_reason = "unsupported dependency notation: " .. snippet
+        return
+      end
+      values[key] = tok.value
+      first_quote = first_quote or tok.quote
+    elseif
+      state.is_kotlin_dsl
+      and #val_tokens == 1
+      and val_tokens[1].kind == "ident"
+      and val_tokens[1].value == "null"
+    then
+      values[key] = false
+    else
+      state.unsupported_reason = "dynamic or unsupported dependency argument: " .. snippet
+      return
+    end
+  end
+
+  if type(values.group) == "string" and type(values.name) == "string" then
+    state.deps[#state.deps + 1] = {
+      configuration = conf,
+      groupId = values.group,
+      artifactId = values.name,
+      version = type(values.version) == "string" and values.version or nil,
+    }
+    if not state.style then
+      state.style = {
+        parens = parens,
+        quote = state.is_kotlin_dsl and '"' or (first_quote or "'"),
+      }
+    end
+  else
+    state.unsupported_reason = "unsupported dependency notation: " .. snippet
+  end
+end
+
+---@param conf string
+---@param arg table[]
+---@param snippet string
+---@param state table
+---@param parens boolean
+---@param allow_special boolean
+---@param is_platform boolean
+local function parse_edit_single_arg(conf, arg, snippet, state, parens, allow_special, is_platform)
+  if #arg == 1 and arg[1].kind == "string" then
+    local tok = arg[1]
+    if tok.interpolated or tok.value:find("%$") then
+      state.unsupported_reason = "dynamic version or variable not resolved: " .. snippet
+      return
+    end
+    local parsed = split_coordinate(tok.value)
+    if not parsed then
+      state.unsupported_reason = "unsupported coordinate: " .. tok.value
+      return
+    end
+    parsed.configuration = conf
+    parsed.is_platform = is_platform or nil
+    state.deps[#state.deps + 1] = parsed
+    if is_platform then
+      state.has_bom = true
+    elseif not state.style then
+      state.style = { parens = parens, quote = state.is_kotlin_dsl and '"' or (tok.quote or "'") }
+    end
+    return
+  end
+
+  local accessor = kotlin_libs_accessor(arg)
+  if accessor then
+    if
+      accessor:match("^libs%.bundles%.")
+      or accessor:match("^libs%.versions%.")
+      or accessor:match("^libs%.plugins%.")
+    then
+      state.unsupported_reason = "catalog bundle or non-library accessor is not supported for safe editing: "
+        .. accessor
+      return
+    end
+    local dep, extra_notes = resolve_catalog_dep(conf, accessor, state.catalog)
+    if not dep then
+      state.unsupported_reason = extra_notes[1] or ("catalog alias not resolved: " .. accessor)
+      return
+    end
+    dep.catalog_accessor = accessor
+    dep.is_platform = is_platform or nil
+    state.deps[#state.deps + 1] = dep
+    if is_platform then
+      state.has_bom = true
+    elseif not state.style then
+      state.style = { parens = parens, quote = state.is_kotlin_dsl and '"' or "'" }
+    end
+    return
+  end
+
+  if allow_special then
+    if is_static_project_arg(arg) then
+      return
+    end
+    if
+      #arg >= 4
+      and arg[1].kind == "ident"
+      and (arg[1].value == "platform" or arg[1].value == "enforcedPlatform")
+      and arg[2].kind == "punct"
+      and arg[2].value == "("
+      and find_matching_delim(arg, 2, "(", ")") == #arg
+    then
+      local inner = vim.list_slice(arg, 3, #arg - 1)
+      parse_edit_single_arg(conf, inner, snippet, state, parens, false, true)
+      return
+    end
+  end
+
+  state.unsupported_reason = "dynamic or unsupported dependency notation: " .. snippet
+end
+
+---@param stmt_tokens table[]
+---@param state table
+local function parse_edit_dep_statement(stmt_tokens, state)
+  if #stmt_tokens == 0 or state.unsupported_reason then
+    return
+  end
+  local first = stmt_tokens[1]
+  local snippet = kotlin_snippet(state.masked, stmt_tokens)
+
+  if first.kind == "ident" then
+    if GRADLE_EDIT_KEYWORDS[first.value] then
+      state.unsupported_reason = "dynamic or conditional construct in dependencies block: " .. snippet
+      return
+    end
+    if KOTLIN_NON_DEP_BLOCKS[first.value] then
+      state.unsupported_reason = ("dependency %s block is not supported for safe editing"):format(first.value)
+      return
+    end
+  end
+
+  if first.kind ~= "ident" or not GRADLE_EDIT_CONFIGS[first.value] then
+    state.unsupported_reason = "unsupported dependency configuration or statement: " .. snippet
+    return
+  end
+
+  local conf = first.value
+  if not state.entry_indent then
+    local _, lead = line_lead(state.text, first.start_pos)
+    if lead:match("^[ \t]*$") then
+      state.entry_indent = lead
+    end
+  end
+
+  local parens = false
+  local args_slice
+  local open_tok = stmt_tokens[2]
+  if open_tok and open_tok.kind == "punct" and open_tok.value == "(" then
+    parens = true
+    local close_paren = find_matching_delim(stmt_tokens, 2, "(", ")")
+    if not close_paren then
+      state.unsupported_reason = "unbalanced parentheses in dependency declaration: " .. snippet
+      return
+    end
+    if close_paren < #stmt_tokens then
+      local after = stmt_tokens[close_paren + 1]
+      local close_brace = after.kind == "punct"
+        and after.value == "{"
+        and find_matching_delim(stmt_tokens, close_paren + 1, "{", "}")
+      if close_brace ~= #stmt_tokens then
+        state.unsupported_reason = "unsupported dependency notation: " .. snippet
+        return
+      end
+    end
+    args_slice = vim.list_slice(stmt_tokens, 3, close_paren - 1)
+  else
+    if state.is_kotlin_dsl then
+      state.unsupported_reason = "unsupported dependency notation: " .. snippet
+      return
+    end
+    local stop_idx = #stmt_tokens
+    if stmt_tokens[stop_idx].kind == "punct" and stmt_tokens[stop_idx].value == "}" then
+      local p, b, br = 0, 0, 0
+      local trail_open
+      for k = 2, stop_idx do
+        local t = stmt_tokens[k]
+        if t.kind == "punct" then
+          if t.value == "(" then
+            p = p + 1
+          elseif t.value == ")" then
+            p = math.max(0, p - 1)
+          elseif t.value == "[" then
+            b = b + 1
+          elseif t.value == "]" then
+            b = math.max(0, b - 1)
+          elseif t.value == "{" then
+            if p == 0 and b == 0 and br == 0 then
+              trail_open = k
+            end
+            br = br + 1
+          elseif t.value == "}" then
+            br = math.max(0, br - 1)
+          end
+        end
+      end
+      if not trail_open or find_matching_delim(stmt_tokens, trail_open, "{", "}") ~= stop_idx then
+        state.unsupported_reason = "unsupported dependency notation: " .. snippet
+        return
+      end
+      stop_idx = trail_open - 1
+      if stop_idx >= 2 and stmt_tokens[stop_idx].kind == "punct" and stmt_tokens[stop_idx].value == "," then
+        stop_idx = stop_idx - 1
+      end
+    end
+    args_slice = vim.list_slice(stmt_tokens, 2, stop_idx)
+  end
+
+  local arg_list = split_kotlin_call_args(args_slice)
+  if not arg_list then
+    state.unsupported_reason = "unsupported dependency notation: " .. snippet
+    return
+  end
+
+  if #arg_list == 1 then
+    local arg = arg_list[1]
+    local sep = arg[2] and arg[2].kind == "punct" and arg[2].value or nil
+    local is_named = #arg >= 3
+      and arg[1].kind == "ident"
+      and ((state.is_kotlin_dsl and sep == "=") or (not state.is_kotlin_dsl and sep == ":"))
+    if is_named then
+      parse_edit_multi_arg_dep(conf, arg_list, snippet, state, parens)
+      return
+    end
+    parse_edit_single_arg(conf, arg, snippet, state, parens, true, false)
+    return
+  end
+
+  parse_edit_multi_arg_dep(conf, arg_list, snippet, state, parens)
+end
+
+---@param tokens table[]
+---@param start_idx integer
+---@param close_brace_idx integer
+---@param state table
+local function parse_edit_dependencies_block(tokens, start_idx, close_brace_idx, state)
+  local i = start_idx
+  local stop = close_brace_idx - 1
+  while i <= stop and not state.unsupported_reason do
+    while i <= stop and (tokens[i].kind == "newline" or (tokens[i].kind == "punct" and tokens[i].value == ";")) do
+      i = i + 1
+    end
+    if i > stop then
+      break
+    end
+
+    local stmt = {}
+    local paren, bracket, brace = 0, 0, 0
+    while i <= stop do
+      local tok = tokens[i]
+      if tok.kind == "punct" then
+        if tok.value == "(" then
+          paren = paren + 1
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == ")" then
+          paren = math.max(0, paren - 1)
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == "[" then
+          bracket = bracket + 1
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == "]" then
+          bracket = math.max(0, bracket - 1)
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == "{" then
+          brace = brace + 1
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        elseif tok.value == "}" then
+          brace = brace - 1
+          stmt[#stmt + 1] = tok
+          i = i + 1
+          if paren == 0 and bracket == 0 and brace == 0 then
+            local nxt = next_non_newline(tokens, i)
+            local keep = nxt
+              and ((nxt.kind == "ident" and nxt.value == "else") or (nxt.kind == "punct" and nxt.value == "."))
+            if not keep then
+              break
+            end
+          end
+        elseif tok.value == ";" and paren == 0 and bracket == 0 and brace == 0 then
+          i = i + 1
+          break
+        else
+          stmt[#stmt + 1] = tok
+          i = i + 1
+        end
+      elseif tok.kind == "newline" then
+        if paren == 0 and bracket == 0 and brace == 0 then
+          local prev = stmt[#stmt]
+          local nxt = next_non_newline(tokens, i + 1)
+          local cont_prev = prev
+            and prev.kind == "punct"
+            and (KOTLIN_CONTINUATION_PUNCT[prev.value] or (not state.is_kotlin_dsl and prev.value == ":"))
+          local cont_next = nxt and nxt.kind == "punct" and (nxt.value == "{" or nxt.value == ".")
+          if not cont_prev and not cont_next then
+            i = i + 1
+            break
+          end
+        end
+        i = i + 1
+      else
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      end
+    end
+
+    parse_edit_dep_statement(stmt, state)
+  end
+end
+
+---@param tokens table[]
+---@param start_idx integer
+---@param block_stack string[]
+---@param state table
+---@return integer next_idx
+local function scan_edit_gradle_blocks(tokens, start_idx, block_stack, state)
+  local i = start_idx
+  local n = #tokens
+  local stmt = {}
+  local paren, bracket = 0, 0
+
+  local function flush_top_statement()
+    if #stmt == 0 or state.unsupported_reason then
+      stmt = {}
+      return
+    end
+    if is_gradle_apply_from_stmt(stmt) then
+      state.unsupported_reason = "external script apply(from = ...) is not supported for safe editing"
+    elseif stmt_has_ident(stmt, "dependencies") then
+      state.unsupported_reason = "unsupported dependencies statement is not supported for safe editing"
+    end
+    stmt = {}
+  end
+
+  while i <= n and not state.unsupported_reason do
+    local tok = tokens[i]
+    if tok.kind == "punct" then
+      if tok.value == "(" then
+        paren = paren + 1
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      elseif tok.value == ")" then
+        paren = math.max(0, paren - 1)
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      elseif tok.value == "[" then
+        bracket = bracket + 1
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      elseif tok.value == "]" then
+        bracket = math.max(0, bracket - 1)
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      elseif tok.value == "{" and paren == 0 and bracket == 0 then
+        local header_kind = classify_dependencies_header(stmt)
+        local close_brace = find_matching_delim(tokens, i, "{", "}")
+        if not close_brace then
+          state.unsupported_reason = "unbalanced braces in build file"
+          return n + 1
+        end
+
+        if header_kind == "unqualified" then
+          stmt = {}
+          if #block_stack == 0 then
+            if state.dependencies_block then
+              state.unsupported_reason = "multiple top-level dependencies blocks found — ambiguous insertion target"
+              return n + 1
+            end
+            local _, open_lead = line_lead(state.text, tok.start_pos)
+            state.dependencies_block = {
+              open_brace_pos = tok.start_pos,
+              close_brace_pos = tokens[close_brace].start_pos,
+              block_indent = open_lead:match("^([ \t]*)") or "",
+            }
+            parse_edit_dependencies_block(tokens, i + 1, close_brace, state)
+            i = close_brace + 1
+          elseif #block_stack == 1 and block_stack[1] == "buildscript" then
+            i = close_brace + 1
+          else
+            state.unsupported_reason = ("scoped or conditional dependencies block (%s) is not supported for safe editing"):format(
+              table.concat(block_stack, " > ")
+            )
+            return n + 1
+          end
+        elseif header_kind == "qualified" or header_kind == "unsupported" or stmt_has_ident(stmt, "dependencies") then
+          state.unsupported_reason = "unsupported or scoped dependencies block is not supported for safe editing"
+          return n + 1
+        elseif #stmt >= 1 and stmt[#stmt].kind == "ident" and stmt[#stmt].value == "apply" then
+          if gradle_block_has_apply_from(tokens, i, close_brace) then
+            state.unsupported_reason = "external script apply(from = ...) is not supported for safe editing"
+            return n + 1
+          end
+          stmt = {}
+          block_stack[#block_stack + 1] = "apply"
+          i = scan_edit_gradle_blocks(tokens, i + 1, block_stack, state)
+          block_stack[#block_stack] = nil
+        else
+          local label = (#stmt > 0 and stmt[1].kind == "ident") and stmt[1].value or "block"
+          stmt = {}
+          block_stack[#block_stack + 1] = label
+          i = scan_edit_gradle_blocks(tokens, i + 1, block_stack, state)
+          block_stack[#block_stack] = nil
+        end
+      elseif tok.value == "}" and paren == 0 and bracket == 0 then
+        flush_top_statement()
+        if #block_stack > 0 then
+          return i + 1
+        end
+        i = i + 1
+      elseif tok.value == ";" and paren == 0 and bracket == 0 then
+        flush_top_statement()
+        i = i + 1
+      else
+        stmt[#stmt + 1] = tok
+        i = i + 1
+      end
+    elseif tok.kind == "newline" then
+      if paren == 0 and bracket == 0 then
+        local prev = stmt[#stmt]
+        local nxt = next_non_newline(tokens, i + 1)
+        local cont_prev = prev
+          and prev.kind == "punct"
+          and (prev.value == "." or prev.value == "=" or (not state.is_kotlin_dsl and prev.value == ":"))
+        local cont_next = nxt and nxt.kind == "punct" and (nxt.value == "{" or nxt.value == ".")
+        if not cont_prev and not cont_next then
+          flush_top_statement()
+        end
+      end
+      i = i + 1
+    else
+      stmt[#stmt + 1] = tok
+      i = i + 1
+    end
+  end
+
+  flush_top_statement()
+  return i
+end
+
+---Analyze a Gradle build file (Groovy or Kotlin DSL) for safe bounded editing.
+---Never executes Gradle; refuses ambiguous, dynamic, or broken syntax.
+---@param text string
+---@param is_kotlin_dsl boolean
+---@param catalog table|nil
+---@return table analysis
+function M._analyze_gradle(text, is_kotlin_dsl, catalog)
+  text = text or ""
+  local masked, has_unterminated, has_slashy
+  if is_kotlin_dsl then
+    masked, has_unterminated = M._mask_kotlin(text)
+  else
+    masked, has_unterminated, has_slashy = M._mask_groovy(text)
+  end
+
+  local unit = detect_gradle_indent_unit(masked)
+  if has_slashy then
+    return {
+      deps = {},
+      has_bom = false,
+      unit = unit,
+      unsupported_reason = "Groovy slashy or dollar-slashy strings are not supported for safe editing",
+    }
+  end
+  if has_unterminated then
+    return {
+      deps = {},
+      has_bom = false,
+      unit = unit,
+      unsupported_reason = "unterminated block comment in build file",
+    }
+  end
+
+  local tokens = tokenize_gradle(masked, is_kotlin_dsl)
+  for _, tok in ipairs(tokens) do
+    if tok.unterminated then
+      return {
+        deps = {},
+        has_bom = false,
+        unit = unit,
+        unsupported_reason = "unterminated string literal in build file",
+      }
+    end
+  end
+
+  if not check_balanced_delimiters(tokens) then
+    return {
+      deps = {},
+      has_bom = false,
+      unit = unit,
+      unsupported_reason = "unbalanced delimiters in build file",
+    }
+  end
+
+  local state = {
+    text = text,
+    masked = masked,
+    is_kotlin_dsl = is_kotlin_dsl == true,
+    catalog = catalog,
+    deps = {},
+    has_bom = false,
+    unit = unit,
+  }
+  scan_edit_gradle_blocks(tokens, 1, {}, state)
+
+  if state.dependencies_block then
+    state.dependencies_block.entry_indent = state.entry_indent
+    state.dependencies_block.style = state.style
+  end
+
+  return {
+    deps = state.deps,
+    has_bom = state.has_bom,
+    dependencies_block = state.dependencies_block,
+    unit = unit,
+    unsupported_reason = state.unsupported_reason,
+  }
+end
+
+---@param catalog table|nil
+---@param groupId string
+---@param artifactId string
+---@return string|nil accessor
+local function find_catalog_accessor(catalog, groupId, artifactId)
+  if not catalog or not catalog.libraries then
+    return nil
+  end
+  local found_norm
+  for _, lib in ipairs(catalog.libraries) do
+    if lib.groupId == groupId and lib.artifactId == artifactId and not lib.note then
+      local norm = lib.alias:gsub("[%-_%.]", ".")
+      local resolved, ambiguous = catalog_library(catalog, "libs." .. norm)
+      if resolved and not ambiguous then
+        if found_norm and found_norm ~= norm then
+          return nil
+        end
+        found_norm = norm
+      end
+    end
+  end
+  return found_norm and ("libs." .. found_norm) or nil
+end
+
+---@param dep table
+---@param entry_indent string
+---@param is_kotlin_dsl boolean
+---@param style table|nil
+---@return string
+local function format_gradle_dependency_line(dep, entry_indent, is_kotlin_dsl, style)
+  local conf = (dep.configuration and dep.configuration ~= "") and dep.configuration or "implementation"
+  local coord = dep.groupId .. ":" .. dep.artifactId
+  if dep.version and dep.version ~= "" then
+    coord = coord .. ":" .. dep.version
+  end
+  if is_kotlin_dsl then
+    return ('%s%s("%s")'):format(entry_indent, conf, coord)
+  end
+  local parens = style and style.parens or false
+  local quote = (style and style.quote) or "'"
+  if parens then
+    return ("%s%s(%s%s%s)"):format(entry_indent, conf, quote, coord, quote)
+  end
+  return ("%s%s %s%s%s"):format(entry_indent, conf, quote, coord, quote)
+end
+
+---Insert one dependency into a Gradle build.gradle / build.gradle.kts text,
+---preserving bytes, comments, style, indentation, and line endings.
+---@param text string
+---@param dep table { groupId, artifactId, version?, configuration? }
+---@param opts { is_kotlin_dsl?: boolean, catalog?: table|nil, build_file?: string|nil }|nil
+---@return string|nil new_text, table|nil meta, string|nil err
+function M._insert_gradle_dependency(text, dep, opts)
+  opts = opts or {}
+  local is_kotlin_dsl = opts.is_kotlin_dsl == true
+  local build_name = opts.build_file or (is_kotlin_dsl and "build.gradle.kts" or "build.gradle")
+
+  if type(dep) ~= "table" then
+    return nil, nil, "dependency must be a table"
+  end
+  if invalid_gradle_value(dep.groupId) then
+    return nil, nil, "invalid groupId: " .. tostring(dep.groupId)
+  end
+  if invalid_gradle_value(dep.artifactId) then
+    return nil, nil, "invalid artifactId: " .. tostring(dep.artifactId)
+  end
+
+  local conf = (dep.configuration ~= nil and dep.configuration ~= "") and dep.configuration or "implementation"
+  if not GRADLE_EDIT_CONFIGS[conf] then
+    return nil, nil, "unsupported Gradle configuration: " .. tostring(conf)
+  end
+
+  local version = (dep.version ~= nil and dep.version ~= "") and dep.version or nil
+  if version and invalid_gradle_value(version) then
+    return nil, nil, "invalid version: " .. tostring(version)
+  end
+
+  local analysis = M._analyze_gradle(text or "", is_kotlin_dsl, opts.catalog)
+  if analysis.unsupported_reason then
+    return nil, nil, analysis.unsupported_reason
+  end
+
+  if not version and not analysis.has_bom then
+    return nil,
+      nil,
+      ("a version is required: no platform/BOM declaration for %s:%s was found in %s"):format(
+        dep.groupId,
+        dep.artifactId,
+        build_name
+      )
+  end
+
+  for _, existing in ipairs(analysis.deps) do
+    if existing.groupId == dep.groupId and existing.artifactId == dep.artifactId then
+      local via = existing.catalog_accessor and (" (via " .. existing.catalog_accessor .. ")") or ""
+      return nil, nil, ("%s:%s is already declared in %s%s"):format(dep.groupId, dep.artifactId, build_name, via)
+    end
+  end
+
+  local eol = (text or ""):find("\r\n", 1, true) and "\r\n" or "\n"
+  local normalized_dep = {
+    groupId = dep.groupId,
+    artifactId = dep.artifactId,
+    version = version,
+    configuration = conf,
+  }
+
+  local meta = {
+    created_section = false,
+    version_omitted = version == nil,
+    configuration = conf,
+    bom_note = nil,
+    catalog_note = nil,
+    rendered_line = nil,
+  }
+  if meta.version_omitted then
+    meta.bom_note =
+      "a platform/BOM declaration was detected, but textual inspection cannot prove it manages this artifact"
+  end
+
+  local catalog_accessor = find_catalog_accessor(opts.catalog, dep.groupId, dep.artifactId)
+  if catalog_accessor then
+    meta.catalog_note = ("catalog alias %s exists in gradle/libs.versions.toml (inserting literal coordinate; catalog is read-only)"):format(
+      catalog_accessor
+    )
+  end
+
+  local new_text
+  local block_info = analysis.dependencies_block
+  if block_info then
+    local entry_indent = block_info.entry_indent or (block_info.block_indent .. analysis.unit)
+    local line = format_gradle_dependency_line(normalized_dep, entry_indent, is_kotlin_dsl, block_info.style)
+    meta.rendered_line = line
+
+    local line_start, lead = line_lead(text, block_info.close_brace_pos)
+    local inner = text:sub(block_info.open_brace_pos + 1, block_info.close_brace_pos - 1)
+    if lead:match("^[ \t]*$") and not inner:match("^[ \t]*$") then
+      new_text = text:sub(1, line_start - 1) .. line .. eol .. text:sub(line_start)
+    else
+      new_text = text:sub(1, block_info.close_brace_pos - 1)
+        .. eol
+        .. line
+        .. eol
+        .. block_info.block_indent
+        .. text:sub(block_info.close_brace_pos)
+    end
+  else
+    meta.created_section = true
+    local line = format_gradle_dependency_line(normalized_dep, analysis.unit, is_kotlin_dsl, nil)
+    meta.rendered_line = line
+    local section = table.concat({
+      "dependencies {",
+      line,
+      "}",
+    }, eol)
+    if text == "" then
+      new_text = section .. eol
+    elseif text:sub(-#eol) == eol then
+      if text:sub(-(#eol * 2)) == eol .. eol then
+        new_text = text .. section .. eol
+      else
+        new_text = text .. eol .. section .. eol
+      end
+    else
+      new_text = text .. eol .. eol .. section
+    end
+  end
+
+  return new_text, meta, nil
+end
+
+---Check whether `target` can be safely edited by `deps.lua`.
+---@param target table|nil result of _resolve_target
+---@return boolean can_edit, string|nil reason, table|nil analysis, string|nil text, table|nil catalog
+function M._can_edit_target(target)
+  if not target or not target.build_file then
+    return false, NO_PROJECT_REASON
+  end
+
+  if target.tool == "maven" then
+    local stat = vim.uv.fs_lstat(target.build_file)
+    if not stat then
+      return false, "pom.xml does not exist"
+    end
+    if stat.type == "link" then
+      return false, "pom.xml is a symlink — refusing to modify"
+    end
+    if stat.type ~= "file" then
+      return false, "pom.xml is not a regular file"
+    end
+    return true, nil
+  end
+
+  if target.ambiguous_build_files then
+    return false, "both build.gradle and build.gradle.kts exist — ambiguous build file"
+  end
+  if target.missing_module_build_file then
+    return false, "selected module has no build.gradle or build.gradle.kts"
+  end
+
+  for _, fname in ipairs({ "build.gradle", "build.gradle.kts" }) do
+    local mod_stat = vim.uv.fs_lstat(target.module .. "/" .. fname)
+    if mod_stat and mod_stat.type == "link" then
+      return false, fname .. " is a symlink — refusing to modify"
+    end
+  end
+
+  local name = vim.fs.basename(target.build_file)
+  local stat = vim.uv.fs_lstat(target.build_file)
+  if not stat then
+    return false, name .. " does not exist"
+  end
+  if stat.type == "link" then
+    return false, name .. " is a symlink — refusing to modify"
+  end
+  if stat.type ~= "file" then
+    return false, name .. " is not a regular file"
+  end
+
+  local text, read_err = read_regular_file(target.build_file)
+  if not text then
+    return false, read_err or ("could not read " .. target.build_file)
+  end
+
+  local catalog
+  if target.catalog_file then
+    catalog = M._parse_version_catalog(read_file(target.catalog_file) or "")
+  end
+
+  local analysis = M._analyze_gradle(text, target.is_kotlin_dsl, catalog)
+  if analysis.unsupported_reason then
+    return false, analysis.unsupported_reason, analysis, text, catalog
+  end
+  return true, nil, analysis, text, catalog
+end
+
 -- ---------- JDTLS sync (H1: java/projectConfigurationUpdate) ----------
 
 ---eclipse.jdt.ls >= 1.63 declares the `java/projectConfigurationUpdate` handler
@@ -3319,7 +4643,7 @@ function M.list(bufnr, target)
   return buf
 end
 
--- ---------- interactive add (Maven only) ----------
+-- ---------- interactive add (Maven & bounded Gradle) ----------
 
 ---@param bom_info table
 ---@return string
@@ -3339,6 +4663,37 @@ local function version_hint(bom_info)
   return "required — no parent, BOM or dependencyManagement entry for this artifact"
 end
 
+---@param analysis table
+---@param build_label string
+---@return string
+local function gradle_version_hint(analysis, build_label)
+  if analysis and analysis.has_bom then
+    return "optional — a platform/BOM declaration was detected (coverage cannot be verified textually)"
+  end
+  return "required — no platform/BOM declaration in " .. build_label
+end
+
+local GRADLE_SCOPE_CHOICES = {
+  "implementation (default)",
+  "api",
+  "testImplementation",
+  "runtimeOnly",
+  "compileOnly",
+  "testCompileOnly",
+  "testRuntimeOnly",
+  "annotationProcessor",
+  "testAnnotationProcessor",
+  "Cancel",
+}
+
+local MAVEN_SCOPE_CHOICES = {
+  "compile (default)",
+  "test",
+  "runtime",
+  "provided",
+  "Cancel",
+}
+
 ---Interactive "Add dependency…" flow. Esc/nil at any step writes nothing.
 ---@param bufnr integer|nil
 ---@param target table|nil pre-resolved target
@@ -3350,17 +4705,36 @@ function M.add(bufnr, target)
     ui.notify(NO_PROJECT_REASON, vim.log.levels.WARN)
     return
   end
-  if target.tool ~= "maven" then
-    ui.notify(GRADLE_EDIT_REASON, vim.log.levels.WARN)
+
+  local can_edit, edit_reason, analysis, gradle_text, catalog = M._can_edit_target(target)
+  if not can_edit then
+    ui.notify(edit_reason or GRADLE_EDIT_REASON, vim.log.levels.WARN)
     return
   end
 
-  local text, read_err = read_file(target.build_file)
-  if not text then
-    ui.notify(read_err or ("could not read " .. target.build_file), vim.log.levels.ERROR)
-    return
+  local name = vim.fs.basename(target.build_file)
+  for _, buf in ipairs(loaded_buffers(target.build_file)) do
+    if vim.bo[buf].modified then
+      ui.notify(name .. " has unsaved changes — save or discard them first", vim.log.levels.WARN)
+      return
+    end
   end
-  local parsed = M._parse_pom(text)
+
+  local is_maven = target.tool == "maven"
+  local text, parsed
+  if is_maven then
+    local read_err
+    text, read_err = read_regular_file(target.build_file)
+    if not text then
+      ui.notify(read_err or ("could not read " .. target.build_file), vim.log.levels.ERROR)
+      return
+    end
+    parsed = M._parse_pom(text)
+  else
+    text = gradle_text
+  end
+
+  local build_label = relpath(target.root, target.build_file)
 
   local function bom_info_of(group, artifact, dep_type, classifier)
     return build_bom_info(parsed, group, artifact, dep_type, classifier)
@@ -3368,29 +4742,56 @@ function M.add(bufnr, target)
 
   local step_confirm, step_scope, manual, search
 
-  step_confirm = function(group, artifact, version, scope)
-    local dep = {
-      groupId = group,
-      artifactId = artifact,
-      version = (version ~= nil and version ~= "") and version or nil,
-      scope = (scope ~= nil and scope ~= "") and scope or nil,
-    }
-    local new_text, meta, err = M._insert_maven_dependency(text, dep)
+  step_confirm = function(group, artifact, version, scope_or_conf)
+    local ver = (version ~= nil and version ~= "") and version or nil
+    local new_text, meta, err
+    if is_maven then
+      new_text, meta, err = M._insert_maven_dependency(text, {
+        groupId = group,
+        artifactId = artifact,
+        version = ver,
+        scope = (scope_or_conf ~= nil and scope_or_conf ~= "") and scope_or_conf or nil,
+      })
+    else
+      new_text, meta, err = M._insert_gradle_dependency(text, {
+        groupId = group,
+        artifactId = artifact,
+        version = ver,
+        configuration = (scope_or_conf ~= nil and scope_or_conf ~= "") and scope_or_conf or "implementation",
+      }, {
+        is_kotlin_dsl = target.is_kotlin_dsl,
+        catalog = catalog,
+        build_file = build_label,
+      })
+    end
     if not new_text then
       ui.notify(err or "could not add the dependency", vim.log.levels.ERROR)
       return
     end
 
     local items = { "✔ Add dependency" }
-    items[#items + 1] = "  " .. group .. ":" .. artifact .. (dep.version and (":" .. dep.version) or " (no <version>)")
-    if dep.scope then
-      items[#items + 1] = "  scope: " .. dep.scope
-    end
-    if meta.created_section then
-      items[#items + 1] = "  a new <dependencies> section will be created"
+    local no_ver_label = is_maven and " (no <version>)" or " (no version)"
+    items[#items + 1] = "  " .. group .. ":" .. artifact .. (ver and (":" .. ver) or no_ver_label)
+    if is_maven then
+      if scope_or_conf and scope_or_conf ~= "" then
+        items[#items + 1] = "  scope: " .. scope_or_conf
+      end
+      if meta.created_section then
+        items[#items + 1] = "  a new <dependencies> section will be created"
+      end
+    else
+      items[#items + 1] = "  configuration: " .. meta.configuration
+      items[#items + 1] = "  preview: " .. trim(meta.rendered_line)
+      items[#items + 1] = "  target: " .. build_label
+      if meta.created_section then
+        items[#items + 1] = "  a new dependencies { ... } section will be created"
+      end
     end
     if meta.bom_note then
       items[#items + 1] = "  note: " .. meta.bom_note
+    end
+    if meta.catalog_note then
+      items[#items + 1] = "  note: " .. meta.catalog_note
     end
     items[#items + 1] = "✖ Cancel"
 
@@ -3398,18 +4799,13 @@ function M.add(bufnr, target)
       if choice ~= "✔ Add dependency" then
         return
       end
-      local ok, write_err = M._write_pom(target.build_file, new_text)
+      local ok, write_err = M._write_build_file(target.build_file, new_text, { expected_text = text })
       if not ok then
-        ui.notify(write_err or "could not write pom.xml", vim.log.levels.ERROR)
+        ui.notify(write_err or ("could not write " .. build_label), vim.log.levels.ERROR)
         return
       end
 
-      local message = ("added %s:%s%s to %s"):format(
-        group,
-        artifact,
-        dep.version and (":" .. dep.version) or "",
-        relpath(target.root, target.build_file)
-      )
+      local message = ("added %s:%s%s to %s"):format(group, artifact, ver and (":" .. ver) or "", build_label)
       if meta.bom_note then
         message = message .. " — " .. meta.bom_note
       end
@@ -3430,20 +4826,18 @@ function M.add(bufnr, target)
   end
 
   step_scope = function(group, artifact, version)
-    ui.pick_one(
-      { "compile (default)", "test", "runtime", "provided", "Cancel" },
-      "Java: Dependencies — scope",
-      function(choice)
-        if choice == nil or choice == "Cancel" then
-          return
-        end
-        local scope = trim((choice:gsub("%s*%b()", "")))
-        if scope == "compile" then
-          scope = ""
-        end
-        step_confirm(group, artifact, version, scope)
+    local choices = is_maven and MAVEN_SCOPE_CHOICES or GRADLE_SCOPE_CHOICES
+    local prompt = is_maven and "Java: Dependencies — scope" or "Java: Dependencies — configuration"
+    ui.pick_one(choices, prompt, function(choice)
+      if choice == nil or choice == "Cancel" then
+        return
       end
-    )
+      local chosen = trim((choice:gsub("%s*%b()", "")))
+      if is_maven and chosen == "compile" then
+        chosen = ""
+      end
+      step_confirm(group, artifact, version, chosen)
+    end)
   end
 
   manual = function()
@@ -3465,7 +4859,8 @@ function M.add(bufnr, target)
           ui.notify("artifactId is required", vim.log.levels.WARN)
           return
         end
-        local hint = version_hint(bom_info_of(group, artifact))
+        local hint = is_maven and version_hint(bom_info_of(group, artifact))
+          or gradle_version_hint(analysis, build_label)
         ui.ask("Java: Dependencies — version (" .. hint .. ")", nil, function(version)
           if version == nil then
             return
@@ -3564,13 +4959,14 @@ local function menu_for(bufnr, target)
     open_label = "Open build.gradle"
   end
 
+  local can_edit, edit_reason = M._can_edit_target(target)
   local entries = {
     { key = "list", label = "List dependencies…", enabled = true },
     {
       key = "add",
       label = "Add dependency…",
-      enabled = target.tool == "maven",
-      reason = GRADLE_EDIT_REASON,
+      enabled = can_edit,
+      reason = edit_reason or GRADLE_EDIT_REASON,
     },
     { key = "open", label = open_label, enabled = true },
     { key = "sync", label = "Sync JDTLS", enabled = client ~= nil, reason = NO_CLIENT_REASON },
