@@ -258,6 +258,8 @@ These keymaps belong to java-menu.nvim. jc.nvim ships its own separate command/m
 
 ## Testing and development
 
+For setup, contribution workflow, and pull request guidance, see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 The repository ships a reproducible test suite (no framework; every spec runs in its own clean headless Neovim session, so no state carries between runs). It is not dependency-free: the fast specs need jc.nvim on the runtimepath, and the integration specs need a real jdtls binary, Maven, and nvim-dap with the java-debug bundle — the runner wires these up from your existing lazy.nvim plugin directory:
 
 ```sh
