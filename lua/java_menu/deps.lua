@@ -222,6 +222,39 @@ function M._mask_xml(text)
   return masked
 end
 
+---Find the next `<tag ...>...</tag>` (or self-closing `<tag .../>`) element in
+---comment-masked XML.
+---@param text string
+---@param tag string
+---@param init integer|nil
+---@return integer|nil elem_start
+---@return integer|nil elem_end
+---@return integer|nil body_start
+---@return integer|nil body_end
+local function find_element(text, tag, init)
+  local open_s, open_e = text:find("<" .. tag .. "[%s>/]", init or 1)
+  if not open_s then
+    return nil
+  end
+  local tag_end
+  if text:sub(open_e, open_e) == ">" then
+    tag_end = open_e
+  else
+    tag_end = text:find(">", open_e, true)
+    if not tag_end then
+      return open_s, #text, nil, nil
+    end
+  end
+  if text:sub(tag_end - 1, tag_end) == "/>" then
+    return open_s, tag_end, nil, nil
+  end
+  local close_s, close_e = text:find("</" .. tag .. "%s*>", tag_end + 1)
+  if not close_s then
+    return open_s, #text, tag_end + 1, #text
+  end
+  return open_s, close_e, tag_end + 1, close_s - 1
+end
+
 ---Mask whole `<tag ...>...</tag>` sections with equal-length spaces.
 ---@param text string
 ---@param tags string[]
@@ -229,16 +262,12 @@ end
 local function mask_blocks(text, tags)
   local out = text
   for _, tag in ipairs(tags) do
-    local open_pattern = "<" .. tag .. "[%s>]"
-    local close_tag = "</" .. tag .. ">"
     local init = 1
     while true do
-      local open_s, open_e = out:find(open_pattern, init)
-      if not open_s then
+      local open_s, stop = find_element(out, tag, init)
+      if not open_s or not stop then
         break
       end
-      local _, close_e = out:find(close_tag, open_e + 1, true)
-      local stop = close_e or #out
       out = out:sub(1, open_s - 1) .. out:sub(open_s, stop):gsub("[^\n]", " ") .. out:sub(stop + 1)
       if stop >= #out then
         break
@@ -260,13 +289,11 @@ end
 
 -- ---------- POM reading (pure) ----------
 
----Fields of one `<dependency>` block (comments already masked).
+---Fields of one `<dependency>` (or `<parent>`) block (comments already masked).
 ---@param block string
 ---@return table
 local function dependency_fields(block)
-  local clean = block:gsub("<exclusions[^>]*>.-</exclusions>", function(match)
-    return (match:gsub("[^\n]", " "))
-  end)
+  local clean = mask_blocks(block, { "exclusions" })
   local function field(tag)
     local value = clean:match("<" .. tag .. "%s*>([^<]*)</" .. tag .. "%s*>")
     value = value and trim(value) or nil
@@ -281,12 +308,13 @@ local function dependency_fields(block)
     version = field("version"),
     scope = field("scope"),
     type = field("type"),
+    classifier = field("classifier"),
     optional = field("optional"),
   }
 end
 
 ---Collect `<dependency>` entries between two byte offsets of `text`.
----@param text string original POM
+---@param text string POM or POM slice
 ---@param from_pos integer
 ---@param to_pos integer
 ---@return table[]
@@ -296,106 +324,332 @@ local function collect_dependencies(text, from_pos, to_pos)
   local out = {}
   local init = 1
   while true do
-    local _, open_e = masked:find("<dependency%s*>", init)
-    if not open_e then
+    local _, elem_end, body_s, body_e = find_element(masked, "dependency", init)
+    if not elem_end then
       break
     end
-    local _, close_e = masked:find("</dependency>", open_e + 1, true)
-    if not close_e then
-      break
+    if body_s and body_e and body_e >= body_s then
+      local fields = dependency_fields(masked:sub(body_s, body_e))
+      if fields.groupId and fields.artifactId then
+        out[#out + 1] = fields
+      end
     end
-    local fields = dependency_fields(slice:sub(open_e + 1, close_e - #"</dependency>"))
-    if fields.groupId and fields.artifactId then
-      out[#out + 1] = fields
-    end
-    init = close_e + 1
+    init = elem_end + 1
   end
   return out
 end
 
----Parse the parts of a POM that matter for dependency insertion. Pure.
+---Collect `<dependencyManagement>` entries and BOM imports from a masked slice.
+---@param masked_slice string
+---@return table[] managed, table[] bom_imports, boolean has_bom
+local function collect_managed_entries(masked_slice)
+  local managed = {}
+  local bom_imports = {}
+  local init = 1
+  while true do
+    local _, dm_end, dm_body_s, dm_body_e = find_element(masked_slice, "dependencyManagement", init)
+    if not dm_end then
+      break
+    end
+    if dm_body_s and dm_body_e and dm_body_e >= dm_body_s then
+      local dm_slice = masked_slice:sub(dm_body_s, dm_body_e)
+      local dep_init = 1
+      while true do
+        local _, deps_end, deps_body_s, deps_body_e = find_element(dm_slice, "dependencies", dep_init)
+        if not deps_end then
+          break
+        end
+        if deps_body_s and deps_body_e and deps_body_e >= deps_body_s then
+          for _, entry in ipairs(collect_dependencies(dm_slice, deps_body_s, deps_body_e)) do
+            local item = {
+              groupId = entry.groupId,
+              artifactId = entry.artifactId,
+              version = entry.version,
+              type = entry.type,
+              classifier = entry.classifier,
+              scope = entry.scope,
+            }
+            managed[#managed + 1] = item
+            if item.type == "pom" and item.scope == "import" then
+              bom_imports[#bom_imports + 1] = item
+            end
+          end
+        end
+        dep_init = deps_end + 1
+      end
+    end
+    init = dm_end + 1
+  end
+  return managed, bom_imports, #bom_imports > 0
+end
+
+---Collect direct `<dependencies>` entries from a masked slice (caller must
+---already have masked `<dependencyManagement>`, `<build>`, `<reporting>`).
+---@param masked_slice string
+---@return table[]
+local function collect_direct_dependencies(masked_slice)
+  local deps = {}
+  local init = 1
+  while true do
+    local _, deps_end, body_s, body_e = find_element(masked_slice, "dependencies", init)
+    if not deps_end then
+      break
+    end
+    if body_s and body_e and body_e >= body_s then
+      for _, entry in ipairs(collect_dependencies(masked_slice, body_s, body_e)) do
+        deps[#deps + 1] = entry
+      end
+    end
+    init = deps_end + 1
+  end
+  return deps
+end
+
+---Extract `<parent>` coordinates from top-level masked POM.
+---@param masked_top string
+---@return table|nil
+local function parse_parent(masked_top)
+  local _, p_end, body_s, body_e = find_element(masked_top, "parent", 1)
+  if not p_end then
+    return nil
+  end
+  if not body_s or not body_e or body_e < body_s then
+    return {}
+  end
+  local body = masked_top:sub(body_s, body_e)
+  local fields = dependency_fields(body)
+  local rel_path = body:match("<relativePath%s*>([^<]*)</relativePath%s*>")
+  rel_path = rel_path and trim(rel_path) or nil
+  if rel_path == "" then
+    rel_path = nil
+  end
+  return {
+    groupId = fields.groupId,
+    artifactId = fields.artifactId,
+    version = fields.version,
+    relativePath = rel_path,
+  }
+end
+
+---Extract declared `<activation>` metadata without evaluating conditions.
+---@param activation_slice string
+---@return table
+local function parse_activation(activation_slice)
+  local active_raw = activation_slice:match("<activeByDefault%s*>([^<]*)</activeByDefault%s*>")
+  local active_by_default
+  if active_raw then
+    local val = trim(active_raw):lower()
+    if val == "true" then
+      active_by_default = true
+    elseif val == "false" then
+      active_by_default = false
+    end
+  end
+  local triggers = {}
+  for _, tag in ipairs({ "jdk", "os", "property", "file" }) do
+    if find_element(activation_slice, tag, 1) then
+      triggers[#triggers + 1] = tag
+    end
+  end
+  return {
+    active_by_default = active_by_default,
+    triggers = triggers,
+  }
+end
+
+---Extract `<profiles>` declarations from POM with comments/build/reporting masked.
+---@param no_build string
+---@return boolean has_profiles, table[] profiles
+local function parse_profiles(no_build)
+  local has_profiles = false
+  local profiles = {}
+  local outer_init = 1
+  while true do
+    local _, outer_end, outer_s, outer_e = find_element(no_build, "profiles", outer_init)
+    if not outer_end then
+      break
+    end
+    has_profiles = true
+    if outer_s and outer_e and outer_e >= outer_s then
+      local profiles_slice = no_build:sub(outer_s, outer_e)
+      local prof_init = 1
+      while true do
+        local _, prof_end, body_s, body_e = find_element(profiles_slice, "profile", prof_init)
+        if not prof_end then
+          break
+        end
+        if body_s and body_e and body_e >= body_s then
+          local p_slice = profiles_slice:sub(body_s, body_e)
+          local id_slice = mask_blocks(p_slice, {
+            "activation",
+            "properties",
+            "dependencies",
+            "dependencyManagement",
+            "repositories",
+            "pluginRepositories",
+            "distributionManagement",
+            "modules",
+          })
+          local id = id_slice:match("<id%s*>([^<]*)</id%s*>")
+          id = id and trim(id) or nil
+          if id == "" then
+            id = nil
+          end
+
+          local activation
+          local _, act_end, act_s, act_e = find_element(p_slice, "activation", 1)
+          if act_end then
+            activation = (act_s and act_e and act_e >= act_s) and parse_activation(p_slice:sub(act_s, act_e))
+              or { triggers = {} }
+          end
+
+          local managed, bom_imports, has_bom = collect_managed_entries(p_slice)
+          local p_no_dm = mask_blocks(p_slice, { "dependencyManagement" })
+          local deps = collect_direct_dependencies(p_no_dm)
+
+          profiles[#profiles + 1] = {
+            id = id,
+            activation = activation,
+            deps = deps,
+            managed = managed,
+            bom_imports = bom_imports,
+            has_bom = has_bom,
+          }
+        else
+          profiles[#profiles + 1] = {
+            id = nil,
+            activation = nil,
+            deps = {},
+            managed = {},
+            bom_imports = {},
+            has_bom = false,
+          }
+        end
+        prof_init = prof_end + 1
+      end
+    end
+    outer_init = outer_end + 1
+  end
+  return has_profiles, profiles
+end
+
+---Parse the parts of a POM that matter for dependency inspection and insertion. Pure.
 ---@param text string
----@return { deps: table[], managed: table[], has_parent: boolean, has_bom: boolean, has_profiles: boolean }
+---@return table
 function M._parse_pom(text)
   text = text or ""
   local masked = M._mask_xml(text)
-  local no_profiles = mask_blocks(masked, { "build", "reporting", "profiles" })
+  local no_build = mask_blocks(masked, { "build", "reporting" })
+  local no_profiles = mask_blocks(no_build, { "profiles" })
   local no_project = mask_blocks(no_profiles, { "dependencyManagement" })
+  local masked_top = mask_blocks(no_project, { "dependencies" })
 
-  -- project-level <dependencies>
-  local deps = {}
-  local open_s, open_e = no_project:find("<dependencies[^>]*>")
-  if open_s then
-    local close_s = no_project:find("</dependencies>", open_e + 1, true)
-    if close_s then
-      deps = collect_dependencies(text, open_e + 1, close_s - 1)
-    end
-  end
-
-  -- dependencyManagement entries (build/reporting/profiles already masked)
-  local managed = {}
-  local init = 1
-  while true do
-    local _, dm_open_e = no_profiles:find("<dependencyManagement[^>]*>", init)
-    if not dm_open_e then
-      break
-    end
-    local dm_close_s, dm_close_e = no_profiles:find("</dependencyManagement>", dm_open_e + 1, true)
-    if not dm_close_s then
-      break
-    end
-    local inner_open_s, inner_open_e = no_profiles:find("<dependencies[^>]*>", dm_open_e + 1)
-    if inner_open_s and inner_open_s < dm_close_s then
-      local inner_close_s = no_profiles:find("</dependencies>", inner_open_e + 1, true)
-      if inner_close_s and inner_close_s <= dm_close_s then
-        for _, entry in ipairs(collect_dependencies(text, inner_open_e + 1, inner_close_s - 1)) do
-          managed[#managed + 1] = {
-            groupId = entry.groupId,
-            artifactId = entry.artifactId,
-            version = entry.version,
-            type = entry.type,
-            scope = entry.scope,
-          }
-        end
-      end
-    end
-    init = dm_close_e + 1
-  end
-
-  local has_bom = false
-  for _, entry in ipairs(managed) do
-    if entry.type == "pom" and entry.scope == "import" then
-      has_bom = true
-      break
-    end
-  end
+  local deps = collect_direct_dependencies(no_project)
+  local managed, bom_imports, has_bom = collect_managed_entries(no_profiles)
+  local parent = parse_parent(masked_top)
+  local has_profiles, profiles = parse_profiles(no_build)
 
   return {
     deps = deps,
     managed = managed,
-    has_parent = masked:find("<parent[%s>]") ~= nil,
+    bom_imports = bom_imports,
+    parent = parent,
+    has_parent = parent ~= nil,
     has_bom = has_bom,
-    has_profiles = masked:find("<profiles[%s>]") ~= nil,
+    has_profiles = has_profiles,
+    profiles = profiles,
   }
 end
 
----Is groupId:artifactId literally declared in dependencyManagement (a BOM
----import itself does not count)? This is the only textual proof that the
----artifact's version is managed.
----@param parsed table|nil result of _parse_pom
+---@param value string|nil
+---@return string
+local function normalized_type(value)
+  if value == nil or value == "" then
+    return "jar"
+  end
+  return value
+end
+
+---@param value string|nil
+---@return string
+local function normalized_classifier(value)
+  if value == nil then
+    return ""
+  end
+  return value
+end
+
+---@param entry table
 ---@param groupId string
 ---@param artifactId string
+---@param dep_type string|nil
+---@param classifier string|nil
 ---@return boolean
-function M._is_exact_managed(parsed, groupId, artifactId)
-  for _, entry in ipairs((parsed and parsed.managed) or {}) do
-    if entry.groupId == groupId and entry.artifactId == artifactId then
+local function managed_entry_matches(entry, groupId, artifactId, dep_type, classifier)
+  return entry.groupId == groupId
+    and entry.artifactId == artifactId
+    and normalized_type(entry.type) == normalized_type(dep_type)
+    and normalized_classifier(entry.classifier) == normalized_classifier(classifier)
+end
+
+---First exact (non-BOM-import) entry in a dependencyManagement list matching G:A:type:classifier.
+---@param managed_list table[]|nil
+---@param groupId string
+---@param artifactId string
+---@param dep_type string|nil
+---@param classifier string|nil
+---@return table|nil
+local function find_exact_managed_entry(managed_list, groupId, artifactId, dep_type, classifier)
+  for _, entry in ipairs(managed_list or {}) do
+    if managed_entry_matches(entry, groupId, artifactId, dep_type, classifier) then
       local bom_import = entry.type == "pom" and entry.scope == "import"
       if not bom_import then
-        return true
+        return entry
       end
     end
   end
-  return false
+  return nil
+end
+
+---Is groupId:artifactId[:type[:classifier]] literally declared with a version
+---in project dependencyManagement (a BOM import itself does not count)? This is
+---the only textual proof that the artifact's version is managed.
+---@param parsed table|nil result of _parse_pom
+---@param groupId string
+---@param artifactId string
+---@param dep_type string|nil
+---@param classifier string|nil
+---@return boolean
+function M._is_exact_managed(parsed, groupId, artifactId, dep_type, classifier)
+  local entry = find_exact_managed_entry(parsed and parsed.managed, groupId, artifactId, dep_type, classifier)
+  return entry ~= nil and entry.version ~= nil and entry.version ~= ""
+end
+
+---@param parsed table
+---@param groupId string
+---@param artifactId string
+---@param dep_type string|nil
+---@param classifier string|nil
+---@return table
+local function build_bom_info(parsed, groupId, artifactId, dep_type, classifier)
+  local has_profile_bom = false
+  local has_profile_dm = false
+  for _, prof in ipairs((parsed and parsed.profiles) or {}) do
+    if prof.has_bom then
+      has_profile_bom = true
+    end
+    local entry = find_exact_managed_entry(prof.managed, groupId, artifactId, dep_type, classifier)
+    if entry and entry.version and entry.version ~= "" then
+      has_profile_dm = true
+    end
+  end
+  return {
+    exact_managed = M._is_exact_managed(parsed, groupId, artifactId, dep_type, classifier),
+    has_parent = parsed.has_parent,
+    has_bom = parsed.has_bom,
+    has_profile_bom = has_profile_bom,
+    has_profile_dm = has_profile_dm,
+  }
 end
 
 ---Literal groupId:artifactId duplicate among the project dependencies.
@@ -424,8 +678,8 @@ local function invalid_xml_value(value)
 end
 
 ---Validate a dependency before insertion.
----@param dep table { groupId, artifactId, version?, scope? }
----@param bom_info { exact_managed: boolean, has_parent: boolean, has_bom: boolean }|nil
+---@param dep table { groupId, artifactId, version?, scope?, type?, classifier? }
+---@param bom_info { exact_managed: boolean, has_parent: boolean, has_bom: boolean, has_profile_bom?: boolean, has_profile_dm?: boolean }|nil
 ---@return boolean|nil ok, string|nil err
 function M._validate_dep(dep, bom_info)
   if type(dep) ~= "table" then
@@ -444,11 +698,28 @@ function M._validate_dep(dep, bom_info)
       return nil, "invalid version: " .. tostring(version)
     end
   elseif not (bom_info and (bom_info.exact_managed or bom_info.has_bom or bom_info.has_parent)) then
+    if bom_info and (bom_info.has_profile_bom or bom_info.has_profile_dm) then
+      return nil,
+        ("a <version> is required: no unconditional <parent>, project dependencyManagement entry or project BOM import for %s:%s was found in pom.xml (profile declarations are conditional)"):format(
+          dep.groupId,
+          dep.artifactId
+        )
+    end
     return nil,
       ("a <version> is required: no <parent>, dependencyManagement entry or BOM import for %s:%s was found in pom.xml"):format(
         dep.groupId,
         dep.artifactId
       )
+  end
+
+  local dep_type = dep.type
+  if dep_type ~= nil and dep_type ~= "" and invalid_xml_value(dep_type) then
+    return nil, "invalid type: " .. tostring(dep_type)
+  end
+
+  local classifier = dep.classifier
+  if classifier ~= nil and classifier ~= "" and invalid_xml_value(classifier) then
+    return nil, "invalid classifier: " .. tostring(classifier)
   end
 
   local scope = dep.scope
@@ -468,12 +739,29 @@ end
 function M._detect_indent(text)
   local masked = M._mask_non_project_deps(text)
 
+  -- Collect lines after the first where leading whitespace before `<` matches
+  -- the unmasked text, so a leading `<!-- comment -->` masked to spaces never
+  -- masquerades as indentation.
+  local lines = {}
+  local pos = masked:find("\n", 1, true)
+  while pos do
+    local line_start = pos + 1
+    local next_nl = masked:find("\n", line_start, true)
+    local line_end = next_nl and (next_nl - 1) or #masked
+    local mline = masked:sub(line_start, line_end)
+    local m_lead = mline:match("^([ \t]*)<")
+    if m_lead and m_lead == text:sub(line_start, line_end):match("^([ \t]*)<") then
+      lines[#lines + 1] = mline
+    end
+    pos = next_nl
+  end
+
   local unit
   if masked:find("\n\t") then
     unit = "\t"
   else
     local min_spaces
-    for line in masked:gmatch("\n([^\n]*)") do
+    for _, line in ipairs(lines) do
       local spaces = line:match("^( +)<")
       if spaces and (min_spaces == nil or #spaces < min_spaces) then
         min_spaces = #spaces
@@ -483,10 +771,12 @@ function M._detect_indent(text)
   end
 
   local section
-  for line in masked:gmatch("\n([^\n]*)") do
+  for _, line in ipairs(lines) do
     local indent = line:match("^(%s*)<modelVersion[%s>]")
-      or line:match("^(%s*)<properties[%s>]")
-      or line:match("^(%s*)<dependencies[%s>]")
+      or line:match("^(%s*)<properties[%s>/]")
+      or line:match("^(%s*)<properties$")
+      or line:match("^(%s*)<dependencies[%s>/]")
+      or line:match("^(%s*)<dependencies$")
     if indent and indent ~= "" then
       section = indent
       break
@@ -495,7 +785,7 @@ function M._detect_indent(text)
   section = section or unit
 
   local dep
-  for line in masked:gmatch("\n([^\n]*)") do
+  for _, line in ipairs(lines) do
     local indent = line:match("^(%s*)<dependency[%s>]")
     if indent then
       dep = indent
@@ -507,6 +797,16 @@ function M._detect_indent(text)
   return unit, section, dep
 end
 
+---@param text string
+---@param pos integer
+---@return integer line_start, string lead
+local function line_lead(text, pos)
+  local prefix = text:sub(1, pos - 1)
+  local nl = prefix:match(".*()\n")
+  local line_start = (nl and nl + 1) or 1
+  return line_start, text:sub(line_start, pos - 1)
+end
+
 ---Insert `block` (already indented, no trailing newline) before the line that
 ---contains byte `pos` of `text`. Every other byte is preserved.
 ---@param text string
@@ -516,10 +816,7 @@ end
 ---@param close_indent string indent used when the target tag is inline
 ---@return string
 local function insert_before_line(text, pos, block, eol, close_indent)
-  local prefix = text:sub(1, pos - 1)
-  local nl = prefix:match(".*()\n")
-  local line_start = (nl and nl + 1) or 1
-  local lead = text:sub(line_start, pos - 1)
+  local line_start, lead = line_lead(text, pos)
   if lead:match("^[ \t]*$") then
     return text:sub(1, line_start - 1) .. block .. eol .. text:sub(line_start)
   end
@@ -527,17 +824,74 @@ local function insert_before_line(text, pos, block, eol, close_indent)
   return text:sub(1, pos - 1) .. eol .. block .. eol .. close_indent .. text:sub(pos)
 end
 
+---@param dep table
+---@param entry_indent string
+---@param unit string
+---@param eol string
+---@return string
+local function build_dependency_block(dep, entry_indent, unit, eol)
+  local version_omitted = dep.version == nil or dep.version == ""
+  local dep_type = dep.type ~= "" and dep.type or nil
+  local classifier = dep.classifier ~= "" and dep.classifier or nil
+  local scope = dep.scope ~= "" and dep.scope or nil
+
+  local inner = entry_indent .. unit
+  local element = {
+    entry_indent .. "<dependency>",
+    inner .. "<groupId>" .. dep.groupId .. "</groupId>",
+    inner .. "<artifactId>" .. dep.artifactId .. "</artifactId>",
+  }
+  if not version_omitted then
+    element[#element + 1] = inner .. "<version>" .. dep.version .. "</version>"
+  end
+  if dep_type and dep_type ~= "jar" then
+    element[#element + 1] = inner .. "<type>" .. dep_type .. "</type>"
+  end
+  if classifier then
+    element[#element + 1] = inner .. "<classifier>" .. classifier .. "</classifier>"
+  end
+  if scope and scope ~= "compile" then
+    element[#element + 1] = inner .. "<scope>" .. scope .. "</scope>"
+  end
+  element[#element + 1] = entry_indent .. "</dependency>"
+  return table.concat(element, eol)
+end
+
+---Expand a self-closing project-level `<dependencies/>` tag around one new
+---dependency entry, preserving every byte outside `[open_s, elem_end]`.
+---@param text string
+---@param open_s integer
+---@param elem_end integer
+---@param dep table
+---@param unit string
+---@param section string
+---@param sibling string
+---@param eol string
+---@return string
+local function expand_self_closing_dependencies(text, open_s, elem_end, dep, unit, section, sibling, eol)
+  local _, lead = line_lead(text, open_s)
+  local close_indent, entry_indent
+  if lead:match("^[ \t]*$") then
+    close_indent = lead
+    entry_indent = lead .. unit
+  else
+    local line_indent = lead:match("^([ \t]+)")
+    close_indent = line_indent or section
+    entry_indent = line_indent and (line_indent .. unit) or sibling
+  end
+  local block = build_dependency_block(dep, entry_indent, unit, eol)
+  local open_tag = text:sub(open_s, elem_end):gsub("%s*/>$", ">")
+  local expanded = open_tag .. eol .. block .. eol .. close_indent .. "</dependencies>"
+  return text:sub(1, open_s - 1) .. expanded .. text:sub(elem_end + 1)
+end
+
 ---Insert one dependency into a POM text, preserving bytes and comments.
 ---@param text string
----@param dep table { groupId, artifactId, version?, scope? }
+---@param dep table { groupId, artifactId, version?, scope?, type?, classifier? }
 ---@return string|nil new_text, table|nil meta, string|nil err
 function M._insert_maven_dependency(text, dep)
   local parsed = M._parse_pom(text)
-  local bom_info = {
-    exact_managed = M._is_exact_managed(parsed, dep.groupId, dep.artifactId),
-    has_parent = parsed.has_parent,
-    has_bom = parsed.has_bom,
-  }
+  local bom_info = build_bom_info(parsed, dep.groupId, dep.artifactId, dep.type, dep.classifier)
 
   local ok, err = M._validate_dep(dep, bom_info)
   if not ok then
@@ -552,25 +906,6 @@ function M._insert_maven_dependency(text, dep)
   local unit, section, sibling = M._detect_indent(text)
 
   local version_omitted = dep.version == nil or dep.version == ""
-  local scope = dep.scope
-  if scope == "" then
-    scope = nil
-  end
-
-  local inner = sibling .. unit
-  local element = {
-    sibling .. "<dependency>",
-    inner .. "<groupId>" .. dep.groupId .. "</groupId>",
-    inner .. "<artifactId>" .. dep.artifactId .. "</artifactId>",
-  }
-  if not version_omitted then
-    element[#element + 1] = inner .. "<version>" .. dep.version .. "</version>"
-  end
-  if scope and scope ~= "compile" then
-    element[#element + 1] = inner .. "<scope>" .. scope .. "</scope>"
-  end
-  element[#element + 1] = sibling .. "</dependency>"
-  local block = table.concat(element, eol)
 
   local meta = { created_section = false, version_omitted = version_omitted, bom_note = nil }
   if version_omitted and not bom_info.exact_managed then
@@ -585,18 +920,27 @@ function M._insert_maven_dependency(text, dep)
 
   local masked = M._mask_non_project_deps(text)
   local new_text
-  local open_s, open_e = masked:find("<dependencies[^>]*>")
+  local open_s, elem_end, body_s, body_e = find_element(masked, "dependencies", 1)
   if open_s then
-    local close_s = masked:find("</dependencies>", open_e + 1, true)
-    if not close_s then
-      return nil, nil, "could not find the closing </dependencies> of the project dependencies in pom.xml"
+    if body_s == nil then
+      if masked:sub(elem_end - 1, elem_end) ~= "/>" then
+        return nil, nil, "could not find the closing </dependencies> of the project dependencies in pom.xml"
+      end
+      new_text = expand_self_closing_dependencies(text, open_s, elem_end, dep, unit, section, sibling, eol)
+    else
+      local close_s = body_e + 1
+      if close_s > #masked then
+        return nil, nil, "could not find the closing </dependencies> of the project dependencies in pom.xml"
+      end
+      local block = build_dependency_block(dep, sibling, unit, eol)
+      new_text = insert_before_line(text, close_s, block, eol, section)
     end
-    new_text = insert_before_line(text, close_s, block, eol, section)
   else
     local project_close = masked:find("</project>", 1, true)
     if not project_close then
       return nil, nil, "could not find </project> in pom.xml"
     end
+    local block = build_dependency_block(dep, sibling, unit, eol)
     local new_section = table.concat({
       section .. "<dependencies>",
       block,
@@ -2417,6 +2761,401 @@ local function dependency_label(dep)
   return label
 end
 
+---@param profile table
+---@return string
+local function profile_label(profile)
+  return (profile and profile.id and profile.id ~= "") and profile.id or "(unnamed)"
+end
+
+---@param activation table|nil
+---@return string
+local function profile_activation_label(activation)
+  if not activation then
+    return "no <activation> declared"
+  end
+  local parts = {}
+  if activation.active_by_default ~= nil then
+    parts[#parts + 1] = "activeByDefault=" .. tostring(activation.active_by_default)
+  end
+  for _, trig in ipairs(activation.triggers or {}) do
+    parts[#parts + 1] = trig
+  end
+  if #parts == 0 then
+    parts[#parts + 1] = "declared"
+  end
+  return "activation: " .. table.concat(parts, ", ") .. " — not evaluated"
+end
+
+---@param parsed table
+---@return string
+local function format_parent_line(parsed)
+  if not parsed.has_parent then
+    return "Parent: none"
+  end
+  local p = parsed.parent
+  if p and p.groupId and p.artifactId then
+    local coord = p.groupId .. ":" .. p.artifactId .. (p.version and (":" .. p.version) or "")
+    local extra = p.relativePath and ("; relativePath=" .. p.relativePath) or ""
+    return ("Parent: %s (declared in pom.xml%s — inherited dependencies and dependencyManagement are not resolved)"):format(
+      coord,
+      extra
+    )
+  end
+  return "Parent: declared (<parent> in pom.xml; coordinates incomplete — inherited dependencies and dependencyManagement are not resolved)"
+end
+
+---@param parsed table
+---@return string
+local function format_bom_line(parsed)
+  local profile_boms = {}
+  for _, prof in ipairs(parsed.profiles or {}) do
+    if prof.has_bom then
+      profile_boms[#profile_boms + 1] = profile_label(prof)
+    end
+  end
+  if parsed.has_bom then
+    local extra = #profile_boms > 0 and ("; also in profile(s): " .. table.concat(profile_boms, ", ")) or ""
+    return ("BOM: import detected (%d in project <dependencyManagement> — imported POMs are not resolved; textual inspection cannot prove per-artifact coverage%s)"):format(
+      #(parsed.bom_imports or {}),
+      extra
+    )
+  end
+  if #profile_boms > 0 then
+    return ("BOM: none at project level (import detected in profile %s — conditional; imported POMs are not resolved; textual inspection cannot prove per-artifact coverage)"):format(
+      table.concat(profile_boms, ", ")
+    )
+  end
+  return "BOM: none"
+end
+
+---@param parsed table
+---@return string
+local function format_profiles_line(parsed)
+  if not parsed.has_profiles then
+    return "Profiles: none"
+  end
+  local count = #(parsed.profiles or {})
+  if count == 0 then
+    return "Profiles: present (0 declared — empty or commented-only <profiles> section)"
+  end
+  return ("Profiles: present (%d declared — conditional; activation is not evaluated)"):format(count)
+end
+
+---@param parsed table
+---@param current_profile table|nil
+---@return string[] all_boms, string[] other_boms
+local function profile_bom_labels(parsed, current_profile)
+  local all_boms, other_boms = {}, {}
+  for _, prof in ipairs(parsed.profiles or {}) do
+    if prof.has_bom then
+      if prof == current_profile then
+        all_boms[#all_boms + 1] = ("profile %q BOM import(s)"):format(profile_label(prof))
+      else
+        local label = ("profile %q BOM import(s) (conditional)"):format(profile_label(prof))
+        all_boms[#all_boms + 1] = label
+        other_boms[#other_boms + 1] = label
+      end
+    end
+  end
+  return all_boms, other_boms
+end
+
+---@param parsed table
+---@param profile table|nil
+---@return string[]
+local function unverified_sources_for(parsed, profile)
+  local unverified = {}
+  if parsed.has_parent then
+    unverified[#unverified + 1] = "<parent>"
+  end
+  if parsed.has_bom then
+    unverified[#unverified + 1] = "project BOM import(s)"
+  end
+  for _, label in ipairs(profile_bom_labels(parsed, profile)) do
+    unverified[#unverified + 1] = label
+  end
+  return unverified
+end
+
+---@param parsed table
+---@param dep table
+---@param current_profile table|nil
+---@return table[]
+local function collect_other_profile_dms(parsed, dep, current_profile)
+  local matches = {}
+  for _, prof in ipairs(parsed.profiles or {}) do
+    if prof ~= current_profile then
+      local entry = find_exact_managed_entry(prof.managed, dep.groupId, dep.artifactId, dep.type, dep.classifier)
+      if entry then
+        matches[#matches + 1] = { profile = prof, entry = entry }
+      end
+    end
+  end
+  return matches
+end
+
+---@param matches table[]
+---@return string
+local function format_profile_dm_candidates(matches)
+  local parts = {}
+  for _, match in ipairs(matches) do
+    parts[#parts + 1] = ("%q (%s)"):format(profile_label(match.profile), match.entry.version or "no <version>")
+  end
+  return table.concat(parts, ", ")
+end
+
+---@param matches table[]
+---@param base_version string
+---@return boolean
+local function has_overriding_profile_dm(matches, base_version)
+  for _, match in ipairs(matches) do
+    local ver = match.entry.version
+    if ver and ver ~= "" and ver ~= base_version then
+      return true
+    end
+  end
+  return false
+end
+
+---@param parsed table
+---@param dep table
+---@param profile table|nil
+---@return string[]
+local function maven_dependency_detail(parsed, dep, profile)
+  local detail = {}
+  if dep.scope then
+    detail[#detail + 1] = "scope=" .. dep.scope
+  end
+  if dep.type then
+    detail[#detail + 1] = "type=" .. dep.type
+  end
+  if dep.classifier then
+    detail[#detail + 1] = "classifier=" .. dep.classifier
+  end
+  if dep.optional then
+    detail[#detail + 1] = "optional=" .. dep.optional
+  end
+
+  local proj_dm = find_exact_managed_entry(parsed.managed, dep.groupId, dep.artifactId, dep.type, dep.classifier)
+  local own_prof_dm = profile
+      and find_exact_managed_entry(profile.managed, dep.groupId, dep.artifactId, dep.type, dep.classifier)
+    or nil
+  local other_profile_dms = collect_other_profile_dms(parsed, dep, profile)
+
+  if dep.version then
+    if dep.version:match("%${.-}") then
+      detail[#detail + 1] = "version property not evaluated"
+    end
+    local primary_dm = (own_prof_dm and own_prof_dm.version) and own_prof_dm or proj_dm
+    local primary_source = (own_prof_dm and own_prof_dm.version)
+        and ("profile %q <dependencyManagement>"):format(profile_label(profile))
+      or "project <dependencyManagement>"
+    if primary_dm and primary_dm.version then
+      if primary_dm.version ~= dep.version then
+        detail[#detail + 1] = ("explicit <version>; %s declares %s"):format(primary_source, primary_dm.version)
+      else
+        detail[#detail + 1] = ("explicit <version>; also declared in %s"):format(primary_source)
+      end
+    end
+    return detail
+  end
+
+  local all_profile_boms, other_profile_boms = profile_bom_labels(parsed, profile)
+
+  if own_prof_dm and own_prof_dm.version then
+    local uncertain = #other_profile_boms > 0 or has_overriding_profile_dm(other_profile_dms, own_prof_dm.version)
+    local msg
+    if uncertain then
+      msg = ("managed candidate in profile %q <dependencyManagement>: %s (conditional"):format(
+        profile_label(profile),
+        own_prof_dm.version
+      )
+      if proj_dm and proj_dm.version and proj_dm.version ~= own_prof_dm.version then
+        msg = msg .. ("; overrides project <dependencyManagement> %s"):format(proj_dm.version)
+      end
+      msg = msg .. ")"
+      if #other_profile_dms > 0 then
+        msg = msg
+          .. "; other active profile(s) may also manage/override: "
+          .. format_profile_dm_candidates(other_profile_dms)
+      end
+      if #other_profile_boms > 0 then
+        msg = msg .. "; unverified: " .. table.concat(other_profile_boms, ", ") .. " not resolved"
+      end
+      msg = msg .. " — effective version not proven"
+    else
+      msg = ("version=%s, managed by profile %q <dependencyManagement>; conditional"):format(
+        own_prof_dm.version,
+        profile_label(profile)
+      )
+      if proj_dm and proj_dm.version and proj_dm.version ~= own_prof_dm.version then
+        msg = msg .. ("; overrides project <dependencyManagement> %s"):format(proj_dm.version)
+      end
+      if #other_profile_dms > 0 then
+        msg = msg
+          .. "; also matched in profile <dependencyManagement>: "
+          .. format_profile_dm_candidates(other_profile_dms)
+      end
+    end
+    if own_prof_dm.version:match("%${.-}") then
+      msg = msg .. "; version property not evaluated"
+    end
+    detail[#detail + 1] = msg
+    return detail
+  end
+
+  if proj_dm and proj_dm.version then
+    local own_no_ver = own_prof_dm
+        and ("profile %q <dependencyManagement> matched without <version>"):format(profile_label(profile))
+      or nil
+    local uncertain = #all_profile_boms > 0 or has_overriding_profile_dm(other_profile_dms, proj_dm.version)
+    local msg
+    if uncertain then
+      msg = ("managed candidate in project <dependencyManagement>: %s"):format(proj_dm.version)
+      if own_no_ver then
+        msg = msg .. "; " .. own_no_ver
+      end
+      if #other_profile_dms > 0 then
+        msg = msg
+          .. "; conditional override in profile <dependencyManagement>: "
+          .. format_profile_dm_candidates(other_profile_dms)
+          .. " (activation not evaluated)"
+      end
+      if #all_profile_boms > 0 then
+        msg = msg .. "; unverified: " .. table.concat(all_profile_boms, ", ") .. " not resolved"
+      end
+      msg = msg .. " — effective version not proven"
+    else
+      msg = ("version=%s, managed by project <dependencyManagement>"):format(proj_dm.version)
+      if own_no_ver then
+        msg = msg .. "; " .. own_no_ver
+      end
+      if #other_profile_dms > 0 then
+        msg = msg
+          .. "; also matched in profile <dependencyManagement>: "
+          .. format_profile_dm_candidates(other_profile_dms)
+          .. " (activation not evaluated)"
+      end
+    end
+    if proj_dm.version:match("%${.-}") then
+      msg = msg .. "; version property not evaluated"
+    end
+    detail[#detail + 1] = msg
+    return detail
+  end
+
+  local unverified = unverified_sources_for(parsed, profile)
+  local matched_no_ver_source
+  if own_prof_dm then
+    matched_no_ver_source = ("profile %q <dependencyManagement>"):format(profile_label(profile))
+  elseif proj_dm then
+    matched_no_ver_source = "project <dependencyManagement>"
+  end
+
+  if matched_no_ver_source then
+    if #unverified > 0 or #other_profile_dms > 0 then
+      local msg = ("version unspecified locally; matched in %s without <version>"):format(matched_no_ver_source)
+      if #unverified > 0 then
+        msg = msg .. "; unverified: " .. table.concat(unverified, ", ") .. " not resolved"
+      end
+      if #other_profile_dms > 0 then
+        msg = msg
+          .. "; conditional match in profile <dependencyManagement>: "
+          .. format_profile_dm_candidates(other_profile_dms)
+          .. " (activation not evaluated)"
+      end
+      detail[#detail + 1] = msg
+    else
+      detail[#detail + 1] = ("version missing; matched in %s without <version> and no BOM import or <parent> in pom.xml"):format(
+        matched_no_ver_source
+      )
+    end
+    return detail
+  end
+
+  if #unverified > 0 then
+    local msg = ("version unspecified locally; unverified: %s not resolved"):format(table.concat(unverified, ", "))
+    if #other_profile_dms > 0 then
+      msg = msg
+        .. "; conditional match in profile <dependencyManagement>: "
+        .. format_profile_dm_candidates(other_profile_dms)
+        .. " (activation not evaluated)"
+    end
+    detail[#detail + 1] = msg
+  elseif #other_profile_dms > 0 then
+    local scope_desc = profile and ("in profile %q and project"):format(profile_label(profile)) or "at project level"
+    detail[#detail + 1] = ("version missing %s; conditional match in profile <dependencyManagement>: %s (activation not evaluated)"):format(
+      scope_desc,
+      format_profile_dm_candidates(other_profile_dms)
+    )
+  else
+    detail[#detail + 1] =
+      "version missing (no <version>, exact <dependencyManagement>, BOM import, or <parent> in pom.xml)"
+  end
+  return detail
+end
+
+---@param lines string[]
+---@param indent string
+---@param parsed table
+---@param deps_list table[]
+---@param profile table|nil
+local function append_maven_deps_lines(lines, indent, parsed, deps_list, profile)
+  if #deps_list == 0 then
+    lines[#lines + 1] = indent .. "(none)"
+    return
+  end
+  for _, dep in ipairs(deps_list) do
+    local detail = maven_dependency_detail(parsed, dep, profile)
+    lines[#lines + 1] = indent
+      .. "- "
+      .. dependency_label(dep)
+      .. (#detail > 0 and ("  (" .. table.concat(detail, ", ") .. ")") or "")
+  end
+end
+
+---@param lines string[]
+---@param indent string
+---@param entries table[]
+---@param provenance_label string
+---@param project_managed table[]|nil
+local function append_maven_managed_lines(lines, indent, entries, provenance_label, project_managed)
+  for _, entry in ipairs(entries) do
+    local detail = {}
+    if entry.type then
+      detail[#detail + 1] = "type=" .. entry.type
+    end
+    if entry.classifier then
+      detail[#detail + 1] = "classifier=" .. entry.classifier
+    end
+    if entry.scope then
+      detail[#detail + 1] = "scope=" .. entry.scope
+    end
+    local is_bom = entry.type == "pom" and entry.scope == "import"
+    if is_bom then
+      detail[#detail + 1] = "BOM import — managed artifacts not resolved"
+    elseif entry.version then
+      detail[#detail + 1] = "provenance: " .. provenance_label
+      if entry.version:match("%${.-}") then
+        detail[#detail + 1] = "version property not evaluated"
+      end
+      if project_managed then
+        local proj_entry =
+          find_exact_managed_entry(project_managed, entry.groupId, entry.artifactId, entry.type, entry.classifier)
+        if proj_entry and proj_entry.version and proj_entry.version ~= entry.version then
+          detail[#detail + 1] = "overrides project <dependencyManagement> " .. proj_entry.version .. " when active"
+        end
+      end
+    else
+      detail[#detail + 1] = "no <version> declared in " .. provenance_label
+    end
+    lines[#lines + 1] = indent
+      .. "- "
+      .. dependency_label(entry)
+      .. (#detail > 0 and ("  (" .. table.concat(detail, ", ") .. ")") or "")
+  end
+end
+
 ---Read-only Dependencies report lines. Pure: only reads the build files.
 ---@param target table result of _resolve_target
 ---@return string[]
@@ -2431,47 +3170,46 @@ function M._report_lines(target)
     local text = read_file(target.build_file) or ""
     local parsed = M._parse_pom(text)
 
-    lines[#lines + 1] = "Parent: " .. (parsed.has_parent and "declared (<parent> in pom.xml)" or "none")
+    lines[#lines + 1] = format_parent_line(parsed)
     local managed_count = #parsed.managed
     lines[#lines + 1] = ("Dependency management: %d entr%s"):format(managed_count, managed_count == 1 and "y" or "ies")
-    if parsed.has_bom then
-      lines[#lines + 1] = "BOM: import detected — textual inspection cannot prove per-artifact coverage"
-    end
-    if parsed.has_profiles then
-      lines[#lines + 1] = "Profiles: present (dependencies declared inside profiles are not listed)"
-    end
+    lines[#lines + 1] = format_bom_line(parsed)
+    lines[#lines + 1] = format_profiles_line(parsed)
 
     lines[#lines + 1] = ("Dependencies: %d"):format(#parsed.deps)
-    if #parsed.deps == 0 then
-      lines[#lines + 1] = "  (none)"
-    else
-      for _, dep in ipairs(parsed.deps) do
-        local detail = {}
-        if dep.scope then
-          detail[#detail + 1] = "scope=" .. dep.scope
-        end
-        if dep.optional then
-          detail[#detail + 1] = "optional=" .. dep.optional
-        end
-        lines[#lines + 1] = "  - "
-          .. dependency_label(dep)
-          .. (#detail > 0 and ("  (" .. table.concat(detail, ", ") .. ")") or "")
-      end
-    end
+    append_maven_deps_lines(lines, "  ", parsed, parsed.deps, nil)
 
     if managed_count > 0 then
       lines[#lines + 1] = "Managed entries:"
-      for _, entry in ipairs(parsed.managed) do
-        local detail = {}
-        if entry.type then
-          detail[#detail + 1] = "type=" .. entry.type
+      append_maven_managed_lines(lines, "  ", parsed.managed, "project <dependencyManagement>", nil)
+    end
+
+    if #(parsed.profiles or {}) > 0 then
+      lines[#lines + 1] = "Profile declarations (conditional — activation not evaluated):"
+      for _, prof in ipairs(parsed.profiles) do
+        local label = profile_label(prof)
+        lines[#lines + 1] = ("  - Profile: %s  (%s)"):format(label, profile_activation_label(prof.activation))
+        if prof.has_bom then
+          lines[#lines + 1] = ("    BOM: import detected (%d in profile %q <dependencyManagement> — imported POMs are not resolved; textual inspection cannot prove per-artifact coverage)"):format(
+            #(prof.bom_imports or {}),
+            label
+          )
         end
-        if entry.scope then
-          detail[#detail + 1] = "scope=" .. entry.scope
+        if #prof.managed > 0 then
+          lines[#lines + 1] = ("    Dependency management: %d entr%s"):format(
+            #prof.managed,
+            #prof.managed == 1 and "y" or "ies"
+          )
+          append_maven_managed_lines(
+            lines,
+            "      ",
+            prof.managed,
+            ("profile %q <dependencyManagement>"):format(label),
+            parsed.managed
+          )
         end
-        lines[#lines + 1] = "  - "
-          .. dependency_label(entry)
-          .. (#detail > 0 and ("  (" .. table.concat(detail, ", ") .. ")") or "")
+        lines[#lines + 1] = ("    Dependencies: %d"):format(#prof.deps)
+        append_maven_deps_lines(lines, "      ", parsed, prof.deps, prof)
       end
     end
     return lines
@@ -2595,6 +3333,9 @@ local function version_hint(bom_info)
   if bom_info.has_parent then
     return "optional — a <parent> is declared (coverage cannot be verified textually)"
   end
+  if bom_info.has_profile_bom or bom_info.has_profile_dm then
+    return "required — no unconditional parent, project BOM or project dependencyManagement entry (profile declarations are conditional)"
+  end
   return "required — no parent, BOM or dependencyManagement entry for this artifact"
 end
 
@@ -2621,12 +3362,8 @@ function M.add(bufnr, target)
   end
   local parsed = M._parse_pom(text)
 
-  local function bom_info_of(group, artifact)
-    return {
-      exact_managed = M._is_exact_managed(parsed, group, artifact),
-      has_parent = parsed.has_parent,
-      has_bom = parsed.has_bom,
-    }
+  local function bom_info_of(group, artifact, dep_type, classifier)
+    return build_bom_info(parsed, group, artifact, dep_type, classifier)
   end
 
   local step_confirm, step_scope, manual, search

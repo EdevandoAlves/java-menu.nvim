@@ -1755,6 +1755,1488 @@ end
 
 interactive_spec()
 
+local function maven_profiles_provenance_spec()
+  -- ---------- 19. Maven: perfis, proveniência gerenciada, parent/BOM, comentários e versões ausentes ----------
+
+  -- A) POM rico com parent, BOM import, dependencyManagement com/sem versão, comentários,
+  --    propriedades, build dentro de profile e perfis com versões/BOM próprios
+  local rich_pom = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <parent>",
+    "    <groupId>com.corp</groupId>",
+    "    <artifactId>corp-parent</artifactId>",
+    "    <!-- <version>0.0.1-comment</version> -->",
+    "    <version>3.1.0</version>",
+    "    <relativePath>../parent/pom.xml</relativePath>",
+    "  </parent>",
+    "  <artifactId>service</artifactId>",
+    "  <dependencyManagement>",
+    "    <dependencies>",
+    "      <dependency>",
+    "        <groupId>org.junit</groupId>",
+    "        <artifactId>junit-bom</artifactId>",
+    "        <version>5.10.2</version>",
+    "        <type>pom</type>",
+    "        <scope>import</scope>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.fasterxml.jackson.core</groupId>",
+    "        <artifactId>jackson-databind</artifactId>",
+    "        <version>2.17.1</version>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>dm-no-version</artifactId>",
+    "        <!-- <version>9.9.9</version> -->",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>prop-managed</artifactId>",
+    "        <version>${prop.ver}</version>",
+    "      </dependency>",
+    "    </dependencies>",
+    "  </dependencyManagement>",
+    "  <dependencies>",
+    "    <dependency>",
+    "      <groupId>com.fasterxml.jackson.core</groupId>",
+    "      <artifactId>jackson-databind</artifactId>",
+    "      <!-- <version>0.9.9</version> -->",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>org.junit.jupiter</groupId>",
+    "      <artifactId>junit-jupiter-api</artifactId>",
+    "      <scope>test</scope>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>dm-no-version</artifactId>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>prop-dep</artifactId>",
+    "      <version>${direct.ver}</version>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>override-dm</artifactId>",
+    "      <version>2.18.0</version>",
+    "    </dependency>",
+    "  </dependencies>",
+    "  <profiles>",
+    "    <!-- <profile>",
+    "      <id>commented-out</id>",
+    "      <dependencies>",
+    "        <dependency><groupId>fake.comment</groupId><artifactId>nope</artifactId><version>1.0</version></dependency>",
+    "      </dependencies>",
+    "    </profile> -->",
+    "    <profile>",
+    "      <repositories>",
+    "        <repository><id>corp-repo</id></repository>",
+    "      </repositories>",
+    "      <!-- <id>fake-id</id> -->",
+    "      <id>dev</id>",
+    "      <activation>",
+    "        <!-- <activeByDefault>false</activeByDefault> -->",
+    "        <activeByDefault>true</activeByDefault>",
+    "        <property><name>env</name></property>",
+    "      </activation>",
+    "      <dependencyManagement>",
+    "        <dependencies>",
+    "          <dependency>",
+    "            <groupId>com.fasterxml.jackson.core</groupId>",
+    "            <artifactId>jackson-databind</artifactId>",
+    "            <version>2.18.0-rc1</version>",
+    "          </dependency>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>dev-managed</artifactId>",
+    "            <version>4.2.0</version>",
+    "          </dependency>",
+    "        </dependencies>",
+    "      </dependencyManagement>",
+    "      <build>",
+    "        <plugins>",
+    "          <plugin>",
+    "            <artifactId>maven-surefire-plugin</artifactId>",
+    "            <dependencies>",
+    "              <dependency>",
+    "                <groupId>plugin.inside.profile</groupId>",
+    "                <artifactId>leak</artifactId>",
+    "                <version>1.0</version>",
+    "              </dependency>",
+    "            </dependencies>",
+    "          </plugin>",
+    "        </plugins>",
+    "      </build>",
+    "      <dependencies>",
+    "        <dependency>",
+    "          <groupId>com.fasterxml.jackson.core</groupId>",
+    "          <artifactId>jackson-databind</artifactId>",
+    "        </dependency>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>dev-managed</artifactId>",
+    "        </dependency>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>prop-managed</artifactId>",
+    "        </dependency>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>dev-explicit</artifactId>",
+    "          <version>1.5.0-dev</version>",
+    "          <scope>runtime</scope>",
+    "        </dependency>",
+    "      </dependencies>",
+    "    </profile>",
+    "    <profile>",
+    "      <activation>",
+    "        <jdk>21</jdk>",
+    "      </activation>",
+    "      <dependencies>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>unnamed-profile-dep</artifactId>",
+    "          <version>9.0.0</version>",
+    "        </dependency>",
+    "      </dependencies>",
+    "    </profile>",
+    "  </profiles>",
+    "</project>",
+  }, "\n")
+
+  local rich_parsed = deps._parse_pom(rich_pom)
+  assert(rich_parsed.has_parent == true)
+  assert(
+    rich_parsed.parent
+      and rich_parsed.parent.groupId == "com.corp"
+      and rich_parsed.parent.artifactId == "corp-parent"
+      and rich_parsed.parent.version == "3.1.0"
+      and rich_parsed.parent.relativePath == "../parent/pom.xml",
+    "parent com comentário mal lido: " .. vim.inspect(rich_parsed.parent)
+  )
+  assert(#rich_parsed.deps == 5, "esperava 5 deps no projeto: " .. #rich_parsed.deps)
+  assert(rich_parsed.deps[1].version == nil, "comentário de versão dentro de <dependency> vazou")
+  assert(#rich_parsed.managed == 4, "esperava 4 managed entries: " .. #rich_parsed.managed)
+  assert(rich_parsed.managed[3].version == nil, "comentário de versão em dependencyManagement vazou")
+  assert(rich_parsed.has_bom == true and #(rich_parsed.bom_imports or {}) == 1)
+  assert(rich_parsed.has_profiles == true and #(rich_parsed.profiles or {}) == 2)
+
+  local dev_prof = rich_parsed.profiles[1]
+  assert(dev_prof.id == "dev", "id do profile foi sequestrado por repository ou comentário: " .. tostring(dev_prof.id))
+  assert(dev_prof.activation and dev_prof.activation.active_by_default == true, "activeByDefault comentado interferiu")
+  assert(dev_prof.activation.triggers[1] == "property")
+  assert(#dev_prof.managed == 2, "esperava 2 managed entries no profile dev: " .. #dev_prof.managed)
+  assert(#dev_prof.deps == 4, "plugin dentro de profile vazou ou dep faltou: " .. #dev_prof.deps)
+  for _, d in ipairs(dev_prof.deps) do
+    assert(d.groupId ~= "plugin.inside.profile", "dependência de plugin dentro de profile vazou")
+    assert(d.groupId ~= "fake.comment", "profile comentado vazou")
+  end
+  assert(rich_parsed.profiles[2].id == nil, "profile sem <id> deveria ter id nil")
+  assert(rich_parsed.profiles[2].activation.triggers[1] == "jdk")
+
+  -- Preservação de duplicata e inserção: dep exclusiva de profile NÃO bloqueia inserção no projeto
+  local prof_insert_ok, _, prof_insert_err = deps._insert_maven_dependency(rich_pom, {
+    groupId = "com.example",
+    artifactId = "dev-explicit",
+    version = "1.0.0",
+  })
+  assert(prof_insert_ok and not prof_insert_err, "dep exclusiva de profile não pode bloquear inserção no projeto")
+
+  local rich_dir = tempdir("maven-rich-report")
+  local rich_pom_path = rich_dir .. "/pom.xml"
+  write_raw(rich_pom_path, rich_pom)
+  local rich_report = table.concat(
+    deps._report_lines({
+      root = rich_dir,
+      tool = "maven",
+      modules = { rich_dir },
+      module = rich_dir,
+      build_file = rich_pom_path,
+      is_kotlin_dsl = false,
+    }),
+    "\n"
+  )
+
+  -- O relatório nunca pode alterar o pom.xml
+  assert(read_raw(rich_pom_path) == rich_pom, "relatório alterou pom.xml em disco")
+
+  assert(
+    rich_report:find(
+      "Parent: com.corp:corp-parent:3.1.0 (declared in pom.xml; relativePath=../parent/pom.xml — inherited dependencies and dependencyManagement are not resolved)",
+      1,
+      true
+    ),
+    "linha de parent divergiu:\n" .. rich_report
+  )
+  assert(
+    rich_report:find(
+      "BOM: import detected (1 in project <dependencyManagement> — imported POMs are not resolved; textual inspection cannot prove per-artifact coverage)",
+      1,
+      true
+    ),
+    "linha de BOM divergiu:\n" .. rich_report
+  )
+  assert(
+    rich_report:find("Profiles: present (2 declared — conditional; activation is not evaluated)", 1, true),
+    "resumo de profiles divergiu:\n" .. rich_report
+  )
+  assert(
+    rich_report:find(
+      '  - com.fasterxml.jackson.core:jackson-databind  (managed candidate in project <dependencyManagement>: 2.17.1; conditional override in profile <dependencyManagement>: "dev" (2.18.0-rc1) (activation not evaluated) — effective version not proven)',
+      1,
+      true
+    ),
+    "precedência/incerteza condicional do project dependencyManagement ausente:\n" .. rich_report
+  )
+  assert(
+    not rich_report:find("- com.fasterxml.jackson.core:jackson-databind  (version=2.17.1", 1, true),
+    "versão efetiva não comprovada foi afirmada para jackson-databind:\n" .. rich_report
+  )
+  assert(
+    rich_report:find(
+      "  - org.junit.jupiter:junit-jupiter-api  (scope=test, version unspecified locally; unverified: <parent>, project BOM import(s) not resolved)",
+      1,
+      true
+    ),
+    "limitação de BOM/parent ausente:\n" .. rich_report
+  )
+  assert(
+    rich_report:find(
+      "  - com.example:dm-no-version  (version unspecified locally; matched in project <dependencyManagement> without <version>; unverified: <parent>, project BOM import(s) not resolved)",
+      1,
+      true
+    ),
+    "entrada gerenciada sem versão deveria manter honestidade:\n" .. rich_report
+  )
+  assert(
+    rich_report:find("  - com.example:prop-dep:${direct.ver}  (version property not evaluated)", 1, true),
+    "nota de propriedade não avaliada ausente:\n" .. rich_report
+  )
+  assert(
+    rich_report:find(
+      "  - org.junit:junit-bom:5.10.2  (type=pom, scope=import, BOM import — managed artifacts not resolved)",
+      1,
+      true
+    ),
+    "nota de BOM em Managed entries ausente:\n" .. rich_report
+  )
+  assert(
+    rich_report:find("  - Profile: dev  (activation: activeByDefault=true, property — not evaluated)", 1, true),
+    "contexto do profile dev ausente:\n" .. rich_report
+  )
+  assert(
+    rich_report:find(
+      '      - com.fasterxml.jackson.core:jackson-databind:2.18.0-rc1  (provenance: profile "dev" <dependencyManagement>, overrides project <dependencyManagement> 2.17.1 when active)',
+      1,
+      true
+    ),
+    "override de dependencyManagement no profile ausente:\n" .. rich_report
+  )
+  assert(
+    rich_report:find(
+      '      - com.fasterxml.jackson.core:jackson-databind  (version=2.18.0-rc1, managed by profile "dev" <dependencyManagement>; conditional; overrides project <dependencyManagement> 2.17.1)',
+      1,
+      true
+    ),
+    "proveniência de versão específica do profile ausente:\n" .. rich_report
+  )
+  assert(
+    rich_report:find(
+      '      - com.example:dev-managed  (version=4.2.0, managed by profile "dev" <dependencyManagement>; conditional)',
+      1,
+      true
+    ),
+    "versão gerenciada pelo próprio profile ausente:\n" .. rich_report
+  )
+  assert(
+    rich_report:find(
+      "      - com.example:prop-managed  (version=${prop.ver}, managed by project <dependencyManagement>; version property not evaluated)",
+      1,
+      true
+    ),
+    "fallback para project dependencyManagement dentro do profile falhou:\n" .. rich_report
+  )
+  assert(
+    rich_report:find("      - com.example:dev-explicit:1.5.0-dev  (scope=runtime)", 1, true),
+    "versão explícita no profile ausente:\n" .. rich_report
+  )
+  assert(
+    rich_report:find("  - Profile: (unnamed)  (activation: jdk — not evaluated)", 1, true),
+    "profile sem id não exibido:\n" .. rich_report
+  )
+  assert(not rich_report:find("fake.comment", 1, true), "profile comentado vazou no relatório")
+  assert(not rich_report:find("plugin.inside.profile", 1, true), "plugin de profile vazou no relatório")
+  assert(not rich_report:find("9.9.9", 1, true), "versão comentada vazou no relatório")
+
+  -- B) Sem parent e sem BOM de projeto: versão ausente, match condicional só em profile,
+  --    e BOM import declarado apenas dentro de profile (nunca promove para o projeto!)
+  local isolated_pom = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.isolated</groupId>",
+    "  <artifactId>app</artifactId>",
+    "  <version>1.0</version>",
+    "  <!-- <parent><groupId>fake</groupId><artifactId>p</artifactId><version>1</version></parent> -->",
+    "  <dependencies>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>truly-missing</artifactId>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>only-profile-managed</artifactId>",
+    "    </dependency>",
+    "  </dependencies>",
+    "  <profiles>",
+    "    <profile>",
+    "      <id>ci</id>",
+    "      <dependencyManagement>",
+    "        <dependencies>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>only-profile-managed</artifactId>",
+    "            <version>7.1.0</version>",
+    "          </dependency>",
+    "          <dependency>",
+    "            <groupId>org.springframework.boot</groupId>",
+    "            <artifactId>spring-boot-dependencies</artifactId>",
+    "            <version>3.2.5</version>",
+    "            <type>pom</type>",
+    "            <scope>import</scope>",
+    "          </dependency>",
+    "        </dependencies>",
+    "      </dependencyManagement>",
+    "      <dependencies>",
+    "        <dependency>",
+    "          <groupId>org.springframework.boot</groupId>",
+    "          <artifactId>spring-boot-starter-web</artifactId>",
+    "        </dependency>",
+    "      </dependencies>",
+    "    </profile>",
+    "  </profiles>",
+    "</project>",
+  }, "\n")
+
+  local iso_parsed = deps._parse_pom(isolated_pom)
+  assert(iso_parsed.has_parent == false, "<parent> comentado foi detectado")
+  assert(iso_parsed.has_bom == false, "BOM apenas de profile não pode contar como BOM de projeto")
+  assert(
+    deps._is_exact_managed(iso_parsed, "com.example", "only-profile-managed") == false,
+    "dependencyManagement de profile não pode contar como gerenciamento incondicional do projeto"
+  )
+  -- Inserção no projeto sem <version> continua recusada mesmo com BOM/DM em profile
+  local iso_ins, _, iso_ins_err = deps._insert_maven_dependency(isolated_pom, {
+    groupId = "com.example",
+    artifactId = "only-profile-managed",
+  })
+  assert(iso_ins == nil and iso_ins_err and iso_ins_err:find("<version> is required", 1, true))
+
+  local iso_dir = tempdir("maven-isolated-report")
+  local iso_pom_path = iso_dir .. "/pom.xml"
+  write_raw(iso_pom_path, isolated_pom)
+  local iso_report = table.concat(
+    deps._report_lines({
+      root = iso_dir,
+      tool = "maven",
+      modules = { iso_dir },
+      module = iso_dir,
+      build_file = iso_pom_path,
+      is_kotlin_dsl = false,
+    }),
+    "\n"
+  )
+  assert(iso_report:find("Parent: none", 1, true), "parent comentado vazou:\n" .. iso_report)
+  assert(
+    iso_report:find(
+      "BOM: none at project level (import detected in profile ci — conditional; imported POMs are not resolved; textual inspection cannot prove per-artifact coverage)",
+      1,
+      true
+    ),
+    "BOM de profile mal reportado:\n" .. iso_report
+  )
+  assert(
+    iso_report:find(
+      '  - com.example:truly-missing  (version unspecified locally; unverified: profile "ci" BOM import(s) (conditional) not resolved)',
+      1,
+      true
+    ),
+    "BOM condicional de profile não sinalizado na dependência de projeto:\n" .. iso_report
+  )
+  assert(
+    not iso_report:find("no <version>, exact <dependencyManagement>, BOM import, or <parent> in pom.xml", 1, true),
+    "não pode afirmar ausência de BOM quando existe BOM em profile:\n" .. iso_report
+  )
+  assert(
+    iso_report:find(
+      '  - com.example:only-profile-managed  (version unspecified locally; unverified: profile "ci" BOM import(s) (conditional) not resolved; conditional match in profile <dependencyManagement>: "ci" (7.1.0) (activation not evaluated))',
+      1,
+      true
+    ),
+    "match condicional em profile e BOM condicional não sinalizados:\n" .. iso_report
+  )
+  assert(
+    iso_report:find(
+      '      - org.springframework.boot:spring-boot-starter-web  (version unspecified locally; unverified: profile "ci" BOM import(s) not resolved)',
+      1,
+      true
+    ),
+    "dependência coberta só por BOM de profile deve permanecer não verificada:\n" .. iso_report
+  )
+
+  -- C) Tags auto-fechadas e <profiles> vazio ou só com comentários não quebram o parsing
+  local self_closing_pom = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.sc</groupId>",
+    "  <artifactId>sc</artifactId>",
+    "  <version>1.0</version>",
+    "  <build/>",
+    "  <profiles><!-- <profile><id>ghost</id></profile> --></profiles>",
+    "  <dependencies>",
+    "    <dependency>",
+    "      <groupId>org.slf4j</groupId>",
+    "      <artifactId>slf4j-api</artifactId>",
+    "      <version>2.0.13</version>",
+    "    </dependency>",
+    "  </dependencies>",
+    "</project>",
+  }, "\n")
+  local sc_parsed = deps._parse_pom(self_closing_pom)
+  assert(#sc_parsed.deps == 1 and sc_parsed.deps[1].artifactId == "slf4j-api", "<build/> engoliu <dependencies>")
+  assert(sc_parsed.has_profiles == true and #sc_parsed.profiles == 0)
+
+  local sc_dir = tempdir("maven-self-closing")
+  write_raw(sc_dir .. "/pom.xml", self_closing_pom)
+  local sc_report = table.concat(
+    deps._report_lines({
+      root = sc_dir,
+      tool = "maven",
+      modules = { sc_dir },
+      module = sc_dir,
+      build_file = sc_dir .. "/pom.xml",
+      is_kotlin_dsl = false,
+    }),
+    "\n"
+  )
+  assert(
+    sc_report:find("Profiles: present (0 declared — empty or commented-only <profiles> section)", 1, true),
+    "profiles vazio/comentado mal reportado:\n" .. sc_report
+  )
+
+  -- D) Fluxo List dependencies no buffer mostra o relatório read-only sem tocar no pom.xml
+  local list_buf = buffer_for(rich_pom_path)
+  stub_ui({ "List dependencies" }, {})
+  deps.menu(list_buf)
+  local out_buf = vim.api.nvim_get_current_buf()
+  local out_text = table.concat(vim.api.nvim_buf_get_lines(out_buf, 0, -1, false), "\n")
+  vim.cmd("close")
+  assert(out_text:find("Profile declarations (conditional — activation not evaluated):", 1, true))
+  assert(out_text:find("managed by profile", 1, true))
+  assert(read_raw(rich_pom_path) == rich_pom, "List dependencies alterou pom.xml")
+end
+
+maven_profiles_provenance_spec()
+
+local function maven_review_repairs_spec()
+  local function report_for_pom(label, pom_text)
+    local dir = tempdir(label)
+    local pom_path = dir .. "/pom.xml"
+    write_raw(pom_path, pom_text)
+    return table.concat(
+      deps._report_lines({
+        root = dir,
+        tool = "maven",
+        modules = { dir },
+        module = dir,
+        build_file = pom_path,
+        is_kotlin_dsl = false,
+      }),
+      "\n"
+    )
+  end
+
+  -- 1) Sem BOM em nenhum lugar (nem projeto nem profile) + BOM em profile afetando projeto com DM
+  local plain_no_bom_pom = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.plain</groupId>",
+    "  <artifactId>app</artifactId>",
+    "  <version>1.0</version>",
+    "  <dependencies>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>missing</artifactId>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>only-prof-dm</artifactId>",
+    "    </dependency>",
+    "  </dependencies>",
+    "  <profiles>",
+    "    <profile>",
+    "      <id>p1</id>",
+    "      <dependencyManagement>",
+    "        <dependencies>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>only-prof-dm</artifactId>",
+    "            <version>1.2.3</version>",
+    "          </dependency>",
+    "        </dependencies>",
+    "      </dependencyManagement>",
+    "    </profile>",
+    "  </profiles>",
+    "</project>",
+  }, "\n")
+  local plain_report = report_for_pom("maven-plain-no-bom", plain_no_bom_pom)
+  assert(
+    plain_report:find(
+      "  - com.example:missing  (version missing (no <version>, exact <dependencyManagement>, BOM import, or <parent> in pom.xml))",
+      1,
+      true
+    ),
+    "versão ausente sem BOM em lugar algum divergiu:\n" .. plain_report
+  )
+  assert(
+    plain_report:find(
+      '  - com.example:only-prof-dm  (version missing at project level; conditional match in profile <dependencyManagement>: "p1" (1.2.3) (activation not evaluated))',
+      1,
+      true
+    ),
+    "match condicional sem BOM divergiu:\n" .. plain_report
+  )
+
+  local proj_dm_and_profile_bom_pom = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.pbom</groupId>",
+    "  <artifactId>app</artifactId>",
+    "  <version>1.0</version>",
+    "  <dependencyManagement>",
+    "    <dependencies>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>managed-proj</artifactId>",
+    "        <version>1.0.0</version>",
+    "      </dependency>",
+    "    </dependencies>",
+    "  </dependencyManagement>",
+    "  <dependencies>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>managed-proj</artifactId>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>unmanaged-proj</artifactId>",
+    "    </dependency>",
+    "  </dependencies>",
+    "  <profiles>",
+    "    <profile>",
+    "      <id>bom-only</id>",
+    "      <dependencyManagement>",
+    "        <dependencies>",
+    "          <dependency>",
+    "            <groupId>org.springframework.boot</groupId>",
+    "            <artifactId>spring-boot-dependencies</artifactId>",
+    "            <version>3.2.5</version>",
+    "            <type>pom</type>",
+    "            <scope>import</scope>",
+    "          </dependency>",
+    "        </dependencies>",
+    "      </dependencyManagement>",
+    "    </profile>",
+    "  </profiles>",
+    "</project>",
+  }, "\n")
+  local pbom_report = report_for_pom("maven-proj-dm-prof-bom", proj_dm_and_profile_bom_pom)
+  assert(
+    pbom_report:find(
+      '  - com.example:unmanaged-proj  (version unspecified locally; unverified: profile "bom-only" BOM import(s) (conditional) not resolved)',
+      1,
+      true
+    ),
+    "BOM de profile deve deixar projeto não resolvido condicionalmente:\n" .. pbom_report
+  )
+  assert(
+    pbom_report:find(
+      '  - com.example:managed-proj  (managed candidate in project <dependencyManagement>: 1.0.0; unverified: profile "bom-only" BOM import(s) (conditional) not resolved — effective version not proven)',
+      1,
+      true
+    ),
+    "BOM de profile deve impedir afirmação de versão efetiva:\n" .. pbom_report
+  )
+  assert(
+    not pbom_report:find("  - com.example:managed-proj  (version=1.0.0", 1, true),
+    "não pode afirmar version=1.0.0 com BOM condicional em profile:\n" .. pbom_report
+  )
+  local pbom_ins, _, pbom_ins_err = deps._insert_maven_dependency(proj_dm_and_profile_bom_pom, {
+    groupId = "com.example",
+    artifactId = "unmanaged-proj",
+  })
+  assert(pbom_ins == nil and pbom_ins_err and pbom_ins_err:find("<version> is required", 1, true))
+
+  -- 2) Dependência em um profile gerenciada por outro profile + precedência profile > projeto
+  local cross_profile_pom = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.cross</groupId>",
+    "  <artifactId>app</artifactId>",
+    "  <version>1.0</version>",
+    "  <dependencyManagement>",
+    "    <dependencies>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>shared</artifactId>",
+    "        <version>1.0.0</version>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>multi-prof</artifactId>",
+    "        <version>1.0.0</version>",
+    "      </dependency>",
+    "    </dependencies>",
+    "  </dependencyManagement>",
+    "  <profiles>",
+    "    <profile>",
+    "      <id>alpha</id>",
+    "      <dependencyManagement>",
+    "        <dependencies>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>alpha-only</artifactId>",
+    "            <version>2.0.0</version>",
+    "          </dependency>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>multi-prof</artifactId>",
+    "            <version>5.0.0</version>",
+    "          </dependency>",
+    "        </dependencies>",
+    "      </dependencyManagement>",
+    "      <dependencies>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>shared</artifactId>",
+    "        </dependency>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>only-beta</artifactId>",
+    "        </dependency>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>multi-prof</artifactId>",
+    "        </dependency>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>alpha-only</artifactId>",
+    "        </dependency>",
+    "      </dependencies>",
+    "    </profile>",
+    "    <profile>",
+    "      <id>beta</id>",
+    "      <dependencyManagement>",
+    "        <dependencies>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>shared</artifactId>",
+    "            <version>3.0.0</version>",
+    "          </dependency>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>only-beta</artifactId>",
+    "            <version>4.0.0</version>",
+    "          </dependency>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>multi-prof</artifactId>",
+    "            <version>6.0.0</version>",
+    "          </dependency>",
+    "        </dependencies>",
+    "      </dependencyManagement>",
+    "    </profile>",
+    "  </profiles>",
+    "</project>",
+  }, "\n")
+  local cross_report = report_for_pom("maven-cross-profile", cross_profile_pom)
+  assert(
+    cross_report:find(
+      '      - com.example:shared  (managed candidate in project <dependencyManagement>: 1.0.0; conditional override in profile <dependencyManagement>: "beta" (3.0.0) (activation not evaluated) — effective version not proven)',
+      1,
+      true
+    ),
+    "override de outro profile sobre project DM dentro de alpha divergiu:\n" .. cross_report
+  )
+  assert(
+    not cross_report:find("      - com.example:shared  (version=1.0.0", 1, true),
+    "não pode afirmar version=1.0.0 quando beta pode sobrescrever:\n" .. cross_report
+  )
+  assert(
+    cross_report:find(
+      '      - com.example:only-beta  (version missing in profile "alpha" and project; conditional match in profile <dependencyManagement>: "beta" (4.0.0) (activation not evaluated))',
+      1,
+      true
+    ),
+    "dependência em alpha gerenciada só por beta divergiu:\n" .. cross_report
+  )
+  assert(
+    cross_report:find(
+      '      - com.example:multi-prof  (managed candidate in profile "alpha" <dependencyManagement>: 5.0.0 (conditional; overrides project <dependencyManagement> 1.0.0); other active profile(s) may also manage/override: "beta" (6.0.0) — effective version not proven)',
+      1,
+      true
+    ),
+    "conflito entre dois profiles gerenciando a mesma dependência divergiu:\n" .. cross_report
+  )
+  assert(
+    not cross_report:find("      - com.example:multi-prof  (version=5.0.0", 1, true),
+    "não pode afirmar version=5.0.0 quando beta também gerencia:\n" .. cross_report
+  )
+  assert(
+    cross_report:find(
+      '      - com.example:alpha-only  (version=2.0.0, managed by profile "alpha" <dependencyManagement>; conditional)',
+      1,
+      true
+    ),
+    "dependência exclusiva de alpha sem conflito divergiu:\n" .. cross_report
+  )
+
+  -- Profile com BOM + outro profile gerenciando dependência
+  local cross_bom_pom = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.crossbom</groupId>",
+    "  <artifactId>app</artifactId>",
+    "  <version>1.0</version>",
+    "  <profiles>",
+    "    <profile>",
+    "      <id>alpha</id>",
+    "      <dependencyManagement>",
+    "        <dependencies>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>alpha-item</artifactId>",
+    "            <version>2.0.0</version>",
+    "          </dependency>",
+    "        </dependencies>",
+    "      </dependencyManagement>",
+    "      <dependencies>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>alpha-item</artifactId>",
+    "        </dependency>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>unmanaged-in-alpha</artifactId>",
+    "        </dependency>",
+    "      </dependencies>",
+    "    </profile>",
+    "    <profile>",
+    "      <id>gamma</id>",
+    "      <dependencyManagement>",
+    "        <dependencies>",
+    "          <dependency>",
+    "            <groupId>org.junit</groupId>",
+    "            <artifactId>junit-bom</artifactId>",
+    "            <version>5.10.2</version>",
+    "            <type>pom</type>",
+    "            <scope>import</scope>",
+    "          </dependency>",
+    "        </dependencies>",
+    "      </dependencyManagement>",
+    "    </profile>",
+    "  </profiles>",
+    "</project>",
+  }, "\n")
+  local cross_bom_report = report_for_pom("maven-cross-bom", cross_bom_pom)
+  assert(
+    cross_bom_report:find(
+      '      - com.example:alpha-item  (managed candidate in profile "alpha" <dependencyManagement>: 2.0.0 (conditional); unverified: profile "gamma" BOM import(s) (conditional) not resolved — effective version not proven)',
+      1,
+      true
+    ),
+    "BOM de outro profile deve tornar versão condicional não comprovada:\n" .. cross_bom_report
+  )
+  assert(
+    cross_bom_report:find(
+      '      - com.example:unmanaged-in-alpha  (version unspecified locally; unverified: profile "gamma" BOM import(s) (conditional) not resolved)',
+      1,
+      true
+    ),
+    "BOM de outro profile deve aparecer como não resolvido condicional:\n" .. cross_bom_report
+  )
+
+  -- 3) Matching GATC (groupId, artifactId, type, classifier) + default jar/empty + duplicata conservadora
+  local gatc_pom = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.gatc</groupId>",
+    "  <artifactId>app</artifactId>",
+    "  <version>1.0</version>",
+    "  <dependencyManagement>",
+    "    <dependencies>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>widget</artifactId>",
+    "        <version>1.0.0</version>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>widget</artifactId>",
+    "        <version>2.0.0</version>",
+    "        <type>test-jar</type>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>widget</artifactId>",
+    "        <version>3.0.0</version>",
+    "        <classifier>tests</classifier>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>widget</artifactId>",
+    "        <version>4.0.0</version>",
+    "        <type>test-jar</type>",
+    "        <classifier>shaded</classifier>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>explicit-jar</artifactId>",
+    "        <version>1.1.0</version>",
+    "        <type>jar</type>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>only-test-jar</artifactId>",
+    "        <version>5.0.0</version>",
+    "        <type>test-jar</type>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>only-classifier</artifactId>",
+    "        <version>6.0.0</version>",
+    "        <classifier>tests</classifier>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>com.example</groupId>",
+    "        <artifactId>no-ver-entry</artifactId>",
+    "      </dependency>",
+    "    </dependencies>",
+    "  </dependencyManagement>",
+    "  <dependencies>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>widget</artifactId>",
+    "      <type>jar</type>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>explicit-jar</artifactId>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>widget</artifactId>",
+    "      <type>test-jar</type>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>widget</artifactId>",
+    "      <classifier>tests</classifier>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>widget</artifactId>",
+    "      <type>war</type>",
+    "    </dependency>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>widget</artifactId>",
+    "      <type>test-jar</type>",
+    "      <classifier>other</classifier>",
+    "    </dependency>",
+    "  </dependencies>",
+    "  <profiles>",
+    "    <profile>",
+    "      <id>p-gatc</id>",
+    "      <dependencyManagement>",
+    "        <dependencies>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>widget</artifactId>",
+    "            <version>9.9.9</version>",
+    "            <classifier>linux-x86_64</classifier>",
+    "          </dependency>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>explicit-jar</artifactId>",
+    "            <version>1.9.0</version>",
+    "          </dependency>",
+    "          <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>only-test-jar</artifactId>",
+    "            <version>5.5.0</version>",
+    "            <type>test-jar</type>",
+    "          </dependency>",
+    "        </dependencies>",
+    "      </dependencyManagement>",
+    "      <dependencies>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>widget</artifactId>",
+    "          <classifier>linux-x86_64</classifier>",
+    "        </dependency>",
+    "        <dependency>",
+    "          <groupId>com.example</groupId>",
+    "          <artifactId>only-test-jar</artifactId>",
+    "        </dependency>",
+    "      </dependencies>",
+    "    </profile>",
+    "  </profiles>",
+    "</project>",
+  }, "\n")
+
+  local gatc_parsed = deps._parse_pom(gatc_pom)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "widget") == true)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "widget", "jar", "") == true)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "widget", "test-jar") == true)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "widget", nil, "tests") == true)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "widget", "test-jar", "shaded") == true)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "widget", "war") == false)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "widget", "test-jar", "other") == false)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "explicit-jar") == true)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "only-test-jar") == false)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "only-test-jar", "test-jar") == true)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "only-classifier") == false)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "only-classifier", nil, "tests") == true)
+  assert(deps._is_exact_managed(gatc_parsed, "com.example", "no-ver-entry") == false)
+
+  -- Omissão de versão só funciona quando GATC exato (com <version>) existe
+  local bad_omit_type, _, bad_omit_type_err = deps._insert_maven_dependency(gatc_pom, {
+    groupId = "com.example",
+    artifactId = "only-test-jar",
+    type = "jar",
+  })
+  assert(bad_omit_type == nil and bad_omit_type_err and bad_omit_type_err:find("<version> is required", 1, true))
+
+  local ok_omit_type, ok_omit_meta, ok_omit_err = deps._insert_maven_dependency(gatc_pom, {
+    groupId = "com.example",
+    artifactId = "only-test-jar",
+    type = "test-jar",
+  })
+  assert(ok_omit_type and ok_omit_meta.version_omitted == true and ok_omit_err == nil)
+  assert(ok_omit_type:find("<type>test-jar</type>", 1, true), "type não emitido na inserção")
+
+  local bad_omit_cls, _, bad_omit_cls_err = deps._insert_maven_dependency(gatc_pom, {
+    groupId = "com.example",
+    artifactId = "only-classifier",
+  })
+  assert(bad_omit_cls == nil and bad_omit_cls_err and bad_omit_cls_err:find("<version> is required", 1, true))
+
+  local ok_omit_cls, ok_cls_meta, ok_cls_err = deps._insert_maven_dependency(gatc_pom, {
+    groupId = "com.example",
+    artifactId = "only-classifier",
+    classifier = "tests",
+  })
+  assert(ok_omit_cls and ok_cls_meta.version_omitted == true and ok_cls_err == nil)
+  assert(ok_omit_cls:find("<classifier>tests</classifier>", 1, true), "classifier não emitido na inserção")
+
+  local bad_no_ver, _, bad_no_ver_err = deps._insert_maven_dependency(gatc_pom, {
+    groupId = "com.example",
+    artifactId = "no-ver-entry",
+  })
+  assert(bad_no_ver == nil and bad_no_ver_err and bad_no_ver_err:find("<version> is required", 1, true))
+
+  -- Preserva comportamento conservador de duplicata por GA
+  assert(deps._find_duplicate(gatc_parsed, "com.example", "widget") ~= nil)
+  local dup_gatc, _, dup_gatc_err = deps._insert_maven_dependency(gatc_pom, {
+    groupId = "com.example",
+    artifactId = "widget",
+    type = "test-jar",
+    classifier = "sources",
+    version = "9.0.0",
+  })
+  assert(dup_gatc == nil and dup_gatc_err and dup_gatc_err:find("already declared", 1, true))
+
+  local gatc_report = report_for_pom("maven-gatc", gatc_pom)
+  assert(
+    gatc_report:find(
+      "  - com.example:widget  (type=jar, version=1.0.0, managed by project <dependencyManagement>)",
+      1,
+      true
+    ),
+    "type=jar explícito deve casar com default omitido no DM:\n" .. gatc_report
+  )
+  assert(
+    gatc_report:find(
+      '  - com.example:explicit-jar  (managed candidate in project <dependencyManagement>: 1.1.0; conditional override in profile <dependencyManagement>: "p-gatc" (1.9.0) (activation not evaluated) — effective version not proven)',
+      1,
+      true
+    ),
+    "default omitido deve casar com type=jar explícito e reconhecer override de profile:\n" .. gatc_report
+  )
+  assert(
+    gatc_report:find(
+      "  - com.example:widget  (type=test-jar, version=2.0.0, managed by project <dependencyManagement>)",
+      1,
+      true
+    ),
+    "type=test-jar deve casar apenas com entrada test-jar:\n" .. gatc_report
+  )
+  assert(
+    gatc_report:find(
+      "  - com.example:widget  (classifier=tests, version=3.0.0, managed by project <dependencyManagement>)",
+      1,
+      true
+    ),
+    "classifier=tests deve casar apenas com entrada classifier=tests:\n" .. gatc_report
+  )
+  assert(
+    gatc_report:find(
+      "  - com.example:widget  (type=war, version missing (no <version>, exact <dependencyManagement>, BOM import, or <parent> in pom.xml))",
+      1,
+      true
+    ),
+    "type=war não pode alegar cobertura do DM de jar/test-jar:\n" .. gatc_report
+  )
+  assert(
+    gatc_report:find(
+      "  - com.example:widget  (type=test-jar, classifier=other, version missing (no <version>, exact <dependencyManagement>, BOM import, or <parent> in pom.xml))",
+      1,
+      true
+    ),
+    "classifier divergente não pode alegar cobertura:\n" .. gatc_report
+  )
+  assert(
+    gatc_report:find(
+      '      - com.example:widget:9.9.9  (classifier=linux-x86_64, provenance: profile "p-gatc" <dependencyManagement>)',
+      1,
+      true
+    ),
+    "classifier diferente no profile não pode afirmar override do projeto:\n" .. gatc_report
+  )
+  assert(
+    not gatc_report:find(
+      '9.9.9  (classifier=linux-x86_64, provenance: profile "p-gatc" <dependencyManagement>, overrides',
+      1,
+      true
+    ),
+    "classifier diferente no profile alegou override indevido:\n" .. gatc_report
+  )
+  assert(
+    gatc_report:find(
+      '      - com.example:explicit-jar:1.9.0  (provenance: profile "p-gatc" <dependencyManagement>, overrides project <dependencyManagement> 1.1.0 when active)',
+      1,
+      true
+    ),
+    "default jar no profile deve detectar override do type=jar do projeto:\n" .. gatc_report
+  )
+  assert(
+    gatc_report:find(
+      '      - com.example:widget  (classifier=linux-x86_64, version=9.9.9, managed by profile "p-gatc" <dependencyManagement>; conditional)',
+      1,
+      true
+    ),
+    "dependência no profile com classifier=linux-x86_64 deve casar com entrada do profile:\n" .. gatc_report
+  )
+  assert(
+    gatc_report:find(
+      "      - com.example:only-test-jar  (version missing (no <version>, exact <dependencyManagement>, BOM import, or <parent> in pom.xml))",
+      1,
+      true
+    ),
+    "dependência default jar no profile não pode casar com entrada test-jar:\n" .. gatc_report
+  )
+end
+
+maven_review_repairs_spec()
+
+local function maven_self_closing_dependencies_spec()
+  -- 1) Expansão cirúrgica de <dependencies/> preservando comentários, trailing newline e follow-up/duplicata GA
+  local sc_basic = table.concat({
+    '<project xmlns="http://maven.apache.org/POM/4.0.0">',
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.sc</groupId>",
+    "  <artifactId>app</artifactId>",
+    "  <version>1.0</version>",
+    "  <!-- keep above -->",
+    "  <dependencies/>",
+    "  <!-- keep below -->",
+    "</project>",
+    "",
+  }, "\n")
+
+  local exp_text, exp_meta, exp_err = deps._insert_maven_dependency(sc_basic, {
+    groupId = "org.slf4j",
+    artifactId = "slf4j-api",
+    version = "2.0.13",
+  })
+  assert(exp_err == nil, "inserção em <dependencies/> falhou: " .. tostring(exp_err))
+  assert(exp_meta.created_section == false, "expansão de <dependencies/> não cria nova seção")
+
+  local exp_expected = table.concat({
+    '<project xmlns="http://maven.apache.org/POM/4.0.0">',
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.sc</groupId>",
+    "  <artifactId>app</artifactId>",
+    "  <version>1.0</version>",
+    "  <!-- keep above -->",
+    "  <dependencies>",
+    "    <dependency>",
+    "      <groupId>org.slf4j</groupId>",
+    "      <artifactId>slf4j-api</artifactId>",
+    "      <version>2.0.13</version>",
+    "    </dependency>",
+    "  </dependencies>",
+    "  <!-- keep below -->",
+    "</project>",
+    "",
+  }, "\n")
+  assert(exp_text == exp_expected, "expansão de <dependencies/> divergiu:\n" .. tostring(exp_text))
+
+  -- Segunda inserção no POM já expandido + política conservadora de duplicata por GA
+  local second_text, second_meta, second_err = deps._insert_maven_dependency(exp_text, {
+    groupId = "junit",
+    artifactId = "junit",
+    version = "4.13.2",
+    scope = "test",
+  })
+  assert(
+    second_err == nil and second_meta.created_section == false,
+    "segunda inserção falhou: " .. tostring(second_err)
+  )
+  assert(second_text:find("<artifactId>junit</artifactId>", 1, true) ~= nil)
+
+  local dup_sc, dup_sc_meta, dup_sc_err = deps._insert_maven_dependency(exp_text, {
+    groupId = "org.slf4j",
+    artifactId = "slf4j-api",
+    type = "test-jar",
+    classifier = "tests",
+    version = "2.0.16",
+  })
+  assert(dup_sc == nil and dup_sc_meta == nil)
+  assert(
+    dup_sc_err and dup_sc_err:find("already declared", 1, true),
+    "duplicata GA conservadora falhou: " .. tostring(dup_sc_err)
+  )
+
+  -- 2) Variações: <dependencies /> com 4 espaços, multiline com tabs, atributos, inline, comentários na mesma linha, sem newline final
+  local sc_4space = table.concat({
+    "<project>",
+    "    <dependencies />",
+    "</project>",
+  }, "\n")
+  local out_4space, meta_4space, err_4space = deps._insert_maven_dependency(sc_4space, {
+    groupId = "com.example",
+    artifactId = "lib4",
+    version = "1.0",
+  })
+  assert(err_4space == nil and meta_4space.created_section == false)
+  assert(out_4space == table.concat({
+    "<project>",
+    "    <dependencies>",
+    "        <dependency>",
+    "            <groupId>com.example</groupId>",
+    "            <artifactId>lib4</artifactId>",
+    "            <version>1.0</version>",
+    "        </dependency>",
+    "    </dependencies>",
+    "</project>",
+  }, "\n"), "variação 4 espaços sem trailing newline divergiu:\n" .. tostring(out_4space))
+
+  local sc_tabs_multiline = table.concat({
+    "<project>",
+    "\t<modelVersion>4.0.0</modelVersion>",
+    "\t<dependencies",
+    "\t\t/>",
+    "</project>",
+  }, "\n")
+  local out_tabs, meta_tabs, err_tabs = deps._insert_maven_dependency(sc_tabs_multiline, {
+    groupId = "com.example",
+    artifactId = "tablib",
+    version = "1.2",
+  })
+  assert(err_tabs == nil and meta_tabs.created_section == false)
+  assert(out_tabs == table.concat({
+    "<project>",
+    "\t<modelVersion>4.0.0</modelVersion>",
+    "\t<dependencies>",
+    "\t\t<dependency>",
+    "\t\t\t<groupId>com.example</groupId>",
+    "\t\t\t<artifactId>tablib</artifactId>",
+    "\t\t\t<version>1.2</version>",
+    "\t\t</dependency>",
+    "\t</dependencies>",
+    "</project>",
+  }, "\n"), "variação multiline/tabs divergiu:\n" .. tostring(out_tabs))
+
+  local sc_attrs = '<project>\n  <dependencies xml:space="preserve" />\n</project>'
+  local out_attrs, _, err_attrs = deps._insert_maven_dependency(sc_attrs, {
+    groupId = "com.example",
+    artifactId = "attrlib",
+    version = "1.0",
+  })
+  assert(err_attrs == nil)
+  assert(
+    out_attrs:find('<dependencies xml:space="preserve">\n    <dependency>', 1, true) ~= nil,
+    "atributos de <dependencies /> não preservados:\n" .. tostring(out_attrs)
+  )
+
+  local sc_inline_comments = "<project>\n  <!-- lead --><dependencies/> <!-- trail -->\n</project>"
+  local out_inline_comments, _, err_inline_comments = deps._insert_maven_dependency(sc_inline_comments, {
+    groupId = "com.example",
+    artifactId = "inline",
+    version = "1.0",
+  })
+  assert(err_inline_comments == nil)
+  assert(out_inline_comments == table.concat({
+    "<project>",
+    "  <!-- lead --><dependencies>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>inline</artifactId>",
+    "      <version>1.0</version>",
+    "    </dependency>",
+    "  </dependencies> <!-- trail -->",
+    "</project>",
+  }, "\n"), "comentários na mesma linha de <dependencies/> divergiram:\n" .. tostring(out_inline_comments))
+
+  local sc_single_line = "<project><dependencies/></project>"
+  local out_single_line, meta_single_line, err_single_line = deps._insert_maven_dependency(sc_single_line, {
+    groupId = "com.example",
+    artifactId = "single",
+    version = "1.0",
+  })
+  assert(err_single_line == nil and meta_single_line.created_section == false)
+  assert(out_single_line == table.concat({
+    "<project><dependencies>",
+    "    <dependency>",
+    "      <groupId>com.example</groupId>",
+    "      <artifactId>single</artifactId>",
+    "      <version>1.0</version>",
+    "    </dependency>",
+    "  </dependencies></project>",
+  }, "\n"), "single-line <project><dependencies/></project> divergiu:\n" .. tostring(out_single_line))
+
+  -- 3) Preservação estrita de CRLF (\r\n)
+  local sc_crlf = sc_basic:gsub("\n", "\r\n")
+  local out_crlf, meta_crlf, err_crlf = deps._insert_maven_dependency(sc_crlf, {
+    groupId = "org.slf4j",
+    artifactId = "slf4j-api",
+    version = "2.0.13",
+  })
+  assert(err_crlf == nil and meta_crlf.created_section == false)
+  assert(out_crlf:find("[^\r]\n") == nil, "expansão CRLF introduziu LF puro")
+  assert(out_crlf == exp_expected:gsub("\n", "\r\n"), "expansão CRLF divergiu")
+
+  -- 4) Não editar <build>, <profiles>, <dependencyManagement> ou comentários com <dependencies/>
+  local non_project_sc = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <!-- <dependencies/> -->",
+    "  <dependencyManagement>",
+    "    <dependencies/>",
+    "  </dependencyManagement>",
+    "  <build>",
+    "    <plugins>",
+    "      <plugin>",
+    "        <artifactId>p</artifactId>",
+    "        <dependencies/>",
+    "      </plugin>",
+    "    </plugins>",
+    "  </build>",
+    "  <profiles>",
+    "    <profile>",
+    "      <id>extra</id>",
+    "      <dependencies/>",
+    "    </profile>",
+    "  </profiles>",
+    "</project>",
+  }, "\n")
+  local np_out, np_meta, np_err = deps._insert_maven_dependency(non_project_sc, {
+    groupId = "com.example",
+    artifactId = "proj-only",
+    version = "1.0",
+  })
+  assert(
+    np_err == nil and np_meta.created_section == true,
+    "deveria criar seção de projeto ignorando <dependencies/> não-projeto"
+  )
+  assert(np_out:find("  <!-- <dependencies/> -->", 1, true) ~= nil)
+  assert(np_out:find("  <dependencyManagement>\n    <dependencies/>\n  </dependencyManagement>", 1, true) ~= nil)
+  assert(np_out:find("        <dependencies/>\n      </plugin>", 1, true) ~= nil)
+  assert(np_out:find("      <id>extra</id>\n      <dependencies/>\n    </profile>", 1, true) ~= nil)
+
+  local both_sc = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <!-- <dependencies/> -->",
+    "  <build>",
+    "    <plugins>",
+    "      <plugin>",
+    "        <artifactId>p</artifactId>",
+    "        <dependencies/>",
+    "      </plugin>",
+    "    </plugins>",
+    "  </build>",
+    "  <profiles>",
+    "    <profile>",
+    "      <id>extra</id>",
+    "      <dependencies/>",
+    "    </profile>",
+    "  </profiles>",
+    "  <dependencies/>",
+    "</project>",
+  }, "\n")
+  local both_out, both_meta, both_err = deps._insert_maven_dependency(both_sc, {
+    groupId = "com.example",
+    artifactId = "proj-sc",
+    version = "1.0",
+  })
+  assert(both_err == nil and both_meta.created_section == false)
+  assert(both_out:find("        <dependencies/>\n      </plugin>", 1, true) ~= nil, "<build> foi alterado")
+  assert(
+    both_out:find("      <id>extra</id>\n      <dependencies/>\n    </profile>", 1, true) ~= nil,
+    "<profile> foi alterado"
+  )
+  assert(
+    both_out:find(
+      "  <dependencies>\n    <dependency>\n      <groupId>com.example</groupId>\n      <artifactId>proj-sc</artifactId>\n      <version>1.0</version>\n    </dependency>\n  </dependencies>\n</project>",
+      1,
+      true
+    ) ~= nil
+  )
+
+  -- 5) Comportamento managed / BOM / parent com <dependencies/>
+  local dm_sc = table.concat({
+    "<project>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <dependencyManagement>",
+    "    <dependencies>",
+    "      <dependency>",
+    "        <groupId>com.fasterxml.jackson.core</groupId>",
+    "        <artifactId>jackson-databind</artifactId>",
+    "        <version>2.17.0</version>",
+    "      </dependency>",
+    "      <dependency>",
+    "        <groupId>org.junit</groupId>",
+    "        <artifactId>junit-bom</artifactId>",
+    "        <version>5.10.0</version>",
+    "        <type>pom</type>",
+    "        <scope>import</scope>",
+    "      </dependency>",
+    "    </dependencies>",
+    "  </dependencyManagement>",
+    "  <dependencies/>",
+    "</project>",
+  }, "\n")
+
+  local dm_out, dm_meta, dm_err = deps._insert_maven_dependency(dm_sc, {
+    groupId = "com.fasterxml.jackson.core",
+    artifactId = "jackson-databind",
+  })
+  assert(dm_err == nil and dm_meta.created_section == false)
+  assert(dm_meta.version_omitted == true and dm_meta.bom_note == nil)
+  assert(dm_out:find("<artifactId>jackson-databind</artifactId>\n    </dependency>\n  </dependencies>", 1, true) ~= nil)
+
+  local bom_out, bom_meta, bom_err = deps._insert_maven_dependency(dm_sc, {
+    groupId = "org.junit.jupiter",
+    artifactId = "junit-jupiter-api",
+  })
+  assert(bom_err == nil and bom_meta.created_section == false and bom_meta.version_omitted == true)
+  assert(bom_meta.bom_note and bom_meta.bom_note:find("BOM", 1, true) ~= nil)
+  assert(
+    bom_out:find("<artifactId>junit-jupiter-api</artifactId>\n    </dependency>\n  </dependencies>", 1, true) ~= nil
+  )
+
+  local unm_out, _, unm_err = deps._insert_maven_dependency(sc_basic, {
+    groupId = "com.x",
+    artifactId = "y",
+  })
+  assert(unm_out == nil and unm_err and unm_err:find("<version> is required", 1, true) ~= nil)
+
+  local parent_sc = table.concat({
+    "<project>",
+    "  <parent>",
+    "    <groupId>com.corp</groupId>",
+    "    <artifactId>parent</artifactId>",
+    "    <version>1</version>",
+    "  </parent>",
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <artifactId>child</artifactId>",
+    "  <dependencies/>",
+    "</project>",
+  }, "\n")
+  local parent_out, parent_meta, parent_err = deps._insert_maven_dependency(parent_sc, {
+    groupId = "com.x",
+    artifactId = "y",
+  })
+  assert(parent_err == nil and parent_meta.created_section == false and parent_meta.version_omitted == true)
+  assert(parent_meta.bom_note and parent_meta.bom_note:find("<parent>", 1, true) ~= nil)
+  assert(
+    parent_out:find(
+      "  <dependencies>\n    <dependency>\n      <groupId>com.x</groupId>\n      <artifactId>y</artifactId>\n    </dependency>\n  </dependencies>",
+      1,
+      true
+    ) ~= nil
+  )
+
+  -- 6) Tag malformada (sem </dependencies> e não auto-fechada) continua falhando com erro claro
+  local unclosed_open, _, unclosed_open_err = deps._insert_maven_dependency("<project>\n  <dependencies>\n</project>", {
+    groupId = "com.x",
+    artifactId = "y",
+    version = "1.0",
+  })
+  assert(
+    unclosed_open == nil
+      and unclosed_open_err
+      and unclosed_open_err:find("could not find the closing </dependencies>", 1, true) ~= nil
+  )
+  local unclosed_gt, _, unclosed_gt_err = deps._insert_maven_dependency("<project>\n  <dependencies\n</project>", {
+    groupId = "com.x",
+    artifactId = "y",
+    version = "1.0",
+  })
+  assert(
+    unclosed_gt == nil
+      and unclosed_gt_err
+      and unclosed_gt_err:find("could not find the closing </dependencies>", 1, true) ~= nil
+  )
+
+  -- 7) Fluxo interativo M.add + recusa com buffer modificado em POM com <dependencies/>
+  local dir = tempdir("sc-add")
+  local pom_path = dir .. "/pom.xml"
+  write_raw(pom_path, sc_basic)
+  local pom_b = buffer_for(pom_path)
+  vim.api.nvim_buf_set_lines(pom_b, 0, -1, false, vim.split(sc_basic, "\n", { plain = true }))
+  vim.bo[pom_b].modified = true
+
+  notices = {}
+  stub_ui(
+    { "Enter coordinates manually", "compile (default)", "Add dependency" },
+    { "org.slf4j", "slf4j-api", "2.0.13" }
+  )
+  deps.add(pom_b)
+  assert(has_notice("unsaved changes"), "M.add deveria recusar escrita com buffer modificado")
+  assert(read_raw(pom_path) == sc_basic, "pom.xml com <dependencies/> foi alterado apesar de buffer modificado")
+
+  vim.bo[pom_b].modified = false
+  notices = {}
+  stub_ui(
+    { "Enter coordinates manually", "compile (default)", "Add dependency" },
+    { "org.slf4j", "slf4j-api", "2.0.13" }
+  )
+  deps.add(pom_b)
+  assert(read_raw(pom_path) == exp_expected, "M.add não expandiu <dependencies/> corretamente em disco")
+  assert(
+    table.concat(vim.api.nvim_buf_get_lines(pom_b, 0, -1, false), "\n") .. "\n" == exp_expected,
+    "buffer limpo não foi recarregado após expansão de <dependencies/>"
+  )
+  vim.api.nvim_buf_delete(pom_b, { force = true })
+end
+
+maven_self_closing_dependencies_spec()
+
 -- ---------- restauração ----------
 
 vim.ui.select = real_select

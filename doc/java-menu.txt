@@ -290,8 +290,12 @@ jdtls. Four entries:
   Dependencies...   Enabled in Maven or Gradle projects (multi-module
                     projects pick the module first, current module on top).
                     - List dependencies...: read-only report (q closes).
-                      Maven lists project-level dependencies, parent,
-                      dependencyManagement and BOM/profile notes. Gradle
+                      Maven lists project-level dependencies with managed-version
+                      provenance, declared <parent>, exact <dependencyManagement>
+                      entries, explicit unresolved <parent>/BOM-import caveats,
+                      and conditional <profiles> context (IDs, unevaluated
+                      <activation>, profile <dependencyManagement> and
+                      dependencies). Gradle
                       performs a static read-only parse of Groovy
                       build.gradle and Kotlin DSL build.gradle.kts literal
                       entries plus gradle/libs.versions.toml, and reports
@@ -371,7 +375,10 @@ generate delegate methods.
   bundled. Network errors offer Retry or Cancel and leave no partial files.
 - Dependencies: Maven edits are surgical text insertions (no XML parser);
   textual <parent>/BOM detection cannot prove per-artifact version coverage
-  and notes this explicitly when <version> is omitted. Gradle is read-only
+  and notes this explicitly when <version> is omitted without an exact local
+  <dependencyManagement> match. Maven <profiles> declarations are listed as
+  conditional without evaluating activation, and ${...} properties are not
+  evaluated. Gradle is read-only
   (editing disabled); static parsing covers Groovy build.gradle and Kotlin
   DSL build.gradle.kts literal/catalog entries and reports dynamic,
   interpolated, helper or scoped forms as partial without running Gradle.
