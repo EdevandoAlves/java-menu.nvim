@@ -338,6 +338,7 @@ assert(
     return vim.fn.filereadable(env_len_file) == 1
       and text:find("stdout token=", 1, true) ~= nil
       and text:find("stderr token=", 1, true) ~= nil
+      and text:find("split=[REDACTED]", 1, true) ~= nil
   end),
   "saída do processo filho não chegou ao buffer"
 )
