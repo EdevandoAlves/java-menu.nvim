@@ -14,10 +14,10 @@ local fixtures = require("tests.java_menu.fixtures")
 -- jc.settings simulado (o build grava/lê o build-last por projeto)
 local jcstore = {}
 package.loaded["jc.settings"] = {
-  read_project = function(_, name)
+  read_project = function(name)
     return jcstore[name]
   end,
-  write_project = function(_, name, value)
+  write_project = function(name, value)
     jcstore[name] = value
   end,
 }

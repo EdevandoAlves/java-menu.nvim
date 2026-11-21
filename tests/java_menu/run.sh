@@ -3,7 +3,7 @@
 #
 # Uso (de qualquer diretório):
 #   tests/java_menu/run.sh fast         # só os testes rápidos (sem JDTLS real)
-#   tests/java_menu/run.sh integration  # só os testes com JDTLS/DAP/Maven reais
+#   tests/java_menu/run.sh integration  # só os testes com JDTLS/DAP/Maven/Gradle reais
 #   tests/java_menu/run.sh all          # fast + integration
 #
 # Variáveis de ambiente opcionais:
@@ -58,6 +58,7 @@ fi
 jdtls_path="$("$NVIM" --headless -u NONE -n -c 'lua io.write(vim.fn.exepath("jdtls") ~= "" and vim.fn.exepath("jdtls") or (vim.fn.stdpath("data").."/mason/bin/jdtls"), "\n")' -c qa! 2>/dev/null)"
 [ -f "$jdtls_path" ] || jdtls_path="$jdtls_path (AUSENTE)"
 mvn_state="$(command -v mvn >/dev/null 2>&1 && echo "$(command -v mvn)" || echo "AUSENTE")"
+gradle_state="$(command -v gradle >/dev/null 2>&1 && echo "$(command -v gradle)" || echo "AUSENTE")"
 
 echo "== java_menu tests =="
 echo "repo:      $REPO_DIR"
@@ -65,6 +66,7 @@ echo "nvim:      $nvim_version"
 echo "jc.nvim:   $jc_rev"
 echo "jdtls:     $jdtls_path"
 echo "mvn:       $mvn_state"
+echo "gradle:    $gradle_state"
 echo "logs:      $LOG_DIR"
 echo
 
@@ -97,13 +99,14 @@ FAST_SPECS=(
 )
 
 # INTEGRATION: JDTLS real (lsp_clients, refactor_lsp, jdtls_projects inclui
-# DAP attach) e processos Maven reais (build_isolation).
+# DAP attach) e processos Maven/Gradle reais (build_isolation, build_gradle_real).
 INTEGRATION_SPECS=(
   lsp_clients_spec
   refactor_lsp_spec
   generate_lsp_spec
   jdtls_projects_spec
   build_isolation_spec
+  build_gradle_real_spec
   project_create_real_spec
   spring_project_real_spec
   deps_sync_real_spec
@@ -120,7 +123,9 @@ for p in nvim-jdtls nvim-lspconfig nvim-dap jc.nvim; do
 done
 
 PASS=0
+SKIP=0
 FAIL=0
+SKIPPED_NAMES=()
 FAILED_NAMES=()
 
 # Processos dos testes: a linha de comando só casa com recursos criados pelos
@@ -182,8 +187,20 @@ vim.cmd('cquit 1')"
   snapshot_pids "$post_pids"
   kill_new_test_jdtls "$pre_pids" "$post_pids" "$name"
   if [ "$rc" -eq 0 ]; then
-    PASS=$((PASS + 1))
-    echo "PASS ($((t1 - t0))s)"
+    skip_line="$(grep -m1 -E "^(\[SPEC_SKIP\] ${name}: |${name}: SKIP \()" "$log" | tr -d '\r' || true)"
+    if [ -n "$skip_line" ]; then
+      SKIP=$((SKIP + 1))
+      SKIPPED_NAMES+=("$name")
+      skip_reason="${skip_line#\[SPEC_SKIP\] ${name}: }"
+      if [ "$skip_reason" = "$skip_line" ]; then
+        skip_reason="${skip_line#${name}: SKIP (}"
+        skip_reason="${skip_reason%)}"
+      fi
+      echo "SKIP ($((t1 - t0))s) — $skip_reason"
+    else
+      PASS=$((PASS + 1))
+      echo "PASS ($((t1 - t0))s)"
+    fi
   else
     FAIL=$((FAIL + 1))
     FAILED_NAMES+=("$name")
@@ -215,10 +232,24 @@ if [ "$GROUP" = integration ] || [ "$GROUP" = all ]; then
 fi
 
 echo "== resumo =="
-echo "PASS: $PASS  FAIL: $FAIL"
+echo "PASS: $PASS  SKIP: $SKIP  FAIL: $FAIL"
+summary_status="pass"
+if [ "$FAIL" -gt 0 ]; then
+  summary_status="fail"
+elif [ "$SKIP" -gt 0 ]; then
+  summary_status="pass_with_skips"
+fi
+echo "SUMMARY: status=$summary_status pass=$PASS skip=$SKIP fail=$FAIL"
+if [ "$SKIP" -gt 0 ]; then
+  echo "pulados: ${SKIPPED_NAMES[*]}"
+fi
 if [ "$FAIL" -gt 0 ]; then
   echo "falhas: ${FAILED_NAMES[*]}"
+fi
+if [ "$SKIP" -gt 0 ] || [ "$FAIL" -gt 0 ]; then
   echo "logs completos em $LOG_DIR"
+fi
+if [ "$FAIL" -gt 0 ]; then
   exit 1
 fi
 exit 0

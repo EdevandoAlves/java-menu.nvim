@@ -1,12 +1,11 @@
 -- java_menu/build.lua
 -- <leader>jb: build and run Java projects (Maven preferred, Gradle when an
 -- executable wrapper exists). Reuses the earlier infrastructure (ui, project)
--- and `jc.settings` for jc's "repeat last".
+-- and `run_config` for per-canonical-root Repeat Last history.
 
 local ui = require("java_menu.ui")
 local project = require("java_menu.project")
 local lsp = require("java_menu.lsp")
-local jca = require("java_menu.jc")
 local run_config = require("java_menu.run_config")
 
 local M = {}
@@ -49,13 +48,35 @@ M._stop_grace_ms = 1000
 M._restart_timeout_ms = 5000
 M._background_grace_ms = 500
 
----Last build arguments per project (repeat never crosses projects).
----jc.settings persists by cwd project name; here the key is the resolved
----buffer root, so repeat never runs A's args in B.
+---Last build arguments per canonical project root (repeat never crosses projects).
 local last_builds = {}
 
 ---Last executed command per project (keyed by canonical root, without secrets).
 local last_runs = {}
+
+---Resolve Repeat Last arguments for `canon_root`:
+---1) in-session `last_builds[canon_root]`,
+---2) persisted per-root `run_config.load_last_build(canon_root)`.
+---`jc.settings` (`build-last`) is intentionally neither read nor written here
+---because its normalized path keys are non-injective and carry no cross-session
+---ownership metadata.
+---@param canon_root string
+---@param notify_err boolean
+---@return string[]|nil argv, boolean has_history
+local function resolve_last_build(canon_root, notify_err)
+  local last = last_builds[canon_root]
+  if type(last) == "table" and #last > 0 then
+    return vim.deepcopy(last), true
+  end
+  local saved_last, saved_err = run_config.load_last_build(canon_root)
+  if saved_err and notify_err then
+    ui.notify(saved_err, vim.log.levels.WARN)
+  end
+  if type(saved_last) == "table" and #saved_last > 0 then
+    return saved_last, true
+  end
+  return nil, false
+end
 
 -- ---------- project helpers ----------
 
@@ -717,6 +738,11 @@ local function start(kind, cmd, cwd, root, opts)
   state.status = "running"
   state.redactions = redactions
 
+  -- return focus to the code window after opening the output buffer
+  if prev_win and vim.api.nvim_win_is_valid(prev_win) then
+    pcall(vim.api.nvim_set_current_win, prev_win)
+  end
+
   -- Record non-secret repeat/restart metadata ONLY after successful launch.
   if cmd_has_secret then
     if not opts._secret_warned then
@@ -739,24 +765,7 @@ local function start(kind, cmd, cwd, root, opts)
       if not ok_save_build and save_build_err then
         ui.notify(save_build_err, vim.log.levels.WARN)
       end
-      local jc_str = run_config.format_jc_args(opts.build_args)
-      if jc_str then
-        local ok_jc, jc_err = jca.write_build_last(jc_str)
-        if not ok_jc then
-          ui.notify(jc_err, vim.log.levels.WARN)
-        end
-      else
-        ui.notify(
-          "build arguments contain quotes, whitespace, or empty tokens incompatible with jc build-last — saved for Java Menu Repeat Last only",
-          vim.log.levels.WARN
-        )
-      end
     end
-  end
-
-  -- keep focus in the code; the output split stays visible below
-  if prev_win and vim.api.nvim_win_is_valid(prev_win) then
-    pcall(vim.api.nvim_set_current_win, prev_win)
   end
 
   ui.notify(
@@ -1171,41 +1180,14 @@ local function do_choose_goal(root, bufnr, tool)
   end)
 end
 
-local function do_repeat(root, bufnr, tool)
+local function do_repeat(root, tool)
   local canon_root = run_config.canonical(root)
-  -- prefer this session's argv record by ROOT (never crosses projects),
-  -- then Java Menu's per-root persisted argv, then jc build-last fallback
-  local last = last_builds[canon_root]
-  local parsed
-  if type(last) == "table" and #last > 0 then
-    parsed = vim.deepcopy(last)
-  else
-    local saved_last, saved_err = run_config.load_last_build(canon_root)
-    if saved_err then
-      ui.notify(saved_err, vim.log.levels.WARN)
-    end
-    if type(saved_last) == "table" and #saved_last > 0 then
-      parsed = saved_last
-    else
-      local jc_last = type(last) == "string" and last or nil
-      if not jc_last or jc_last == "" then
-        local err
-        jc_last, err = jca.read_build_last()
-        if err then
-          ui.notify(err, vim.log.levels.WARN)
-        end
-      end
-      if not jc_last or jc_last == "" then
-        ui.notify("no previous build in this project", vim.log.levels.WARN)
-        return
-      end
-      local arg_err
-      parsed, arg_err = split_args(jc_last)
-      if not parsed then
-        ui.notify(arg_err or "invalid arguments", vim.log.levels.ERROR)
-        return
-      end
-    end
+  -- prefer this session's argv record by canonical root (never crosses projects),
+  -- then Java Menu's per-root persisted argv
+  local parsed, has_history = resolve_last_build(canon_root, true)
+  if not has_history then
+    ui.notify("no previous build in this project", vim.log.levels.WARN)
+    return
   end
   if not tool.runner then
     ui.notify(tool.reason or "build tool unavailable", vim.log.levels.WARN)
@@ -1554,6 +1536,7 @@ function M.build()
   local active = state.running or draining
   local active_root = state.root and run_config.canonical(state.root) or nil
 
+  local _, has_last_build = resolve_last_build(canon_root, false)
   local entries = {
     {
       key = "run_main",
@@ -1598,21 +1581,7 @@ function M.build()
     {
       key = "repeat",
       label = "Repeat Last",
-      enabled = can_build and (function()
-        local last = last_builds[canon_root]
-        if type(last) == "table" then
-          return #last > 0
-        end
-        if type(last) == "string" and last ~= "" then
-          return true
-        end
-        local saved_last = run_config.load_last_build(canon_root)
-        if type(saved_last) == "table" and #saved_last > 0 then
-          return true
-        end
-        local jc_last = jca.read_build_last()
-        return jc_last ~= nil and jc_last ~= ""
-      end)(),
+      enabled = can_build and has_last_build,
       reason = (not can_build and build_reason) or "no previous build in this project",
     },
     {
@@ -1657,7 +1626,7 @@ function M.build()
       elseif entry.key == "choose_goal" then
         do_choose_goal(root, bufnr, tool)
       elseif entry.key == "repeat" then
-        do_repeat(root, bufnr, tool)
+        do_repeat(root, tool)
       elseif entry.key == "stop" then
         M.stop()
       elseif entry.key == "output" then

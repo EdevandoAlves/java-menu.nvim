@@ -4,7 +4,11 @@
 -- redaction for logs/notifications/command displays.
 --
 -- Persistence uses per-root JSON files under stdpath("data")/java_menu/run/
--- keyed by `project.workspace_id(root)` (injective on canonical path).
+-- keyed by a SHA-256 digest of the canonical root (`settings-<sha256>.json` and
+-- `build-<sha256>.json`) and checks the stored canonical `root` owner before
+-- loading. Legacy `project.workspace_id(root)` files without ownership proof
+-- are ignored (neither imported nor deleted) because `workspace_id` can
+-- collide across distinct canonical paths such as `/a%/b` and `/a/%b`.
 -- `jc.settings` is intentionally NOT used here because it keys by cwd project
 -- basename rather than canonical buffer root and reads only a single line.
 --
@@ -37,13 +41,13 @@ end
 ---@return string
 function M.storage_path(root)
   local canon = M.canonical(root)
-  return vim.fs.joinpath(base_dir(), project.workspace_id(canon) .. ".json")
+  return vim.fs.joinpath(base_dir(), "settings-" .. vim.fn.sha256(canon) .. ".json")
 end
 
 ---@return table
 function M.defaults()
   return {
-    version = 1,
+    version = 2,
     profile = "",
     jvm_args = "",
     app_args = "",
@@ -84,7 +88,8 @@ end
 ---@param root string
 ---@return table cfg, string|nil err
 function M.load(root)
-  local path = M.storage_path(root)
+  local canon = M.canonical(root)
+  local path = M.storage_path(canon)
   if vim.fn.filereadable(path) ~= 1 then
     return M.defaults(), nil
   end
@@ -100,8 +105,11 @@ function M.load(root)
   if not ok_json or type(decoded) ~= "table" then
     return M.defaults(), ("invalid run settings JSON at %s (using defaults)"):format(path)
   end
+  if decoded.root ~= canon then
+    return M.defaults(), ("run settings at %s do not belong to %s (ignored)"):format(path, canon)
+  end
   local cfg = sanitize(decoded)
-  local env_res = M.load_env(root)
+  local env_res = M.load_env(canon)
   if env_res.exists and next(env_res.env) ~= nil then
     local cleared = false
     if M.overlaps_env({ cfg.profile }, env_res.env) then
@@ -156,20 +164,23 @@ end
 ---@param cfg table
 ---@return boolean ok, string|nil err
 function M.save(root, cfg)
+  local canon = M.canonical(root)
   local payload = sanitize(cfg)
-  local env_res = M.load_env(root)
+  payload.version = 2
+  payload.root = canon
+  local env_res = M.load_env(canon)
   if env_res.exists and cfg_overlaps_env(payload, env_res.env) then
     return false, "run settings overlap with .env values (including short substrings) and were not persisted"
   end
 
-  return write_private_json(M.storage_path(root), payload, "run settings")
+  return write_private_json(M.storage_path(canon), payload, "run settings")
 end
 
 ---@param root string
 ---@return string
 function M.last_build_path(root)
   local canon = M.canonical(root)
-  return vim.fs.joinpath(base_dir(), project.workspace_id(canon) .. ".build.json")
+  return vim.fs.joinpath(base_dir(), "build-" .. vim.fn.sha256(canon) .. ".json")
 end
 
 ---Load persisted non-secret last build argv for `root`.
@@ -189,7 +200,13 @@ function M.load_last_build(root)
     return nil, nil
   end
   local ok_json, decoded = pcall(vim.json.decode, raw_text)
-  if not ok_json or type(decoded) ~= "table" or type(decoded.args) ~= "table" or #decoded.args == 0 then
+  if
+    not ok_json
+    or type(decoded) ~= "table"
+    or decoded.root ~= M.canonical(root)
+    or type(decoded.args) ~= "table"
+    or #decoded.args == 0
+  then
     return nil, ("invalid last build JSON at %s (ignored)"):format(path)
   end
   local argv = {}
@@ -222,7 +239,11 @@ function M.save_last_build(root, argv)
   if env_res.exists and M.overlaps_env(clean, env_res.env) then
     return false, "build arguments overlap with .env values (including short substrings) and were not persisted"
   end
-  return write_private_json(M.last_build_path(root), { version = 1, args = clean }, "last build")
+  return write_private_json(
+    M.last_build_path(root),
+    { version = 2, root = M.canonical(root), args = clean },
+    "last build"
+  )
 end
 
 ---Remove persisted run settings for `root`.

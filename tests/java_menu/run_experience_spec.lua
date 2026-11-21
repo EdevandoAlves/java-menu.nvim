@@ -772,7 +772,7 @@ do
   end))
 end
 
--- ========== 10. Regression (3): Args com aspas preservados no Repeat Last e jc ==========
+-- ========== 10. Regression (3): Args com aspas preservados no Repeat Last sem tocar jc build-last ==========
 
 do
   -- Roundtrip format_args <-> split_args
@@ -802,12 +802,15 @@ do
   assert(run_config.format_jc_args({ "a\nb" }) == nil, "arg com newline não é compatível com jc")
 
   local jc_store = { ["build-last"] = "verify" }
+  local jc_reads, jc_writes = 0, 0
   local prev_jc_settings = package.loaded["jc.settings"]
   package.loaded["jc.settings"] = {
     read_project = function(name)
+      jc_reads = jc_reads + 1
       return jc_store[name]
     end,
     write_project = function(name, value)
+      jc_writes = jc_writes + 1
       jc_store[name] = value
     end,
   }
@@ -833,8 +836,8 @@ do
   )
   local expected_lines = "-Dmsg=hello world\n--note=two  spaces\ncompile\n"
   assert(read_raw(q_capture) == expected_lines, "choose_goal inicial divergiu: " .. read_raw(q_capture))
-  assert(jc_store["build-last"] == "verify", "jc build-last NÃO pode receber serialização incompatível com aspas!")
-  assert(has_notice("incompatible with jc build-last"), "deveria avisar que escrita incompatível no jc foi evitada")
+  assert(jc_store["build-last"] == "verify", "jc build-last NÃO pode ser sobrescrito pelo Java Menu")
+  assert(jc_reads == 0 and jc_writes == 0, "Java Menu Repeat não deve ler nem gravar jc.settings")
 
   -- Repeat in-session preserva argv exato
   vim.fn.delete(q_capture)
@@ -866,7 +869,7 @@ do
     "repeat próprio perdeu aspas após limpar memória: " .. read_raw(q_capture)
   )
 
-  -- Args simples sem aspas/espaços continuam gravando jc build-last normalmente
+  -- Args simples sem aspas/espaços também usam apenas histórico próprio e preservam jc build-last intacto
   vim.fn.delete(q_capture)
   build.build()
   ask_script = { "clean package" }
@@ -877,7 +880,8 @@ do
     end),
     "choose_goal simples não concluiu"
   )
-  assert(jc_store["build-last"] == "clean package", "args simples deveriam atualizar jc build-last")
+  assert(jc_store["build-last"] == "verify", "args simples do Java Menu não devem sobrescrever jc build-last")
+  assert(jc_reads == 0 and jc_writes == 0, "args simples não devem ler nem gravar jc.settings")
 
   package.loaded["jc.settings"] = prev_jc_settings
 end
@@ -1201,13 +1205,16 @@ end
 -- ========== 14. Regression (7): Histórico de Repeat só é gravado após lançamento bem-sucedido ==========
 
 do
-  local jc_hist_store = {}
+  local jc_hist_store = { ["build-last"] = "jc-sentinel" }
+  local jc_reads, jc_writes = 0, 0
   local prev_jc_settings = package.loaded["jc.settings"]
   package.loaded["jc.settings"] = {
     read_project = function(name)
+      jc_reads = jc_reads + 1
       return jc_hist_store[name]
     end,
     write_project = function(name, value)
+      jc_writes = jc_writes + 1
       jc_hist_store[name] = value
     end,
   }
@@ -1219,14 +1226,15 @@ do
   local canon_h = run_config.canonical(root_h)
   open_file(main_h)
 
-  -- 14a. Primeiro build válido grava histórico
+  -- 14a. Primeiro build válido grava histórico próprio sem ler/gravar jc.settings
   build.build()
   menu_cb(entry("compile"))
   assert(fixtures.wait_for(5000, function()
     return build._state.running
   end))
   assert(vim.deep_equal(build._last_builds[canon_h], { "compile" }), "compile lançado deveria gravar _last_builds")
-  assert(jc_hist_store["build-last"] == "compile", "compile lançado deveria gravar jc build-last")
+  assert(jc_hist_store["build-last"] == "jc-sentinel", "compile lançado não pode sobrescrever jc build-last")
+  assert(jc_reads == 0 and jc_writes == 0, "compile lançado não deve ler nem gravar jc.settings")
   assert(
     vim.deep_equal(run_config.load_last_build(canon_h), { "compile" }),
     "compile lançado deveria persistir last_build"
@@ -1242,7 +1250,7 @@ do
     vim.deep_equal(build._last_builds[canon_h], { "compile" }),
     "tentativa rejeitada (running) não pode alterar _last_builds"
   )
-  assert(jc_hist_store["build-last"] == "compile", "tentativa rejeitada (running) não pode alterar jc build-last")
+  assert(jc_hist_store["build-last"] == "jc-sentinel", "tentativa rejeitada (running) não pode alterar jc build-last")
   assert(
     vim.deep_equal(run_config.load_last_build(canon_h), { "compile" }),
     "tentativa rejeitada (running) não pode alterar last_build em disco"
@@ -1266,13 +1274,492 @@ do
 
   assert(has_notice("could not start"), "falha em jobstart deveria notificar erro")
   assert(vim.deep_equal(build._last_builds[canon_h], { "compile" }), "jobstart<=0 não pode alterar _last_builds")
-  assert(jc_hist_store["build-last"] == "compile", "jobstart<=0 não pode alterar jc build-last")
+  assert(jc_hist_store["build-last"] == "jc-sentinel", "jobstart<=0 não pode alterar jc build-last")
   assert(
     vim.deep_equal(run_config.load_last_build(canon_h), { "compile" }),
     "jobstart<=0 não pode alterar last_build em disco"
   )
 
   package.loaded["jc.settings"] = prev_jc_settings
+end
+
+-- ========== 15. Regression: Repeat usa histórico canônico próprio (sem jc.settings) ==========
+
+do
+  local project = require("java_menu.project")
+  local prev_jc_settings = package.loaded["jc.settings"]
+  local prev_cwd = vim.uv.cwd()
+
+  local function make_gradle_stub(label, capture_file, explicit_root)
+    local root = explicit_root or tempdir(label)
+    fixtures.write(root .. "/settings.gradle", { "rootProject.name = '" .. label .. "'" })
+    fixtures.write(root .. "/build.gradle", { "plugins { id 'java' }" })
+    local lines = { "#!/bin/sh" }
+    if capture_file then
+      lines[#lines + 1] = 'printf "%s\\n" "$@" > ' .. vim.fn.shellescape(capture_file)
+    end
+    lines[#lines + 1] = "exit 0"
+    fixtures.write(root .. "/gradlew", lines)
+    vim.fn.system({ "chmod", "+x", root .. "/gradlew" })
+    local main_file = root .. "/src/main/java/com/demo/" .. label .. "/App.java"
+    fixtures.write(main_file, {
+      "package com.demo." .. label .. ";",
+      "public class App {}",
+    })
+    return root, main_file
+  end
+
+  local function jc_norm(path)
+    return (path:gsub("[\\/:;.]", "_"))
+  end
+
+  -- 15a. Mock plano de jc.settings: histórico nunca é lido nem sobrescrito pelo Java Menu Repeat
+  local flat_jc = { ["build-last"] = "external-sentinel" }
+  local flat_reads, flat_writes = 0, 0
+  package.loaded["jc.settings"] = {
+    read_project = function(name)
+      flat_reads = flat_reads + 1
+      return flat_jc[name]
+    end,
+    write_project = function(name, value)
+      flat_writes = flat_writes + 1
+      flat_jc[name] = value
+    end,
+  }
+
+  local root_a = tempdir("isoa")
+  local capture_a = root_a .. "/capture_a.txt"
+  local _, main_a = make_gradle_stub("isoa", capture_a, root_a)
+  local root_b = tempdir("isob")
+  local capture_b = root_b .. "/capture_b.txt"
+  local _, main_b = make_gradle_stub("isob", capture_b, root_b)
+  local canon_a = run_config.canonical(root_a)
+  local canon_b = run_config.canonical(root_b)
+
+  open_file(main_a)
+  build.build()
+  assert(entry("repeat").enabled == false, "Repeat no Projeto A não pode ler build-last externo do jc.settings")
+  ask_script = { "compileJava" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining()
+    end),
+    "build no Projeto A não concluiu"
+  )
+  assert(flat_jc["build-last"] == "external-sentinel", "Projeto A não pode sobrescrever jc build-last")
+  assert(flat_reads == 0 and flat_writes == 0, "Projeto A não deve ler nem gravar jc.settings")
+
+  open_file(main_b)
+  build.build()
+  local repeat_b = entry("repeat")
+  assert(repeat_b.enabled == false, "Repeat deveria estar desabilitado no Projeto B com mock plano de jc.settings")
+  assert(repeat_b.reason:find("no previous build", 1, true), "motivo do Repeat no Projeto B divergiu")
+
+  -- 15b. Históricos de mesmo valor entre projetos e entre sessões ficam estritamente isolados
+  flat_jc["build-last"] = "compileJava" -- mesmo valor do último build de A
+  build.build()
+  assert(
+    entry("repeat").enabled == false,
+    "Repeat no Projeto B não pode habilitar quando jc.settings tem o mesmo valor do Projeto A"
+  )
+
+  ask_script = { "compileJava" } -- B executa exatamente o mesmo valor que A
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining()
+    end),
+    "build mesmo-valor no Projeto B não concluiu"
+  )
+  -- Agora B executa outro comando e simulamos nova sessão limpando _last_builds em memória
+  ask_script = { "jar" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining()
+    end),
+    "segundo build no Projeto B não concluiu"
+  )
+  flat_jc["build-last"] = "clean"
+  build._last_builds[canon_a] = nil
+  build._last_builds[canon_b] = nil
+
+  vim.fn.delete(capture_a)
+  open_file(main_a)
+  build.build()
+  assert(entry("repeat").enabled == true, "Repeat do Projeto A deveria carregar do disco por raiz canônica")
+  menu_cb(entry("repeat"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(capture_a) == 1
+    end),
+    "repeat cross-session no Projeto A não concluiu"
+  )
+  assert(read_raw(capture_a) == "compileJava\n", "Repeat de A deveria manter compileJava: " .. read_raw(capture_a))
+
+  vim.fn.delete(capture_b)
+  open_file(main_b)
+  build.build()
+  assert(entry("repeat").enabled == true, "Repeat do Projeto B deveria carregar do disco por raiz canônica")
+  menu_cb(entry("repeat"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(capture_b) == 1
+    end),
+    "repeat cross-session no Projeto B não concluiu"
+  )
+  assert(read_raw(capture_b) == "jar\n", "Repeat de B deveria manter jar: " .. read_raw(capture_b))
+  assert(flat_jc["build-last"] == "clean", "Repeat não pode tocar jc.settings")
+  assert(flat_reads == 0 and flat_writes == 0, "históricos de mesmo valor não devem consultar jc.settings")
+
+  -- 15c. Colisão de normalização de raiz no estilo jc.settings (foo.bar vs foo/bar -> mesmo prefixo normalizado)
+  local collide_base = tempdir("collide")
+  local root_dot = collide_base .. "/foo.bar"
+  local capture_dot = root_dot .. "/capture_dot.txt"
+  local _, main_dot = make_gradle_stub("dot", capture_dot, root_dot)
+  local root_slash = collide_base .. "/foo/bar"
+  local capture_slash = root_slash .. "/capture_slash.txt"
+  local _, main_slash = make_gradle_stub("slash", capture_slash, root_slash)
+  local canon_dot = run_config.canonical(root_dot)
+  local canon_slash = run_config.canonical(root_slash)
+
+  local shared_jc_key = jc_norm(canon_dot .. "/build.gradle")
+  assert(
+    shared_jc_key == jc_norm(canon_slash .. "/build.gradle"),
+    "fixture de colisão deveria gerar mesma chave normalizada estilo jc.settings"
+  )
+  local collided_jc = { [shared_jc_key] = "jc-collided-sentinel" }
+  local collided_reads, collided_writes = 0, 0
+  local function current_collided_key()
+    local cur_root = project.root(0)
+    return cur_root and jc_norm(run_config.canonical(cur_root) .. "/build.gradle") or "cwd"
+  end
+  package.loaded["jc.settings"] = {
+    read_project = function(_)
+      collided_reads = collided_reads + 1
+      return collided_jc[current_collided_key()]
+    end,
+    write_project = function(_, value)
+      collided_writes = collided_writes + 1
+      collided_jc[current_collided_key()] = value
+    end,
+  }
+
+  open_file(main_dot)
+  build.build()
+  assert(entry("repeat").enabled == false, "foo.bar não pode ler entrada colidida do jc.settings")
+  ask_script = { "compileJava" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining()
+    end),
+    "build em foo.bar não concluiu"
+  )
+  assert(collided_jc[shared_jc_key] == "jc-collided-sentinel", "foo.bar não pode sobrescrever slot colidido no jc")
+
+  open_file(main_slash)
+  build.build()
+  assert(entry("repeat").enabled == false, "foo/bar não pode herdar histórico de foo.bar via chave normalizada")
+  ask_script = { "jar" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining()
+    end),
+    "build em foo/bar não concluiu"
+  )
+  assert(collided_jc[shared_jc_key] == "jc-collided-sentinel", "foo/bar não pode sobrescrever slot colidido no jc")
+  assert(collided_reads == 0 and collided_writes == 0, "colisão normalizada não deve acessar jc.settings")
+
+  -- Cross-session (limpa memória): cada projeto preserva sua própria história canônica sem colisão
+  build._last_builds[canon_dot] = nil
+  build._last_builds[canon_slash] = nil
+  vim.fn.delete(capture_dot)
+  open_file(main_dot)
+  build.build()
+  menu_cb(entry("repeat"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(capture_dot) == 1
+    end),
+    "repeat de foo.bar após colisão não concluiu"
+  )
+  assert(read_raw(capture_dot) == "compileJava\n", "foo.bar divergiu após colisão: " .. read_raw(capture_dot))
+
+  vim.fn.delete(capture_slash)
+  open_file(main_slash)
+  build.build()
+  menu_cb(entry("repeat"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(capture_slash) == 1
+    end),
+    "repeat de foo/bar após colisão não concluiu"
+  )
+  assert(read_raw(capture_slash) == "jar\n", "foo/bar divergiu após colisão: " .. read_raw(capture_slash))
+
+  -- 15d. Stub determinístico para contexto de output buffer e submódulo sem build.gradle na raiz
+  local ctx_store = { ["build-last"] = "cwd-sentinel" }
+  local ctx_reads, ctx_writes = 0, 0
+  package.loaded["jc.settings"] = {
+    read_project = function(name)
+      ctx_reads = ctx_reads + 1
+      return ctx_store[name]
+    end,
+    write_project = function(name, value)
+      ctx_writes = ctx_writes + 1
+      ctx_store[name] = value
+    end,
+  }
+
+  local _, main_c = fixtures.maven_project("iso-outbuf", "com.demo.outbuf", "AppC")
+  local root_c = project.root(vim.fn.bufnr(main_c, true))
+  fixtures.write(root_c .. "/mvnw", { "#!/bin/sh", "exit 0" })
+  vim.fn.system({ "chmod", "+x", root_c .. "/mvnw" })
+
+  open_file(main_c)
+  build.build() -- registra last_code_buf = AppC
+  assert(entry("repeat").enabled == false, "AppC novo não deveria ter Repeat")
+  assert(build._state.last_output and vim.api.nvim_buf_is_valid(build._state.last_output))
+  vim.api.nvim_set_current_buf(build._state.last_output)
+
+  build.build()
+  assert(entry("repeat").enabled == false, "Repeat no output buffer não pode ler build-last do cwd")
+  menu_cb(entry("compile"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining()
+    end),
+    "build disparado do output buffer não concluiu"
+  )
+  assert(ctx_store["build-last"] == "cwd-sentinel", "build no output buffer não pode alterar jc.settings")
+
+  local root_sub = tempdir("iso-submod")
+  local sub_capture = root_sub .. "/sub_capture.txt"
+  fixtures.write(root_sub .. "/settings.gradle", {
+    "rootProject.name = 'iso-submod'",
+    "include(':services:api')",
+  })
+  fixtures.write(root_sub .. "/gradlew", {
+    "#!/bin/sh",
+    'printf "%s\\n" "$@" > ' .. vim.fn.shellescape(sub_capture),
+  })
+  vim.fn.system({ "chmod", "+x", root_sub .. "/gradlew" })
+  fixtures.write(root_sub .. "/services/api/build.gradle", { "plugins { id 'java' }" })
+  local sub_main = root_sub .. "/services/api/src/main/java/com/demo/sub/SubApp.java"
+  fixtures.write(sub_main, { "package com.demo.sub;", "public class SubApp {}" })
+
+  open_file(sub_main)
+  local canon_sub = run_config.canonical(root_sub)
+  assert(run_config.canonical(project.root(0)) == canon_sub, "raiz do projeto aninhado divergiu")
+  build.build()
+  assert(entry("repeat").enabled == false, "submódulo sem build prévio não pode habilitar Repeat")
+  ask_script = { "help" }
+  pick_script = { "services/api" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(sub_capture) == 1
+    end),
+    "build em projeto com submódulo não concluiu"
+  )
+  build._last_builds[canon_sub] = nil
+  vim.fn.delete(sub_capture)
+  build.build()
+  assert(entry("repeat").enabled == true, "Repeat próprio por canon_root deveria estar habilitado após build")
+  menu_cb(entry("repeat"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(sub_capture) == 1
+    end),
+    "repeat do submódulo não concluiu"
+  )
+  assert(read_raw(sub_capture) == ":services:api:help\n", "repeat do submódulo divergiu: " .. read_raw(sub_capture))
+  assert(ctx_store["build-last"] == "cwd-sentinel", "submódulo não pode sobrescrever jc.settings")
+  assert(ctx_reads == 0 and ctx_writes == 0, "output buffer e submódulo não devem acessar jc.settings")
+
+  -- 15e. project_root#find ausente (E117) nunca permite leitura nem escrita inverificável no jc.settings
+  local prev_rtp = vim.o.runtimepath
+  for _, p in ipairs(vim.api.nvim_list_runtime_paths()) do
+    if p:find("jc.nvim", 1, true) then
+      vim.opt.rtp:remove(p)
+    end
+  end
+  vim.cmd("silent! delfunction project_root#find")
+  local ok_finder, finder_err = pcall(vim.fn["project_root#find"])
+  assert(
+    not ok_finder and tostring(finder_err):find("E117", 1, true),
+    "fixture deveria simular E117 em project_root#find"
+  )
+
+  local missing_store = { ["build-last"] = "missing-sentinel" }
+  local missing_reads, missing_writes = 0, 0
+  package.loaded["jc.settings"] = {
+    read_project = function(name)
+      missing_reads = missing_reads + 1
+      return missing_store[name]
+    end,
+    write_project = function(name, value)
+      missing_writes = missing_writes + 1
+      missing_store[name] = value
+    end,
+  }
+
+  local root_miss = tempdir("iso-missing-finder")
+  local miss_capture = root_miss .. "/miss_capture.txt"
+  local _, main_miss = make_gradle_stub("miss", miss_capture, root_miss)
+  local canon_miss = run_config.canonical(root_miss)
+  open_file(main_miss)
+  build.build()
+  assert(entry("repeat").enabled == false, "com finder ausente, Repeat não pode ler jc.settings")
+  ask_script = { "compileJava" }
+  menu_cb(entry("choose_goal"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(miss_capture) == 1
+    end),
+    "build com finder ausente não concluiu"
+  )
+  assert(
+    missing_store["build-last"] == "missing-sentinel",
+    "com finder ausente, Java Menu não pode gravar jc.settings"
+  )
+  assert(
+    missing_reads == 0 and missing_writes == 0,
+    "com finder ausente, não deve haver leitura/escrita em jc.settings"
+  )
+
+  build._last_builds[canon_miss] = nil
+  vim.fn.delete(miss_capture)
+  build.build()
+  assert(entry("repeat").enabled == true, "Repeat próprio deveria funcionar mesmo sem project_root#find")
+  menu_cb(entry("repeat"))
+  assert(
+    fixtures.wait_for(10000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(miss_capture) == 1
+    end),
+    "repeat sem finder não concluiu"
+  )
+  assert(read_raw(miss_capture) == "compileJava\n", "repeat sem finder divergiu: " .. read_raw(miss_capture))
+
+  vim.o.runtimepath = prev_rtp
+  assert(vim.uv.cwd() == prev_cwd, "cwd global nunca pode ser alterado")
+  package.loaded["jc.settings"] = prev_jc_settings
+end
+
+-- Distinct canonical paths must never share a persisted build record or run
+-- settings file, even when legacy workspace_id encoding collides.
+do
+  local project = require("java_menu.project")
+  local base = tempdir("percent-collision")
+  local a, b = base .. "/a%/b", base .. "/a/%b"
+  vim.fn.mkdir(a, "p")
+  vim.fn.mkdir(b, "p")
+  local canon_a = run_config.canonical(a)
+  local canon_b = run_config.canonical(b)
+  assert(project.workspace_id(a) == project.workspace_id(b))
+
+  -- Build history isolation + forged owner check
+  assert(run_config.last_build_path(a) ~= run_config.last_build_path(b))
+  assert(run_config.save_last_build(a, { "alpha" }))
+  assert(run_config.load_last_build(b) == nil)
+  assert(run_config.save_last_build(b, { "beta" }))
+  assert(vim.deep_equal(run_config.load_last_build(a), { "alpha" }))
+  assert(vim.deep_equal(run_config.load_last_build(b), { "beta" }))
+  vim.fn.writefile({ vim.json.encode({ root = canon_a, args = { "wrong" } }) }, run_config.last_build_path(b))
+  assert(run_config.load_last_build(b) == nil, "a record owned by another root must be ignored")
+
+  -- Legacy unowned settings file (keyed by colliding workspace_id) must never
+  -- be imported or deleted by load/save/reset for either root.
+  local legacy_path = vim.fs.joinpath(data_dir, project.workspace_id(canon_a) .. ".json")
+  local legacy_content = vim.json.encode({
+    version = 1,
+    profile = "legacy-profile",
+    jvm_args = "-Xmx3g",
+    app_args = "--legacy",
+    use_env = false,
+  })
+  vim.fn.writefile({ legacy_content }, legacy_path)
+  assert(run_config.storage_path(a) ~= legacy_path)
+  assert(run_config.storage_path(b) ~= legacy_path)
+  assert(run_config.storage_path(a) ~= run_config.storage_path(b))
+
+  local legacy_a, legacy_a_err = run_config.load(a)
+  local legacy_b, legacy_b_err = run_config.load(b)
+  assert(legacy_a_err == nil and legacy_a.profile == "" and legacy_a.jvm_args == "" and legacy_a.use_env == true)
+  assert(legacy_b_err == nil and legacy_b.profile == "" and legacy_b.jvm_args == "" and legacy_b.use_env == true)
+  assert(vim.fn.filereadable(legacy_path) == 1 and vim.trim(read_raw(legacy_path)) == legacy_content)
+
+  -- Scoped save/load/reset isolation between colliding canonical roots
+  assert(run_config.save(a, { profile = "dev", jvm_args = "-Xmx1g", app_args = "--alpha", use_env = true }))
+  local saved_disk_a = vim.json.decode(read_raw(run_config.storage_path(a)))
+  assert(saved_disk_a.version == 2 and saved_disk_a.root == canon_a)
+
+  local unloaded_b, unloaded_b_err = run_config.load(b)
+  assert(unloaded_b_err == nil and unloaded_b.profile == "" and unloaded_b.jvm_args == "")
+
+  assert(run_config.save(b, { profile = "prod", jvm_args = "-Xmx2g", app_args = "--beta", use_env = false }))
+  local cfg_a = run_config.load(a)
+  local cfg_b = run_config.load(b)
+  assert(
+    cfg_a.profile == "dev" and cfg_a.jvm_args == "-Xmx1g" and cfg_a.app_args == "--alpha" and cfg_a.use_env == true
+  )
+  assert(
+    cfg_b.profile == "prod" and cfg_b.jvm_args == "-Xmx2g" and cfg_b.app_args == "--beta" and cfg_b.use_env == false
+  )
+  assert(vim.fn.filereadable(legacy_path) == 1 and vim.trim(read_raw(legacy_path)) == legacy_content)
+
+  -- Reset removes only the target root's scoped settings, leaving sibling and legacy intact
+  assert(run_config.reset(a))
+  local after_reset_a, reset_a_err = run_config.load(a)
+  assert(reset_a_err == nil and after_reset_a.profile == "" and after_reset_a.jvm_args == "")
+  assert(run_config.load(b).profile == "prod")
+  assert(vim.fn.filereadable(legacy_path) == 1 and vim.trim(read_raw(legacy_path)) == legacy_content)
+
+  -- Forged owner or unowned record at scoped storage_path must be rejected
+  vim.fn.writefile({
+    vim.json.encode({
+      version = 2,
+      root = canon_a,
+      profile = "forged",
+      jvm_args = "-Dforged=1",
+      app_args = "--forged",
+      use_env = false,
+    }),
+  }, run_config.storage_path(b))
+  local forged_b, forged_b_err = run_config.load(b)
+  assert(
+    forged_b_err ~= nil
+      and forged_b.profile == ""
+      and forged_b.jvm_args == ""
+      and forged_b.app_args == ""
+      and forged_b.use_env == true,
+    "run settings owned by another root must be ignored"
+  )
+
+  vim.fn.writefile({
+    vim.json.encode({
+      version = 1,
+      profile = "unowned",
+      jvm_args = "-Xmx512m",
+      app_args = "--unowned",
+      use_env = false,
+    }),
+  }, run_config.storage_path(b))
+  local unowned_b, unowned_b_err = run_config.load(b)
+  assert(
+    unowned_b_err ~= nil
+      and unowned_b.profile == ""
+      and unowned_b.jvm_args == ""
+      and unowned_b.app_args == ""
+      and unowned_b.use_env == true,
+    "unowned run settings without root metadata must be ignored"
+  )
+
+  assert(run_config.reset(b))
+  assert(vim.fn.filereadable(legacy_path) == 1 and vim.trim(read_raw(legacy_path)) == legacy_content)
 end
 
 -- Limpeza e restauração

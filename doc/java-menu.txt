@@ -222,9 +222,14 @@ separately printed fragments cannot be detected; short values can redact
 ordinary output. Arguments are stored locally: put secrets in .env instead.
 Restart refuses automatic termination if the process group cannot be verified.
 Background processes left after normal exit can outlive Java Menu's stop
-controls. Arguments that jc.nvim cannot replay faithfully stay in Java
-Menu's repeat history only. Short .env values may cause unrelated arguments
-to be excluded from saved history.
+controls. Repeat Last uses Java Menu's own canonical-root history only and
+neither reads nor writes jc.nvim's `build-last` (`JCbuildLast`), as
+jc.settings uses non-injective path keys without cross-session ownership.
+Short .env values may cause unrelated arguments to be excluded from saved
+history. Previously saved build histories and run settings without project
+ownership metadata (including legacy unhashed settings files) are neither
+imported nor deleted; run a build or re-save in Run Settings to create
+scoped data.
 
                                                                   *java-menu-tests*
 Tests ~
