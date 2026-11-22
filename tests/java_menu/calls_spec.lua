@@ -1685,28 +1685,205 @@ local function run_tests()
   assert(last_notice() and last_notice().msg:find("window or buffer changed", 1, true))
   vim.cmd("silent! only")
 
-  -- FileType hooks must not attach another client while a virtual buffer is
-  -- being populated and before its owner has been recorded.
+  -- ---------- 14. jdt:// FileType suppression, malicious hook isolation, and safe local ftplugin ----------
+  -- Arbitrary FileType autocmds and runtimepath ftplugin/ scripts cannot be
+  -- executed with proven isolation (even before content load, an async hook
+  -- could schedule vim.lsp.buf_attach_client and leak content via didOpen).
+  -- Verify: (a) arbitrary FileType hooks and user/plugin rtp ftplugin/syntax
+  -- scripts never run and cannot attach a foreign client (sync or scheduled),
+  -- (b) foreign clients on other buffers are never detached, (c) bundled
+  -- $VIMRUNTIME ftplugin/syntax initialize safely when enabled, and (d) normal
+  -- LspAttach hooks still run for the owning client.
+  vim.lsp.get_clients = real_get_clients
+  local iso_owner_msgs, iso_foreign_msgs = {}, {}
+  local iso_owner = start_inproc_jdtls(root .. "/iso-owner", iso_owner_msgs)
+  local iso_foreign = start_inproc_jdtls(root .. "/iso-foreign", iso_foreign_msgs)
+  assert(
+    vim.wait(1000, function()
+      return iso_owner.initialized and iso_foreign.initialized
+    end, 10),
+    "isolation test in-process clients did not initialize"
+  )
+  local foreign_seed_buf = next(iso_foreign.attached_buffers)
+  assert(foreign_seed_buf and vim.lsp.buf_is_attached(foreign_seed_buf, iso_foreign.id))
+  for i = #iso_owner_msgs, 1, -1 do
+    iso_owner_msgs[i] = nil
+  end
+  for i = #iso_foreign_msgs, 1, -1 do
+    iso_foreign_msgs[i] = nil
+  end
+
+  local fake_rtp = track_dir(vim.fs.normalize(vim.fn.tempname() .. "-fake-rtp"))
+  fixtures.write(
+    fake_rtp .. "/ftplugin/java.lua",
+    string.format(
+      [[
+vim.g.__malicious_rtp_ftplugin = true
+pcall(vim.lsp.buf_attach_client, 0, %d)
+vim.schedule(function()
+  pcall(vim.lsp.buf_attach_client, 0, %d)
+end)
+]],
+      iso_foreign.id,
+      iso_foreign.id
+    )
+  )
+  fixtures.write(
+    fake_rtp .. "/syntax/java.lua",
+    string.format(
+      [[
+vim.g.__malicious_rtp_syntax = true
+pcall(vim.lsp.buf_attach_client, 0, %d)
+]],
+      iso_foreign.id
+    )
+  )
+
+  local saved_rtp_before = vim.o.runtimepath
+  local saved_ei_before = vim.o.eventignore
+  local saved_did_ftplugin = vim.g.did_load_ftplugin
+  local saved_syntax_on = vim.g.syntax_on
+  vim.cmd("filetype plugin on")
+  vim.cmd("syntax on")
+  vim.opt.runtimepath:prepend(fake_rtp)
+  local rtp_with_fake = vim.o.runtimepath
+
   local guarded_uri = "jdt://contents/java.base/java.lang/Guard.class?=guard/Guard.class"
   local filetype_fired = false
-  local hook = vim.api.nvim_create_autocmd("FileType", {
-    pattern = "java",
-    callback = function()
-      filetype_fired = true
+  local premature_entry = false
+  local entry_hook = vim.api.nvim_create_autocmd({ "BufNewFile", "BufEnter", "BufWinEnter" }, {
+    callback = function(ev)
+      if vim.api.nvim_buf_get_name(ev.buf) == guarded_uri and vim.b[ev.buf].java_menu_jdt_owner == nil then
+        premature_entry = true
+        vim.lsp.buf_attach_client(ev.buf, iso_foreign.id)
+      end
     end,
   })
-  calls._navigate_to(
-    { uri = guarded_uri, range = { start = { line = 0, character = 0 } } },
-    two_win_cli,
-    { bufnr = caller_buf, win = vim.api.nvim_get_current_win() }
-  )
-  local guarded_req = two_win_cli._sent[#two_win_cli._sent]
-  assert(guarded_req.method == "java/classFileContents")
-  two_win_cli:deliver(guarded_req.id, nil, "package java.lang;\npublic class Guard {}")
-  flush_schedule()
-  vim.api.nvim_del_autocmd(hook)
-  assert(not filetype_fired, "FileType hook ran before jdt:// buffer ownership was established")
-  assert(vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf()) == guarded_uri)
+  local malicious_ft_sync = vim.api.nvim_create_autocmd("FileType", {
+    pattern = "java",
+    callback = function(ev)
+      filetype_fired = true
+      vim.b[ev.buf].normal_ft_ran = true
+      pcall(vim.lsp.buf_attach_client, ev.buf, iso_foreign.id)
+    end,
+  })
+  local malicious_ft_async = vim.api.nvim_create_autocmd("FileType", {
+    pattern = "java",
+    callback = function(ev)
+      local target = ev.buf
+      vim.schedule(function()
+        pcall(vim.lsp.buf_attach_client, target, iso_foreign.id)
+      end)
+    end,
+  })
+  local malicious_syntax = vim.api.nvim_create_autocmd("Syntax", {
+    pattern = "java",
+    callback = function(ev)
+      pcall(vim.lsp.buf_attach_client, ev.buf, iso_foreign.id)
+    end,
+  })
+  local malicious_optionset = vim.api.nvim_create_autocmd("OptionSet", {
+    pattern = { "runtimepath", "filetype", "syntax" },
+    callback = function(ev)
+      pcall(vim.lsp.buf_attach_client, ev.buf, iso_foreign.id)
+    end,
+  })
+  local lsp_attach_hook = vim.api.nvim_create_autocmd("LspAttach", {
+    callback = function(ev)
+      if vim.api.nvim_buf_is_valid(ev.buf) and vim.b[ev.buf].java_menu_jdt_uri == guarded_uri then
+        vim.b[ev.buf].user_lsp_attach_client = ev.data and ev.data.client_id
+      end
+    end,
+  })
+
+  vim.api.nvim_set_current_buf(caller_buf)
+  local ok_iso, iso_err = pcall(function()
+    assert(
+      calls._navigate_to(
+        { uri = guarded_uri, range = { start = { line = 1, character = 19 } } },
+        iso_owner,
+        { bufnr = caller_buf, win = vim.api.nvim_get_current_win() }
+      ) == true
+    )
+    assert(
+      vim.wait(1000, function()
+        return vim.api.nvim_buf_get_name(0) == guarded_uri and vim.lsp.buf_is_attached(0, iso_owner.id)
+      end, 10),
+      "owner client did not open and attach guarded jdt:// buffer"
+    )
+    flush_schedule()
+
+    local jdt_buf = track_buf(vim.api.nvim_get_current_buf())
+    assert(not premature_entry, "buffer event ran before virtual-buffer ownership was recorded")
+    assert(not filetype_fired, "arbitrary FileType autocmd ran on jdt:// buffer")
+    assert(vim.b[jdt_buf].normal_ft_ran == nil, "normal FileType autocmd unexpectedly ran on jdt:// buffer")
+    assert(vim.g.__malicious_rtp_ftplugin == nil, "user/plugin rtp ftplugin/java.lua executed on jdt:// buffer!")
+    assert(vim.g.__malicious_rtp_syntax == nil, "user/plugin rtp syntax/java.lua executed on jdt:// buffer!")
+    assert(
+      not vim.lsp.buf_is_attached(jdt_buf, iso_foreign.id),
+      "malicious hook attached foreign client to jdt:// buffer!"
+    )
+    assert(#iso_foreign_msgs == 0, "foreign client received LSP messages / leaked content!")
+    assert(
+      vim.lsp.buf_is_attached(foreign_seed_buf, iso_foreign.id),
+      "foreign client was detached from its own buffer!"
+    )
+    assert(vim.bo[jdt_buf].filetype == "java")
+    assert(vim.bo[jdt_buf].modifiable == false)
+    assert(vim.bo[jdt_buf].buftype == "nofile")
+    assert(vim.b[jdt_buf].did_ftplugin == 1, "bundled $VIMRUNTIME ftplugin did not initialize locally")
+    assert(vim.bo[jdt_buf].commentstring == "// %s", "expected java commentstring from bundled ftplugin")
+    assert(vim.b[jdt_buf].current_syntax == "java", "bundled $VIMRUNTIME syntax did not initialize locally")
+    assert(vim.bo[jdt_buf].syntax == "java", "expected syntax=java on jdt:// buffer")
+    assert(vim.b[jdt_buf].user_lsp_attach_client == iso_owner.id, "LspAttach hook did not run for owning client")
+    assert(vim.o.runtimepath == rtp_with_fake, "runtimepath was not restored after local ftplugin init")
+    assert(vim.o.eventignore == saved_ei_before, "eventignore was not restored")
+    assert_no_invented_uris(iso_owner_msgs, "iso_owner")
+    assert_no_invented_uris(iso_foreign_msgs, "iso_foreign")
+
+    -- When did_load_ftplugin / syntax_on are disabled, safe init must respect that.
+    vim.g.did_load_ftplugin = nil
+    vim.g.syntax_on = nil
+    local guarded_uri_2 = "jdt://contents/java.base/java.lang/Guard2.class?=guard/Guard2.class"
+    vim.api.nvim_set_current_buf(caller_buf)
+    assert(
+      calls._navigate_to(
+        { uri = guarded_uri_2, range = { start = { line = 0, character = 0 } } },
+        iso_owner,
+        { bufnr = caller_buf, win = vim.api.nvim_get_current_win() }
+      ) == true
+    )
+    assert(
+      vim.wait(1000, function()
+        return vim.api.nvim_buf_get_name(0) == guarded_uri_2 and vim.lsp.buf_is_attached(0, iso_owner.id)
+      end, 10),
+      "owner client did not open second guarded jdt:// buffer"
+    )
+    flush_schedule()
+    local jdt_buf_2 = track_buf(vim.api.nvim_get_current_buf())
+    assert(vim.bo[jdt_buf_2].filetype == "java")
+    assert(vim.b[jdt_buf_2].did_ftplugin == nil, "ftplugin ran despite did_load_ftplugin=nil")
+    assert(vim.b[jdt_buf_2].current_syntax == nil, "syntax ran despite syntax_on=nil")
+    assert(vim.bo[jdt_buf_2].syntax == "", "bo.syntax set despite syntax_on=nil")
+    assert(not vim.lsp.buf_is_attached(jdt_buf_2, iso_foreign.id))
+    assert(#iso_foreign_msgs == 0)
+  end)
+
+  vim.api.nvim_del_autocmd(malicious_ft_sync)
+  vim.api.nvim_del_autocmd(malicious_ft_async)
+  vim.api.nvim_del_autocmd(malicious_syntax)
+  vim.api.nvim_del_autocmd(malicious_optionset)
+  vim.api.nvim_del_autocmd(entry_hook)
+  vim.api.nvim_del_autocmd(lsp_attach_hook)
+  vim.o.runtimepath = saved_rtp_before
+  vim.o.eventignore = saved_ei_before
+  vim.g.did_load_ftplugin = saved_did_ftplugin
+  vim.g.syntax_on = saved_syntax_on
+  vim.g.__malicious_rtp_ftplugin = nil
+  vim.g.__malicious_rtp_syntax = nil
+  iso_owner:stop(true)
+  iso_foreign:stop(true)
+  assert(ok_iso, iso_err)
 
   print("calls_spec: OK")
 end

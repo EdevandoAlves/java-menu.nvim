@@ -97,11 +97,13 @@ FAST_SPECS=(
   tests_navigation_spec
   run_experience_spec
   calls_spec
+  types_spec
 )
 
 # INTEGRATION: JDTLS real (lsp_clients, refactor_lsp, jdtls_projects inclui
 # DAP attach) e processos Maven/Gradle reais (build_isolation, build_gradle_real).
 INTEGRATION_SPECS=(
+  type_hierarchy_real_spec
   call_hierarchy_real_spec
   lsp_clients_spec
   refactor_lsp_spec

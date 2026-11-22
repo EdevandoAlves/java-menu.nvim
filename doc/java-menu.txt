@@ -22,10 +22,10 @@ CONTENTS                                                      *java-menu-content
 1. INTRODUCTION                                                *java-menu-intro*
 
 java-menu.nvim is a contextual menu layer for Java development in Neovim.
-Nine groups — New, Generate, Refactor, Imports, Build/Run, Tests,
-Debug, Project, Call Hierarchy — collect the operations you need for the
-current situation, and every entry says whether it is available and, when it
-is not, why.
+Ten groups — New, Generate, Refactor, Imports, Build/Run, Tests,
+Debug, Project, Call Hierarchy, Type Hierarchy — collect the operations you
+need for the current situation, and every entry says whether it is available
+and, when it is not, why.
 
 The Java work itself is done by |jc.nvim| and by the jdtls language server
 you already run. java-menu.nvim never starts, installs or manages a language
@@ -130,6 +130,7 @@ dependency instead of half-registering menus.
       debug = true,
       project = true,
       calls = true,
+      types = true,
     },
     which_key = true,     -- label the group in which-key when installed
   })
@@ -153,8 +154,8 @@ Behavior you get without asking:
                                                             *java-menu-javamenu*
                                                               *java-menu-trigger-cmd*
 `:JavaMenu [group]` ~
-Opens one of the nine menus, with command-line completion for
-`new | generate | refactor | imports | build | tests | debug | project | calls`.
+Opens one of the ten menus, with command-line completion for
+`new | generate | refactor | imports | build | tests | debug | project | calls | types`.
 Without an argument it lists the accepted groups.
 
 ==============================================================================
@@ -174,6 +175,7 @@ Global keymaps registered by `setup()`; `<prefix>` is the `prefix` option
 |n    | `<prefix>d`      | Debug                     | nvim-dap + java-debug    |
 |n    | `<prefix>p`      | Project                   | no jdtls needed          |
 |n    | `<prefix>c`      | Call Hierarchy            | jdtls (callHierarchy)    |
+|n    | `<prefix>h`      | Type Hierarchy            | jdtls (typeHierarchy/impl)|
 
 Keymap conflicts with mappings that are not java-menu's are never
 overwritten: yours is kept, ours is skipped, and the conflict is reported.
@@ -369,6 +371,26 @@ symbol under the cursor, using the attached jdtls client directly:
   clear reason instead of reusing foreign contents or synthesizing
   non-canonical LSP URIs).
 
+                                                                  *java-menu-types*
+Type Hierarchy ~
+Contextual Supertypes, Subtypes, and Implementations for the Java symbol under
+the cursor, using the attached jdtls client directly and checking real LSP
+server capabilities per entry:
+- Supertypes: resolves parents (`extends` / `implements`) via
+  `textDocument/prepareTypeHierarchy` and `typeHierarchy/supertypes`
+  (requires `typeHierarchyProvider`).
+- Subtypes: resolves direct subclasses and implementing types via
+  `textDocument/prepareTypeHierarchy` and `typeHierarchy/subtypes`
+  (requires `typeHierarchyProvider`).
+- Implementations: resolves concrete implementations of types or overridden
+  methods via `textDocument/implementation` (requires
+  `implementationProvider`).
+- Shared safeguards: reuses `java_menu.hierarchy` for explicit multi-client
+  selection, client `offset_encoding`, cancellation (`Cancel active request`
+  or `require("java_menu.types").cancel()`), stale-callback/picker and
+  `changedtick`/window/buffer guards, and safe `file://` + canonical
+  `jdt://` URI isolation.
+
 ==============================================================================
 8. WORKSPACEEDIT PREVIEW                                     *java-menu-preview*
 
@@ -444,14 +466,24 @@ generate delegate methods.
   concurrent writer in the final instant.
 - Project creation runs no git init and installs/configures no tools.
 - Rename Package / Move Package are disabled (see |java-menu-refactor|).
-- Call Hierarchy requires an attached jdtls client with `callHierarchyProvider`
-  (and `java/classFileContents` for virtual `jdt://` targets, which have no
+- Call & Type Hierarchy require an attached jdtls client advertising
+  `callHierarchyProvider` for Call Hierarchy, `typeHierarchyProvider` for
+  Supertypes/Subtypes, and `implementationProvider` for Implementations (plus
+  `java/classFileContents` for virtual `jdt://` targets, which have no
   physical file path on disk); results are single-level per menu invocation
   and depend on JDTLS indexing. Distinct jdtls clients cannot share or isolate
   the same canonical `jdt://` URI simultaneously in Neovim without altering the
   LSP URI, so collisions are refused until the existing `jdt://` buffer is
-  closed.
-- Tested on Linux only; no Windows/macOS validation.
+  closed. Additionally, `FileType` autocmds and user/plugin `runtimepath`
+  `ftplugin/` scripts are not executed on virtual `jdt://` buffers because
+  arbitrary hooks (sync or deferred) cannot be proven isolated from attaching
+  another LSP client and leaking buffer contents via `didOpen`; only Neovim's
+  bundled `$VIMRUNTIME` ftplugin and syntax rules are initialized locally
+  (when enabled), while `LspAttach` still fires normally for the owning client.
+  Buffer-entry events are suppressed during initialization only. After the
+  buffer is shown, user or plugin autocmds can still attach other clients;
+  configure those hooks to respect project ownership.
+- The full suite runs on Linux; macOS and Windows have portable smoke checks.
 
 ==============================================================================
 10. TROUBLESHOOTING                                     *java-menu-troubleshooting*

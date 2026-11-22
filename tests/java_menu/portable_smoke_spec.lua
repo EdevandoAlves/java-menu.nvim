@@ -96,7 +96,9 @@ local function run_smoke()
     { "java_menu.deps", "menu" },
     { "java_menu.diagnostics", "report" },
     { "java_menu.run_config", "load" },
+    { "java_menu.hierarchy", "new_controller" },
     { "java_menu.calls", "calls" },
+    { "java_menu.types", "types" },
   }
   for _, spec in ipairs(expected_modules) do
     local mod = require(spec[1])

@@ -25,6 +25,7 @@ M.actions = {
   debug = { key = "d", module = "java_menu.debug", entry = "debug", modes = { "n" }, desc = "Debug" },
   project = { key = "p", module = "java_menu.project_menu", entry = "project", modes = { "n" }, desc = "Project" },
   calls = { key = "c", module = "java_menu.calls", entry = "calls", modes = { "n" }, desc = "Call Hierarchy" },
+  types = { key = "h", module = "java_menu.types", entry = "types", modes = { "n" }, desc = "Type Hierarchy" },
 }
 
 M.config = {

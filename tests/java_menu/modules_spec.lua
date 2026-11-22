@@ -53,6 +53,11 @@ for _, name in ipairs({ "calls", "incoming", "outgoing", "cancel" }) do
   expect_fn(calls, name, "menu Call Hierarchy")
 end
 
+local types = require("java_menu.types")
+for _, name in ipairs({ "types", "supertypes", "subtypes", "implementations", "cancel" }) do
+  expect_fn(types, name, "menu Type Hierarchy")
+end
+
 -- ---------- infraestrutura ----------
 
 local ui = require("java_menu.ui")
