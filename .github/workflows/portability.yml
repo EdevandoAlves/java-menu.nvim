@@ -1,0 +1,141 @@
+# Portability smoke checks for macOS and Windows (issue #8).
+# Controlled scope: pure portable Lua/Neovim smoke checks only.
+# Excludes JDTLS, external Maven/Gradle/wrapper processes, chmod, symlinks,
+# and /tmp assumptions. Passing this workflow does not claim full OS support.
+# Uses direct official downloads and public git clone with no actions or steps
+# requiring user secrets (no third-party setup actions).
+
+name: Portability Smoke
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Match Neovim version pinned in .github/workflows/ci.yml.
+  NVIM_VERSION: v0.12.6
+  # Match jc.nvim revision pinned in .github/workflows/ci.yml.
+  JC_REVISION: 0aaf5bbc07ed1a69d66779187d48bfea6ec863b6
+  XDG_DATA_HOME: ${{ github.workspace }}/.deps
+
+jobs:
+  smoke:
+    name: Smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Neovim ${{ env.NVIM_VERSION }} (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.arch }}" in
+            ARM64) asset="nvim-macos-arm64.tar.gz" ;;
+            X64) asset="nvim-macos-x86_64.tar.gz" ;;
+            *)
+              echo "Unsupported macOS architecture: ${{ runner.arch }}" >&2
+              exit 1
+              ;;
+          esac
+          nvim_dir="${{ runner.temp }}/nvim"
+          archive="${{ runner.temp }}/${asset}"
+          mkdir -p "${nvim_dir}"
+          curl -fsSL --retry 3 "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/${asset}" -o "${archive}"
+          tar -xzf "${archive}" -C "${nvim_dir}" --strip-components=1
+          rm -f "${archive}"
+          echo "${nvim_dir}/bin" >> "$GITHUB_PATH"
+          "${nvim_dir}/bin/nvim" --version | head -n 1
+
+      - name: Install Neovim ${{ env.NVIM_VERSION }} (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          switch ('${{ runner.arch }}') {
+            'X64' {
+              $asset = 'nvim-win64.zip'
+              $innerDir = 'nvim-win64'
+            }
+            'ARM64' {
+              $asset = 'nvim-win-arm64.zip'
+              $innerDir = 'nvim-win-arm64'
+            }
+            default {
+              throw "Unsupported Windows architecture: ${{ runner.arch }}"
+            }
+          }
+          $archive = Join-Path $env:RUNNER_TEMP $asset
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'nvim-extract'
+          $nvimDir = Join-Path $env:RUNNER_TEMP 'nvim'
+          $url = "https://github.com/neovim/neovim/releases/download/$($env:NVIM_VERSION)/$asset"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          if (Test-Path $extractRoot) { Remove-Item -Recurse -Force $extractRoot }
+          if (Test-Path $nvimDir) { Remove-Item -Recurse -Force $nvimDir }
+          Expand-Archive -Path $archive -DestinationPath $extractRoot -Force
+          Move-Item -Path (Join-Path $extractRoot $innerDir) -Destination $nvimDir
+          Remove-Item -Force $archive
+          Remove-Item -Recurse -Force $extractRoot
+          $binDir = Join-Path $nvimDir 'bin'
+          if (-not (Test-Path (Join-Path $binDir 'nvim.exe'))) {
+            throw "Expected nvim.exe not found at $binDir"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $binDir
+          & (Join-Path $binDir 'nvim.exe') --version | Select-Object -First 1
+
+      - name: Install jc.nvim at pinned revision
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lazyDir = Join-Path (Join-Path $env:XDG_DATA_HOME 'nvim') 'lazy'
+          $jcDir = Join-Path $lazyDir 'jc.nvim'
+          New-Item -ItemType Directory -Force -Path $lazyDir | Out-Null
+          git clone --no-checkout https://github.com/artur-shaik/jc.nvim $jcDir
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $jcDir checkout $env:JC_REVISION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $actual = (git -C $jcDir rev-parse HEAD).Trim()
+          if ($actual -ne $env:JC_REVISION) {
+            throw "jc.nvim checkout at $actual, expected $($env:JC_REVISION)"
+          }
+
+      - name: Run pure portable headless smoke checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = (Resolve-Path $env:GITHUB_WORKSPACE).Path
+          $jcDir = Join-Path (Join-Path (Join-Path $env:XDG_DATA_HOME 'nvim') 'lazy') 'jc.nvim'
+          if (-not (Test-Path $jcDir)) {
+            throw "Required jc.nvim directory missing: $jcDir"
+          }
+
+          $specs = @(
+            'tests/java_menu/setup_spec.lua',
+            'tests/java_menu/modules_spec.lua',
+            'tests/java_menu/portable_smoke_spec.lua'
+          )
+
+          foreach ($spec in $specs) {
+            Write-Host "=== Running $spec on $($env:RUNNER_OS) ($($env:RUNNER_ARCH)) ==="
+            $env:JAVA_MENU_SMOKE_REPO = $repo
+            $env:JAVA_MENU_SMOKE_JC = $jcDir
+            $env:JAVA_MENU_SMOKE_SPEC = Join-Path $repo $spec
+            $env:JAVA_MENU_EXPECTED_OS = $env:RUNNER_OS
+
+            $luaRunner = "vim.opt.rtp:append(vim.env.JAVA_MENU_SMOKE_REPO); vim.opt.rtp:append(vim.env.JAVA_MENU_SMOKE_JC); local ok, err = xpcall(dofile, debug.traceback, vim.env.JAVA_MENU_SMOKE_SPEC); if not ok then io.stderr:write('[SMOKE_ERROR] ' .. tostring(vim.env.JAVA_MENU_SMOKE_SPEC) .. string.char(10) .. tostring(err) .. string.char(10)); vim.cmd('cquit 1') end"
+            & nvim --headless -u NONE -n -c "lua $luaRunner" -c 'qa!'
+            if ($LASTEXITCODE -ne 0) {
+              throw "Portable smoke spec failed (exit=$($LASTEXITCODE)): $spec"
+            }
+          }
