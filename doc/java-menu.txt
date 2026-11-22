@@ -22,10 +22,10 @@ CONTENTS                                                      *java-menu-content
 1. INTRODUCTION                                                *java-menu-intro*
 
 java-menu.nvim is a contextual menu layer for Java development in Neovim.
-Ten groups — New, Generate, Refactor, Imports, Build/Run, Tests,
-Debug, Project, Call Hierarchy, Type Hierarchy — collect the operations you
-need for the current situation, and every entry says whether it is available
-and, when it is not, why.
+Eleven entries — New, Generate, Refactor, Imports, Build/Run, Tests,
+Debug, Project, Call Hierarchy, Type Hierarchy, Stack Trace — collect the
+operations you need for the current situation, and every entry says whether
+it is available and, when it is not, why.
 
 The Java work itself is done by |jc.nvim| and by the jdtls language server
 you already run. java-menu.nvim never starts, installs or manages a language
@@ -131,6 +131,7 @@ dependency instead of half-registering menus.
       project = true,
       calls = true,
       types = true,
+      stacktrace = true,
     },
     which_key = true,     -- label the group in which-key when installed
   })
@@ -154,8 +155,8 @@ Behavior you get without asking:
                                                             *java-menu-javamenu*
                                                               *java-menu-trigger-cmd*
 `:JavaMenu [group]` ~
-Opens one of the ten menus, with command-line completion for
-`new | generate | refactor | imports | build | tests | debug | project | calls | types`.
+Opens one of the eleven actions, with command-line completion for
+`new | generate | refactor | imports | build | tests | debug | project | calls | types | stacktrace`.
 Without an argument it lists the accepted groups.
 
 ==============================================================================
@@ -176,6 +177,7 @@ Global keymaps registered by `setup()`; `<prefix>` is the `prefix` option
 |n    | `<prefix>p`      | Project                   | no jdtls needed          |
 |n    | `<prefix>c`      | Call Hierarchy            | jdtls (callHierarchy)    |
 |n    | `<prefix>h`      | Type Hierarchy            | jdtls (typeHierarchy/impl)|
+|n    | `<prefix>s`      | Stack Trace               | jdtls (resolveStackTrace)|
 
 Keymap conflicts with mappings that are not java-menu's are never
 overwritten: yours is kept, ours is skipped, and the conflict is reported.
@@ -391,6 +393,29 @@ server capabilities per entry:
   `changedtick`/window/buffer guards, and safe `file://` + canonical
   `jdt://` URI isolation.
 
+                                                             *java-menu-stacktrace*
+Stack Trace ~
+Navigate the Java stack trace line under the cursor to its source file and
+line (`<prefix>s` or `:JavaMenu stacktrace`):
+- Supported frames: standard Java frames, Java 9+ `module/`,
+  `module@version/`, and `classloader/module@version/` prefixes, inner/
+  anonymous classes (`Outer$Inner`), constructors/initializers (`<init>`,
+  `<clinit>`), and optional line numbers. `Native Method`, `Unknown Source`,
+  non-frame lines, and missing/unattached sources report clear messages.
+- Per-buffer provenance: `build.lua` output buffers store verified
+  per-buffer run provenance (`build.output_provenance(buf)`) rather than
+  relying on a global `last_output_root`. Buffers without verified project
+  provenance (scratch buffers, logs outside a project, unverified output
+  buffers) always ask for explicit jdtls client selection or refuse when no
+  client is running — never guessing from `cwd` or the first buffer/project.
+- Scoped resolution: queries `java.project.listSourcePaths` on the chosen
+  client, restricts candidates to the verified project root, prompts
+  explicitly when multiple verified source files match, and always passes an
+  explicit non-empty project list to `java.project.resolveStackTraceLocation`.
+- Shared safeguards: reuses `java_menu.hierarchy` for cancellation
+  (`require("java_menu.stacktrace").cancel()`), `changedtick`/window/buffer
+  guards, and safe `file://` + canonical `jdt://` buffer navigation.
+
 ==============================================================================
 8. WORKSPACEEDIT PREVIEW                                     *java-menu-preview*
 
@@ -483,6 +508,13 @@ generate delegate methods.
   Buffer-entry events are suppressed during initialization only. After the
   buffer is shown, user or plugin autocmds can still attach other clients;
   configure those hooks to respect project ownership.
+- Stack Trace navigation requires a running jdtls client exposing
+  `java.project.listSourcePaths` and `java.project.resolveStackTraceLocation`
+  (plus `java/classFileContents` for virtual `jdt://` targets). Buffers
+  without verified project provenance always require explicit jdtls client
+  selection instead of guessing from `cwd` or the first open project. JDTLS
+  may not resolve JDK frames without source attachments; decompiled library
+  source may not match the stack trace line number.
 - The full suite runs on Linux; macOS and Windows have portable smoke checks.
 
 ==============================================================================

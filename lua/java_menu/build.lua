@@ -67,6 +67,12 @@ local last_builds = {}
 ---Last executed command per project (keyed by canonical root, without secrets).
 local last_runs = {}
 
+---Verified per-buffer provenance for build output buffers, keyed by bufnr.
+---Stored internally (not solely in mutable buffer variables) and cleared on
+---wipeout; never stores secrets, env values, or unredacted command args.
+local output_provenance = {}
+local provenance_augroup = vim.api.nvim_create_augroup("java_menu_build_provenance", { clear = true })
+
 ---Resolve Repeat Last arguments for `canon_root`:
 ---1) in-session `last_builds[canon_root]`,
 ---2) persisted per-root `run_config.load_last_build(canon_root)`.
@@ -240,13 +246,72 @@ local function context_buf()
   return cur
 end
 
-local function open_output(title)
+local function prune_output_provenance()
+  for b in pairs(output_provenance) do
+    if not vim.api.nvim_buf_is_valid(b) then
+      output_provenance[b] = nil
+    end
+  end
+end
+
+local function single_client_meta(bufnr)
+  if not bufnr or bufnr <= 0 then
+    return nil, nil
+  end
+  local clients = lsp.clients(bufnr)
+  if #clients ~= 1 then
+    return nil, nil
+  end
+  local client = clients[1]
+  local root_dir = (type(client.root_dir) == "string" and client.root_dir ~= "")
+      and run_config.canonical(client.root_dir)
+    or nil
+  return client.id, root_dir
+end
+
+local function record_output_provenance(buf, prov)
+  if type(prov) ~= "table" or type(prov.root) ~= "string" or prov.root == "" then
+    return
+  end
+  prune_output_provenance()
+  local canon_root = run_config.canonical(prov.root)
+  local canon_cwd = (type(prov.cwd) == "string" and prov.cwd ~= "") and run_config.canonical(prov.cwd) or nil
+  local canon_module = (type(prov.module) == "string" and prov.module ~= "") and run_config.canonical(prov.module)
+    or nil
+  local canon_client_root = (type(prov.client_root_dir) == "string" and prov.client_root_dir ~= "")
+      and run_config.canonical(prov.client_root_dir)
+    or nil
+
+  vim.b[buf].java_build_root = canon_root
+  output_provenance[buf] = {
+    buf = buf,
+    seq = prov.seq,
+    title = prov.title,
+    kind = prov.kind,
+    root = canon_root,
+    cwd = canon_cwd,
+    module = canon_module,
+    client_id = prov.client_id,
+    client_root_dir = canon_client_root,
+  }
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    group = provenance_augroup,
+    buffer = buf,
+    once = true,
+    callback = function(ev)
+      output_provenance[ev.buf] = nil
+    end,
+  })
+end
+
+local function open_output(title, prov)
   local buf = vim.api.nvim_create_buf(false, true)
   vim.bo[buf].buftype = "nofile"
   vim.bo[buf].bufhidden = "hide"
   vim.bo[buf].swapfile = false
   vim.bo[buf].modifiable = true
   vim.b[buf].java_build_title = title
+  record_output_provenance(buf, prov)
 
   vim.cmd("botright split")
   local win = vim.api.nvim_get_current_win()
@@ -1685,7 +1750,17 @@ local function start(kind, cmd, cwd, root, opts)
   local redacted_cmd = safe_runner ~= "" and { safe_runner, "[REDACTED]" } or { "[REDACTED]" }
   local cmd_display = cmd_has_secret and table.concat(redacted_cmd, " ")
     or run_config.redact(table.concat(cmd, " "), redactions)
-  local buf = open_output(kind)
+  local run_seq = state.seq + 1
+  local buf = open_output(kind, {
+    seq = run_seq,
+    title = kind,
+    kind = kind,
+    root = canon_root,
+    cwd = cwd,
+    module = opts.module,
+    client_id = opts.client_id,
+    client_root_dir = opts.client_root_dir,
+  })
   local header = {
     ("$ %s"):format(cmd_display),
     ("cwd: %s"):format(cwd),
@@ -1785,6 +1860,9 @@ local function start(kind, cmd, cwd, root, opts)
       cmd = vim.deepcopy(cmd),
       cwd = cwd,
       root = project_root,
+      module = opts.module and run_config.canonical(opts.module) or nil,
+      client_id = opts.client_id,
+      client_root_dir = opts.client_root_dir,
       use_env = opts.use_env == true,
     }
     if type(opts.build_args) == "table" and #opts.build_args > 0 then
@@ -2081,7 +2159,12 @@ function M.restart(confirmed)
   end
 
   local function launch_recorded()
-    start(rec.kind, vim.deepcopy(rec.cmd), rec.cwd, rec.root, { use_env = rec.use_env })
+    start(rec.kind, vim.deepcopy(rec.cmd), rec.cwd, rec.root, {
+      use_env = rec.use_env,
+      module = rec.module,
+      client_id = rec.client_id,
+      client_root_dir = rec.client_root_dir,
+    })
   end
 
   -- A restart targets the destination project's full process set. This also
@@ -2217,6 +2300,32 @@ function M.restart(confirmed)
   start_drain_monitor(seq, target_pgid, target_ticks, { restart_op = op })
 end
 
+---Return a copy of the verified provenance recorded for a build output buffer,
+---or nil if `buf` is not a verified output buffer created by `build.lua`.
+---@param buf integer|nil
+---@return table|nil
+function M.output_provenance(buf)
+  buf = buf and buf > 0 and buf or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(buf) then
+    output_provenance[buf] = nil
+    return nil
+  end
+  local prov = output_provenance[buf]
+  if type(prov) ~= "table" then
+    return nil
+  end
+  if vim.b[buf].java_build_title == nil or vim.b[buf].java_build_title ~= prov.title then
+    return nil
+  end
+  if vim.b[buf].java_build_root ~= prov.root then
+    return nil
+  end
+  if type(prov.root) ~= "string" or prov.root == "" then
+    return nil
+  end
+  return vim.deepcopy(prov)
+end
+
 ---Show the last output (from any project — the origin is identified in the menu).
 function M.show_output()
   local buf = state.last_output
@@ -2257,13 +2366,17 @@ local function scope_args(tool, root, module, args)
 end
 
 ---Run build args at the root (with module scope).
-local function run_build(tool, root, module, args, label)
+local function run_build(tool, root, module, args, label, bufnr)
   local scoped = scope_args(tool.tool, root, module, args)
   local cmd = { tool.runner }
   vim.list_extend(cmd, scoped)
+  local client_id, client_root_dir = single_client_meta(bufnr)
   start(label or args[1], cmd, root, root, {
     user_args = args,
     build_args = scoped,
+    module = module,
+    client_id = client_id,
+    client_root_dir = client_root_dir,
   })
 end
 
@@ -2288,9 +2401,14 @@ local function classpath_for(uri, bufnr, cb)
       if type(result.modulepaths) == "table" then
         vim.list_extend(cp, result.modulepaths)
       end
+      local client_root_dir = (type(client.root_dir) == "string" and client.root_dir ~= "")
+          and run_config.canonical(client.root_dir)
+        or nil
       cb({
         classpaths = cp,
         project_root = type(result.projectRoot) == "string" and vim.uri_to_fname(result.projectRoot) or nil,
+        client_id = client.id,
+        client_root_dir = client_root_dir,
       })
     end)
   end, bufnr)
@@ -2414,7 +2532,7 @@ local function do_goal(root, bufnr, tool, goal, label)
     return
   end
   ask_module(root, bufnr, function(module)
-    run_build(tool, root, module, { goal }, label or goal)
+    run_build(tool, root, module, { goal }, label or goal, bufnr)
   end)
 end
 
@@ -2438,12 +2556,12 @@ local function do_choose_goal(root, bufnr, tool)
       return
     end
     ask_module(root, bufnr, function(module)
-      run_build(tool, root, module, parsed, "goal")
+      run_build(tool, root, module, parsed, "goal", bufnr)
     end)
   end)
 end
 
-local function do_repeat(root, tool)
+local function do_repeat(root, tool, bufnr)
   local canon_root = run_config.canonical(root)
   -- prefer this session's argv record by canonical root (never crosses projects),
   -- then Java Menu's per-root persisted argv
@@ -2456,7 +2574,12 @@ local function do_repeat(root, tool)
     ui.notify(tool.reason or "build tool unavailable", vim.log.levels.WARN)
     return
   end
-  start("build", vim.list_extend({ tool.runner }, parsed), root, root, { user_args = parsed })
+  local client_id, client_root_dir = single_client_meta(bufnr)
+  start("build", vim.list_extend({ tool.runner }, parsed), root, root, {
+    user_args = parsed,
+    client_id = client_id,
+    client_root_dir = client_root_dir,
+  })
 end
 
 local function run_main(root, bufnr, mains)
@@ -2545,6 +2668,9 @@ local function run_main(root, bufnr, mains)
             _secret_warned = secret_warned,
             _force_secret = secret_warned,
             user_args = user_args,
+            module = entry.module,
+            client_id = cp.client_id,
+            client_root_dir = cp.client_root_dir,
           })
         end)
       end)
@@ -2644,11 +2770,15 @@ local function run_spring(root, bufnr, spring)
           if next_cfg.app_args ~= "" then
             user_args[#user_args + 1] = next_cfg.app_args
           end
+          local client_id, client_root_dir = single_client_meta(bufnr)
           start("spring", cmd, root, root, {
             use_env = next_cfg.use_env ~= false,
             _secret_warned = secret_warned,
             _force_secret = secret_warned,
             user_args = user_args,
+            module = module,
+            client_id = client_id,
+            client_root_dir = client_root_dir,
           })
         end)
       end)
@@ -2966,7 +3096,7 @@ function M.build()
       elseif entry.key == "choose_goal" then
         do_choose_goal(root, bufnr, tool)
       elseif entry.key == "repeat" then
-        do_repeat(root, tool)
+        do_repeat(root, tool, bufnr)
       elseif entry.key == "stop" then
         M.stop()
       elseif entry.key == "output" then

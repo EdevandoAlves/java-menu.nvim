@@ -953,6 +953,16 @@ function Controller:navigate_to(entry, client, ctx, op_token)
           return
         end
 
+        if M.client_stopped(client) then
+          ui.notify("jdtls client is no longer available", vim.log.levels.WARN)
+          self:end_operation(op_token)
+          return
+        end
+        if ctx.navigation_guard and not ctx.navigation_guard() then
+          self:end_operation(op_token)
+          return
+        end
+
         local ok_pop, target_buf, collision_reason = pcall(populate_jdt_buffer, uri, content, client)
         if not ok_pop then
           ui.notify("could not load jdt:// buffer: " .. tostring(target_buf), vim.log.levels.ERROR)

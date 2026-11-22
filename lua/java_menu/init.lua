@@ -26,6 +26,13 @@ M.actions = {
   project = { key = "p", module = "java_menu.project_menu", entry = "project", modes = { "n" }, desc = "Project" },
   calls = { key = "c", module = "java_menu.calls", entry = "calls", modes = { "n" }, desc = "Call Hierarchy" },
   types = { key = "h", module = "java_menu.types", entry = "types", modes = { "n" }, desc = "Type Hierarchy" },
+  stacktrace = {
+    key = "s",
+    module = "java_menu.stacktrace",
+    entry = "stacktrace",
+    modes = { "n" },
+    desc = "Stack Trace",
+  },
 }
 
 M.config = {

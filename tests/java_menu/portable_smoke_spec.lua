@@ -99,6 +99,7 @@ local function run_smoke()
     { "java_menu.hierarchy", "new_controller" },
     { "java_menu.calls", "calls" },
     { "java_menu.types", "types" },
+    { "java_menu.stacktrace", "stacktrace" },
   }
   for _, spec in ipairs(expected_modules) do
     local mod = require(spec[1])

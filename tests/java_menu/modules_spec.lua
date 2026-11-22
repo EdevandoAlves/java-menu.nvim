@@ -38,6 +38,7 @@ expect_fn(imports, "imports", "menu Imports")
 
 local build = require("java_menu.build")
 expect_fn(build, "build", "menu Build")
+expect_fn(build, "output_provenance", "menu Build")
 
 local tests_menu = require("java_menu.tests")
 expect_fn(tests_menu, "tests", "menu Tests")
@@ -56,6 +57,11 @@ end
 local types = require("java_menu.types")
 for _, name in ipairs({ "types", "supertypes", "subtypes", "implementations", "cancel" }) do
   expect_fn(types, name, "menu Type Hierarchy")
+end
+
+local stacktrace = require("java_menu.stacktrace")
+for _, name in ipairs({ "stacktrace", "cancel" }) do
+  expect_fn(stacktrace, name, "menu Stack Trace")
 end
 
 -- ---------- infraestrutura ----------
