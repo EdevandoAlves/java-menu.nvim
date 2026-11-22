@@ -8,6 +8,26 @@
 
 local M = {}
 
+---All active JDTLS clients attached to the buffer.
+---@param bufnr number|nil
+---@return vim.lsp.Client[]
+function M.clients(bufnr)
+  bufnr = bufnr and bufnr > 0 and bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return {}
+  end
+  local out = {}
+  for _, client in ipairs(vim.lsp.get_clients({ name = "jdtls", bufnr = bufnr }) or {}) do
+    if not (type(client.is_stopped) == "function" and client:is_stopped()) then
+      out[#out + 1] = client
+    end
+  end
+  table.sort(out, function(a, b)
+    return (tonumber(a.id) or 0) < (tonumber(b.id) or 0)
+  end)
+  return out
+end
+
 ---JDTLS client attached to the buffer (nil when there is no client).
 ---@param bufnr number|nil
 ---@return vim.lsp.Client|nil

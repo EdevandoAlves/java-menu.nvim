@@ -48,6 +48,11 @@ expect_fn(debug, "debug", "menu Debug")
 local signature = require("java_menu.signature")
 expect_fn(signature, "change_signature", "menu Change Signature")
 
+local calls = require("java_menu.calls")
+for _, name in ipairs({ "calls", "incoming", "outgoing", "cancel" }) do
+  expect_fn(calls, name, "menu Call Hierarchy")
+end
+
 -- ---------- infraestrutura ----------
 
 local ui = require("java_menu.ui")
@@ -56,7 +61,15 @@ for _, name in ipairs({ "notify", "pick_one", "pick_many", "ask", "menu", "jdtls
 end
 
 local lsp = require("java_menu.lsp")
-for _, name in ipairs({ "client", "client_or_reason", "encoding", "capabilities", "jc_global_reason", "global_count" }) do
+for _, name in ipairs({
+  "clients",
+  "client",
+  "client_or_reason",
+  "encoding",
+  "capabilities",
+  "jc_global_reason",
+  "global_count",
+}) do
   expect_fn(lsp, name, "lsp")
 end
 

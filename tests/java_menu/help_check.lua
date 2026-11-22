@@ -42,6 +42,7 @@ local expectations = {
   ["java-menu-troubleshooting"] = "TROUBLESHOOTING",
   ["java-menu-credits"] = "Artur Shaik",
   ["java-menu-project"] = "New Project",
+  ["java-menu-calls"] = "Call Hierarchy",
 }
 
 for tag, needle in pairs(expectations) do

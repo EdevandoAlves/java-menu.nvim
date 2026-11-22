@@ -22,9 +22,10 @@ CONTENTS                                                      *java-menu-content
 1. INTRODUCTION                                                *java-menu-intro*
 
 java-menu.nvim is a contextual menu layer for Java development in Neovim.
-Eight groups — New, Generate, Refactor, Imports, Build/Run, Tests,
-Debug, Project — collect the operations you need for the current situation,
-and every entry says whether it is available and, when it is not, why.
+Nine groups — New, Generate, Refactor, Imports, Build/Run, Tests,
+Debug, Project, Call Hierarchy — collect the operations you need for the
+current situation, and every entry says whether it is available and, when it
+is not, why.
 
 The Java work itself is done by |jc.nvim| and by the jdtls language server
 you already run. java-menu.nvim never starts, installs or manages a language
@@ -128,6 +129,7 @@ dependency instead of half-registering menus.
       tests = true,
       debug = true,
       project = true,
+      calls = true,
     },
     which_key = true,     -- label the group in which-key when installed
   })
@@ -151,8 +153,8 @@ Behavior you get without asking:
                                                             *java-menu-javamenu*
                                                               *java-menu-trigger-cmd*
 `:JavaMenu [group]` ~
-Opens one of the eight menus, with command-line completion for
-`new | generate | refactor | imports | build | tests | debug | project`.
+Opens one of the nine menus, with command-line completion for
+`new | generate | refactor | imports | build | tests | debug | project | calls`.
 Without an argument it lists the accepted groups.
 
 ==============================================================================
@@ -171,6 +173,7 @@ Global keymaps registered by `setup()`; `<prefix>` is the `prefix` option
 |n    | `<prefix>t`      | Tests                     | neotest + jdtls          |
 |n    | `<prefix>d`      | Debug                     | nvim-dap + java-debug    |
 |n    | `<prefix>p`      | Project                   | no jdtls needed          |
+|n    | `<prefix>c`      | Call Hierarchy            | jdtls (callHierarchy)    |
 
 Keymap conflicts with mappings that are not java-menu's are never
 overwritten: yours is kept, ours is skipped, and the conflict is reported.
@@ -338,6 +341,34 @@ jdtls. Four entries:
                     consequences. Strictly informative: installs, fixes and
                     builds nothing.
 
+                                                                  *java-menu-calls*
+Call Hierarchy ~
+Contextual Incoming Calls (callers) and Outgoing Calls (callees) for the Java
+symbol under the cursor, using the attached jdtls client directly:
+- Incoming Calls: expands multiple call sites (`fromRanges`) in each caller
+  and jumps to the exact call site (falling back to `selectionRange` when
+  `fromRanges` is empty), respecting client `offset_encoding`.
+- Outgoing Calls: jumps to the called symbol's declaration (`to.uri` +
+  `to.selectionRange`/`to.range`) while showing caller call-site line numbers
+  as context.
+- Multi-client selection: when more than one jdtls client is attached to the
+  buffer, prompts explicitly to choose which client to query.
+- Cancellation and stale protection: active slow requests can be cancelled
+  from the menu (`Cancel active request`) or `require("java_menu.calls").cancel()`
+  via `$/cancelRequest`; operation tokens protect client, symbol, and result
+  selectors as well as LSP callbacks (`prepareCallHierarchy`, calls, and
+  `java/classFileContents`), so stale callbacks after cancellation,
+  superseding operations, buffer switch, or buffer edits (`changedtick`) are
+  discarded safely without starting requests, cancelling newer flows, or
+  navigating.
+- URI navigation: supports both `file://` files and virtual `jdt://` URIs
+  (loaded via `java/classFileContents` into read-only `nofile` buffers under
+  their canonical `jdt://` URI with explicit ownership tracking so `didOpen`,
+  `hover`, `definition`, and Call Hierarchy preserve the original URI;
+  cross-client or pre-existing `jdt://` buffer collisions are refused with a
+  clear reason instead of reusing foreign contents or synthesizing
+  non-canonical LSP URIs).
+
 ==============================================================================
 8. WORKSPACEEDIT PREVIEW                                     *java-menu-preview*
 
@@ -413,6 +444,13 @@ generate delegate methods.
   concurrent writer in the final instant.
 - Project creation runs no git init and installs/configures no tools.
 - Rename Package / Move Package are disabled (see |java-menu-refactor|).
+- Call Hierarchy requires an attached jdtls client with `callHierarchyProvider`
+  (and `java/classFileContents` for virtual `jdt://` targets, which have no
+  physical file path on disk); results are single-level per menu invocation
+  and depend on JDTLS indexing. Distinct jdtls clients cannot share or isolate
+  the same canonical `jdt://` URI simultaneously in Neovim without altering the
+  LSP URI, so collisions are refused until the existing `jdt://` buffer is
+  closed.
 - Tested on Linux only; no Windows/macOS validation.
 
 ==============================================================================
