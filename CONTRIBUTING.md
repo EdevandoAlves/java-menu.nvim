@@ -4,6 +4,17 @@ Contributions are welcome. Start with an [open issue](https://github.com/Edevand
 
 java-menu.nvim aims for workflows that feel native to Neovim. It integrates with jc.nvim and a user-managed JDTLS rather than replacing them. Keep existing keymaps and user configuration intact, expose unavailable actions with a useful reason, and favor small changes that work with existing tools.
 
+## Evaluating the next phase or feature
+
+Before proposing or starting a new phase or feature, assess and present these four questions:
+
+1. Does it solve a frequent Java development task?
+2. Does it add value beyond what is already easy to do in Neovim?
+3. Can it use existing tools rather than reimplementing their capabilities?
+4. Can we test it and communicate its limitations honestly?
+
+Investigate uncertain answers before treating a proposal as ready. Favor useful, cohesive Java workflows over IntelliJ feature parity, and keep the plugin focused on integrating existing tools.
+
 ## Development prerequisites
 
 The fast suite needs Neovim and jc.nvim. It searches for jc.nvim under `${XDG_DATA_HOME:-$HOME/.local/share}/nvim/lazy/jc.nvim`. The CI workflow pins the versions used for its checks; consult `.github/workflows/ci.yml` if reproducing CI. Optional dependencies and their effects are listed in the README.

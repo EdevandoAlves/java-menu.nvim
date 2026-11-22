@@ -262,9 +262,24 @@ Run nearest/file/suite/pick through neotest with jc.nvim's adapter
 precompile, and navigate in either direction between a class and its test.
 Matches prefer the current module and support *Test, *Tests, *IT and Test*
 names. Ambiguous matches are offered for selection; a missing test can be
-created after confirmation. The test picker prioritizes the current module
-and package. Open a project file before using the menu from an output buffer.
-Without neotest the menu says so instead of breaking.
+created after confirmation.
+Create JUnit 5 Test for Method... lists methods from a `src/main/java`
+source file via JDTLS `textDocument/documentSymbol` (preserving nested type
+hierarchy and overload signatures for explicit selection without guessing),
+checks JUnit 5 on the test classpath via `java.project.getClasspaths`
+(refusing when JUnit 5 is absent and warning honestly when the capability is
+unavailable instead of trusting build-file text alone), confirms a valid
+collision-free test method name and destination, reuses `jc.templates` for
+new test files (created exclusively via `wx` only after final confirmation),
+and inserts an explicitly pending/failing `@Test` skeleton
+(`throw new java.lang.AssertionError("TODO: ...")`) with safe imports and without generating assertions.
+Supports explicit multi-client selection, cancellation (`$/cancelRequest` or
+`require("java_menu.tests").cancel()`), `changedtick`/window/buffer guards,
+and dirty-buffer/symlink/disk-race refusal.
+The test picker prioritizes the current module and package. Open a project
+file before using the menu from an output buffer. Without neotest the menu
+says so instead of breaking (Create JUnit 5 Test for Method... only needs an
+attached jdtls client).
 
                                                                   *java-menu-debug*
 Debug ~
@@ -515,6 +530,16 @@ generate delegate methods.
   selection instead of guessing from `cwd` or the first open project. JDTLS
   may not resolve JDK frames without source attachments; decompiled library
   source may not match the stack trace line number.
+- JUnit 5 method test skeleton: requires an attached jdtls client supporting
+  `textDocument/documentSymbol` on a `src/main/java` file. Build-file text
+  alone is never trusted as classpath proof: `java.project.getClasspaths`
+  (test scope) is queried when advertised and refuses when JUnit 5
+  (`org.junit.jupiter`) is absent; if the client lacks
+  `java.project.getClasspaths`, confirmation shows the classpath as
+  UNVERIFIED. Dirty target buffers, symlinks, and concurrent disk/buffer
+  edits are refused; no dependencies are ever installed, no assertions are
+  guessed, existing buffers are not force-saved, and new files are created
+  exclusively (`wx`) only after final confirmation.
 - The full suite runs on Linux; macOS and Windows have portable smoke checks.
 
 ==============================================================================

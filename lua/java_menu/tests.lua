@@ -8,8 +8,11 @@ local ui = require("java_menu.ui")
 local project = require("java_menu.project")
 local lsp = require("java_menu.lsp")
 local jca = require("java_menu.jc")
+local hierarchy = require("java_menu.hierarchy")
 
 local M = {}
+
+local skeleton_ctrl = hierarchy.new_controller({ feature_label = "test skeleton" })
 
 local function neotest()
   local ok, nt = pcall(require, "neotest")
@@ -711,6 +714,2399 @@ local function goto_entry(is_java, nav)
   }
 end
 
+-- ---------- JUnit 5 test skeleton for selected method (Issue #16) ----------
+
+local TYPE_KINDS = { [5] = true, [10] = true, [11] = true, [23] = true } -- Class, Enum, Interface, Struct
+local METHOD_KIND = 6
+
+local JAVA_KEYWORDS = {}
+for word in
+  ([[
+abstract assert boolean break byte case catch char class const continue default do double else
+enum extends final finally float for goto if implements import instanceof int interface long native new
+package private protected public return short static strictfp super switch synchronized this throw throws
+transient try void volatile while true false null _
+]]):gmatch("%S+")
+do
+  JAVA_KEYWORDS[word] = true
+end
+
+---@param name string|nil
+---@return boolean
+local function is_java_identifier(name)
+  return type(name) == "string" and name:match("^[%a_$][%w_$]*$") ~= nil and not JAVA_KEYWORDS[name]
+end
+
+local function supports_document_symbol(client, bufnr)
+  return hierarchy.supports_method(client, "textDocument/documentSymbol", bufnr, "documentSymbolProvider")
+end
+
+local function supports_command(client, bufnr, cmd_name)
+  if hierarchy.client_stopped(client) then
+    return false
+  end
+  if not hierarchy.supports_method(client, "workspace/executeCommand", bufnr, "executeCommandProvider") then
+    return false
+  end
+  local cap = type(client.server_capabilities) == "table" and client.server_capabilities.executeCommandProvider or nil
+  if type(cap) == "table" and type(cap.commands) == "table" then
+    for _, c in ipairs(cap.commands) do
+      if c == cmd_name then
+        return true
+      end
+    end
+    return false
+  end
+  return true
+end
+
+local function read_u16_le(s, pos)
+  local b1, b2 = s:byte(pos, pos + 1)
+  if not b1 or not b2 then
+    return nil
+  end
+  return b1 + b2 * 256
+end
+
+local function read_u32_le(s, pos)
+  local b1, b2, b3, b4 = s:byte(pos, pos + 3)
+  if not b1 or not b2 or not b3 or not b4 then
+    return nil
+  end
+  return b1 + b2 * 256 + b3 * 65536 + b4 * 16777216
+end
+
+---Check whether a .jar/.zip file on disk actually contains `entry_name`
+---by scanning its ZIP central directory.
+---@param jar_path string
+---@param entry_name string
+---@return boolean
+local function jar_contains_entry(jar_path, entry_name)
+  local fd = vim.uv.fs_open(jar_path, "r", 0)
+  if not fd then
+    return false
+  end
+  local st = vim.uv.fs_fstat(fd)
+  if not st or st.type ~= "file" or (st.size or 0) < 22 then
+    vim.uv.fs_close(fd)
+    return false
+  end
+
+  local tail_len = math.min(st.size, 65557)
+  local tail_off = st.size - tail_len
+  local tail = vim.uv.fs_read(fd, tail_len, tail_off)
+  if type(tail) ~= "string" or #tail < 22 then
+    vim.uv.fs_close(fd)
+    return false
+  end
+
+  local eocd_sig = string.char(0x50, 0x4b, 0x05, 0x06)
+  local eocd_pos = nil
+  for i = #tail - 21, 1, -1 do
+    if tail:sub(i, i + 3) == eocd_sig then
+      local comment_len = read_u16_le(tail, i + 20)
+      if comment_len and i + 21 + comment_len == #tail then
+        eocd_pos = i
+        break
+      end
+    end
+  end
+  if not eocd_pos then
+    vim.uv.fs_close(fd)
+    return false
+  end
+
+  local cd_size = read_u32_le(tail, eocd_pos + 12)
+  local cd_offset = read_u32_le(tail, eocd_pos + 16)
+  if not cd_size or not cd_offset or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF then
+    vim.uv.fs_close(fd)
+    return false
+  end
+  if cd_offset + cd_size > st.size then
+    vim.uv.fs_close(fd)
+    return false
+  end
+
+  local cd = vim.uv.fs_read(fd, cd_size, cd_offset)
+  vim.uv.fs_close(fd)
+  if type(cd) ~= "string" or #cd < cd_size then
+    return false
+  end
+
+  local cd_sig = string.char(0x50, 0x4b, 0x01, 0x02)
+  local pos = 1
+  local target_len = #entry_name
+  while pos + 45 <= #cd do
+    if cd:sub(pos, pos + 3) ~= cd_sig then
+      break
+    end
+    local name_len = read_u16_le(cd, pos + 28)
+    local extra_len = read_u16_le(cd, pos + 30)
+    local comment_len = read_u16_le(cd, pos + 32)
+    if not name_len or not extra_len or not comment_len then
+      break
+    end
+    local next_pos = pos + 46 + name_len + extra_len + comment_len
+    if next_pos - 1 > #cd then
+      break
+    end
+    if name_len == target_len and cd:sub(pos + 46, pos + 45 + name_len) == entry_name then
+      return true
+    end
+    pos = next_pos
+  end
+  return false
+end
+
+local function is_jupiter_api_artifact_name(lower_path)
+  local base = vim.fs.basename(lower_path)
+  if base:match("^junit%-jupiter%-api%-%d") or base == "junit-jupiter-api.jar" then
+    return true
+  end
+  if base:match("^junit%-jupiter%-%d") then
+    return true
+  end
+  return false
+end
+
+local function is_jupiter_engine_name(lower_path)
+  local base = vim.fs.basename(lower_path)
+  return base:find("junit-jupiter-engine", 1, true) ~= nil
+end
+
+---Verify whether JUnit 5 API (`org.junit.jupiter.api.Test`) is present on the
+---resolved test classpath with real class evidence where entries exist on disk.
+---@param result table|nil
+---@param mod_label string|nil
+---@return table
+local function inspect_junit5_classpath(result, mod_label)
+  if type(result) ~= "table" or type(result.classpaths) ~= "table" then
+    return { status = "invalid" }
+  end
+  local entries = {}
+  for _, p in ipairs(result.classpaths) do
+    if type(p) == "string" then
+      entries[#entries + 1] = p
+    end
+  end
+  if type(result.modulepaths) == "table" then
+    for _, p in ipairs(result.modulepaths) do
+      if type(p) == "string" then
+        entries[#entries + 1] = p
+      end
+    end
+  end
+
+  local mod_desc = (mod_label and mod_label ~= "") and (mod_label .. " ") or ""
+  local saw_junit4 = false
+  local saw_engine = false
+  local saw_unverified_api_entry = false
+  local api_rel = "org/junit/jupiter/api/Test.class"
+
+  for _, raw in ipairs(entries) do
+    local lower = raw:lower():gsub("\\", "/")
+    local st = vim.uv.fs_stat(raw)
+    if st then
+      if st.type == "directory" then
+        local cls_st = vim.uv.fs_stat(raw:gsub("[/\\]+$", "") .. "/" .. api_rel)
+        if cls_st and cls_st.type == "file" then
+          return {
+            status = "verified",
+            summary = "verified (org.junit.jupiter.api.Test on " .. mod_desc .. "test classpath)",
+          }
+        end
+      elseif st.type == "file" and (lower:match("%.jar$") or lower:match("%.zip$")) then
+        if jar_contains_entry(raw, api_rel) then
+          return {
+            status = "verified",
+            summary = "verified (org.junit.jupiter.api.Test on " .. mod_desc .. "test classpath)",
+          }
+        end
+      end
+      if is_jupiter_engine_name(lower) then
+        saw_engine = true
+      end
+    else
+      if is_jupiter_api_artifact_name(lower) then
+        saw_unverified_api_entry = true
+      elseif is_jupiter_engine_name(lower) then
+        saw_engine = true
+      end
+    end
+
+    if lower:find("junit-4.", 1, true) or lower:find("junit-3.", 1, true) or lower:find("/junit/junit/", 1, true) then
+      saw_junit4 = true
+    end
+  end
+
+  if saw_unverified_api_entry then
+    return {
+      status = "unverified",
+      summary = "UNVERIFIED (JUnit 5 API jar listed on "
+        .. mod_desc
+        .. "classpath, but org.junit.jupiter.api.Test could not be verified on disk)",
+    }
+  end
+
+  return {
+    status = "missing",
+    saw_engine_only = saw_engine,
+    saw_junit4 = saw_junit4,
+  }
+end
+
+local function split_param_types(params_inner)
+  local inner = vim.trim(params_inner or "")
+  if inner == "" then
+    return {}
+  end
+  local out = {}
+  local depth_angle, depth_paren, depth_bracket = 0, 0, 0
+  local start = 1
+  for i = 1, #inner do
+    local c = inner:sub(i, i)
+    if c == "<" then
+      depth_angle = depth_angle + 1
+    elseif c == ">" and depth_angle > 0 then
+      depth_angle = depth_angle - 1
+    elseif c == "(" then
+      depth_paren = depth_paren + 1
+    elseif c == ")" and depth_paren > 0 then
+      depth_paren = depth_paren - 1
+    elseif c == "[" then
+      depth_bracket = depth_bracket + 1
+    elseif c == "]" and depth_bracket > 0 then
+      depth_bracket = depth_bracket - 1
+    elseif c == "," and depth_angle == 0 and depth_paren == 0 and depth_bracket == 0 then
+      local part = vim.trim(inner:sub(start, i - 1))
+      if part ~= "" then
+        out[#out + 1] = part
+      end
+      start = i + 1
+    end
+  end
+  local tail = vim.trim(inner:sub(start))
+  if tail ~= "" then
+    out[#out + 1] = tail
+  end
+  return out
+end
+
+local function clean_type_name(raw)
+  local s = vim.trim(raw or "")
+  local no_generics = s:gsub("%b<>", "")
+  return vim.trim(no_generics)
+end
+
+local function parse_method_symbol(node)
+  local raw_name = vim.trim(type(node.name) == "string" and node.name or "")
+  local raw_detail = vim.trim(type(node.detail) == "string" and node.detail or "")
+
+  local base_name = raw_name
+  local params_paren = nil
+  local ret_part = ""
+
+  local open_idx = raw_name:find("(", 1, true)
+  if open_idx then
+    base_name = vim.trim(raw_name:sub(1, open_idx - 1))
+    local rest = raw_name:sub(open_idx)
+    local parens, after = rest:match("^(%b())(.*)$")
+    if parens then
+      params_paren = parens
+      ret_part = vim.trim(after or "")
+    else
+      params_paren = rest
+    end
+  elseif raw_detail:sub(1, 1) == "(" then
+    local parens, after = raw_detail:match("^(%b())(.*)$")
+    if parens then
+      params_paren = parens
+      ret_part = vim.trim(after or "")
+    end
+  end
+
+  if ret_part == "" and raw_detail ~= "" and raw_detail:sub(1, 1) ~= "(" then
+    ret_part = raw_detail
+  end
+  if ret_part:sub(1, 1) == ":" then
+    ret_part = vim.trim(ret_part:sub(2))
+  end
+
+  base_name = base_name:gsub("%b<>", "")
+  base_name = vim.trim(base_name)
+  local params = params_paren and split_param_types(params_paren:sub(2, -2)) or {}
+  local signature = base_name .. (params_paren or "()")
+  local display_sig = ret_part ~= "" and (signature .. " : " .. ret_part) or signature
+
+  return {
+    name = base_name,
+    params = params,
+    params_text = params_paren or "()",
+    return_type = ret_part,
+    signature = signature,
+    display_signature = display_sig,
+  }
+end
+
+local function pos_in_range(pos, range)
+  if not (pos and hierarchy.is_valid_range(range) and type(range["end"]) == "table") then
+    return false
+  end
+  local s, e = range.start, range["end"]
+  if pos.line < s.line or (pos.line == s.line and pos.character < s.character) then
+    return false
+  end
+  if pos.line > e.line or (pos.line == e.line and pos.character > e.character) then
+    return false
+  end
+  return true
+end
+
+local function range_contains(outer, inner)
+  if not (hierarchy.is_valid_range(outer) and hierarchy.is_valid_range(inner)) then
+    return false
+  end
+  return pos_in_range(inner.start, outer) and pos_in_range(inner["end"], outer)
+end
+
+local function range_span_score(range)
+  if not (hierarchy.is_valid_range(range) and type(range["end"]) == "table") then
+    return math.huge
+  end
+  local dl = math.max(0, (range["end"].line or 0) - (range.start.line or 0))
+  local dc = math.max(0, (range["end"].character or 0) - (range.start.character or 0))
+  return dl * 100000 + dc
+end
+
+---Extract methods from JDTLS `textDocument/documentSymbol` response, preserving
+---enclosing type hierarchy, overload signatures, and cursor containment.
+---@param resp table[]|nil
+---@param cursor_pos table|nil
+---@return table[]
+local function extract_methods_from_symbols(resp, cursor_pos)
+  if type(resp) ~= "table" or #resp == 0 then
+    return {}
+  end
+
+  local methods = {}
+  local is_symbol_info = false
+  for _, item in ipairs(resp) do
+    if type(item) == "table" and type(item.location) == "table" and item.range == nil then
+      is_symbol_info = true
+      break
+    end
+  end
+
+  if is_symbol_info then
+    local types = {}
+    local raw_methods = {}
+    for _, item in ipairs(resp) do
+      if type(item) == "table" then
+        if TYPE_KINDS[item.kind] then
+          types[#types + 1] = item
+        elseif item.kind == METHOD_KIND then
+          raw_methods[#raw_methods + 1] = item
+        end
+      end
+    end
+    for _, m in ipairs(raw_methods) do
+      local m_range = m.location and m.location.range or nil
+      local enclosing = {}
+      if hierarchy.is_valid_range(m_range) then
+        for _, t in ipairs(types) do
+          local t_range = t.location and t.location.range or nil
+          if hierarchy.is_valid_range(t_range) and range_contains(t_range, m_range) then
+            enclosing[#enclosing + 1] = t
+          end
+        end
+        table.sort(enclosing, function(a, b)
+          return range_span_score(a.location.range) > range_span_score(b.location.range)
+        end)
+      end
+      local type_path = {}
+      for _, t in ipairs(enclosing) do
+        local tn = clean_type_name(t.name)
+        if tn ~= "" then
+          type_path[#type_path + 1] = tn
+        end
+      end
+      if #type_path == 0 and type(m.containerName) == "string" and m.containerName ~= "" then
+        type_path[1] = clean_type_name(m.containerName)
+      end
+      local parsed = parse_method_symbol(m)
+      if parsed.name ~= "" then
+        methods[#methods + 1] = {
+          name = parsed.name,
+          params = parsed.params,
+          params_text = parsed.params_text,
+          return_type = parsed.return_type,
+          signature = parsed.signature,
+          display_signature = parsed.display_signature,
+          type_path = type_path,
+          qualified_type = table.concat(type_path, "."),
+          range = m_range,
+          selection_range = m_range,
+        }
+      end
+    end
+  else
+    local function walk(nodes, type_stack, inside_method)
+      for _, node in ipairs(nodes or {}) do
+        if type(node) == "table" then
+          if TYPE_KINDS[node.kind] then
+            if not inside_method then
+              local next_stack = vim.list_extend({}, type_stack)
+              local tn = clean_type_name(node.name)
+              if tn ~= "" then
+                next_stack[#next_stack + 1] = tn
+              end
+              walk(node.children, next_stack, false)
+            end
+          elseif node.kind == METHOD_KIND then
+            local parsed = parse_method_symbol(node)
+            if parsed.name ~= "" then
+              local type_path = vim.list_extend({}, type_stack)
+              methods[#methods + 1] = {
+                name = parsed.name,
+                params = parsed.params,
+                params_text = parsed.params_text,
+                return_type = parsed.return_type,
+                signature = parsed.signature,
+                display_signature = parsed.display_signature,
+                type_path = type_path,
+                qualified_type = table.concat(type_path, "."),
+                range = hierarchy.pick_range(node.range, node.selectionRange),
+                selection_range = hierarchy.pick_range(node.selectionRange, node.range),
+              }
+            end
+            walk(node.children, type_stack, true)
+          else
+            walk(node.children, type_stack, inside_method)
+          end
+        end
+      end
+    end
+    walk(resp, {}, false)
+  end
+
+  local by_type_name = {}
+  local by_global_name = {}
+  for _, m in ipairs(methods) do
+    local key = m.qualified_type .. "\0" .. m.name
+    by_type_name[key] = (by_type_name[key] or 0) + 1
+    by_global_name[m.name] = (by_global_name[m.name] or 0) + 1
+  end
+
+  local best_cursor_idx = nil
+  local best_cursor_span = math.huge
+  for idx, m in ipairs(methods) do
+    local key = m.qualified_type .. "\0" .. m.name
+    m.is_overloaded = (by_type_name[key] or 0) > 1
+    m.has_name_collision = (by_global_name[m.name] or 0) > 1
+    m.at_cursor = false
+    local check_range = hierarchy.is_valid_range(m.range) and m.range or m.selection_range
+    if cursor_pos and pos_in_range(cursor_pos, check_range) then
+      local span = range_span_score(check_range)
+      if span < best_cursor_span then
+        best_cursor_span = span
+        best_cursor_idx = idx
+      end
+    end
+  end
+  if best_cursor_idx then
+    methods[best_cursor_idx].at_cursor = true
+  end
+
+  return methods
+end
+
+local function capitalize_ident(s)
+  if s == "" then
+    return ""
+  end
+  return s:sub(1, 1):upper() .. s:sub(2)
+end
+
+local function sanitize_param_token(param_type)
+  local t = vim.trim(param_type or "")
+  if t == "" then
+    return "Arg"
+  end
+  local is_varargs = t:sub(-3) == "..."
+  if is_varargs then
+    t = vim.trim(t:sub(1, -4))
+  end
+  local array_dims = 0
+  while t:sub(-2) == "[]" do
+    array_dims = array_dims + 1
+    t = vim.trim(t:sub(1, -3))
+  end
+  -- Drop parameter names if present (e.g. "String name" -> "String")
+  local no_generics = t:gsub("%b<>", "")
+  no_generics = vim.trim(no_generics)
+  local first_token = no_generics:match("^([%w_.$]+)") or no_generics
+  local simple = first_token:match("([^.]+)$") or first_token
+  simple = simple:gsub("[^%w_$]", "")
+  if simple == "" then
+    simple = "Arg"
+  end
+  if array_dims > 0 then
+    simple = simple .. (array_dims == 1 and "Array" or ("Array" .. tostring(array_dims)))
+  end
+  if is_varargs then
+    simple = simple .. "Varargs"
+  end
+  return simple
+end
+
+---Build a valid, collision-free JUnit 5 test method name for `method`.
+---@param method table
+---@param existing_methods table<string, boolean>|nil
+---@return string
+local function default_test_method_name(method, existing_methods)
+  local parts = { "test" }
+  if type(method.type_path) == "table" and #method.type_path > 1 then
+    local inner = {}
+    for i = 2, #method.type_path do
+      local seg = method.type_path[i]:gsub("[^%w_$]", "")
+      if seg ~= "" then
+        inner[#inner + 1] = capitalize_ident(seg)
+      end
+    end
+    if #inner > 0 then
+      parts[#parts + 1] = table.concat(inner, "_") .. "_"
+    end
+  end
+
+  local raw_method = (method.name or "method"):gsub("[^%w_$]", "")
+  if raw_method == "" then
+    raw_method = "method"
+  end
+  if #parts == 1 then
+    parts[#parts + 1] = capitalize_ident(raw_method)
+  else
+    parts[#parts + 1] = raw_method
+  end
+
+  local base = table.concat(parts)
+  if method.is_overloaded then
+    if type(method.params) == "table" and #method.params > 0 then
+      local p_tokens = {}
+      for _, p in ipairs(method.params) do
+        p_tokens[#p_tokens + 1] = sanitize_param_token(p)
+      end
+      base = base .. "_" .. table.concat(p_tokens, "_")
+    else
+      base = base .. "_noArgs"
+    end
+  end
+
+  base = base:gsub("[^%w_$]", "_")
+  if not is_java_identifier(base) then
+    base = "test_" .. base
+  end
+  if not is_java_identifier(base) then
+    base = "testMethod"
+  end
+
+  local taken = existing_methods or {}
+  if not taken[base] then
+    return base
+  end
+  local n = 2
+  while taken[base .. "_" .. n] do
+    n = n + 1
+  end
+  return base .. "_" .. n
+end
+
+---Locate all valid buffers pointing to `path` (via canonical comparison).
+---@param path string
+---@return integer[]
+local function find_buffers_for_path(path)
+  local target = canonical(path)
+  local seen = {}
+  local out = {}
+  local direct = vim.fn.bufnr(path)
+  if direct ~= -1 and vim.api.nvim_buf_is_valid(direct) then
+    local name = vim.api.nvim_buf_get_name(direct)
+    if (target and canonical(name) == target) or name == path then
+      seen[direct] = true
+      out[#out + 1] = direct
+    end
+  end
+  if target then
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      if not seen[buf] and vim.api.nvim_buf_is_valid(buf) then
+        local name = vim.api.nvim_buf_get_name(buf)
+        if name ~= "" and canonical(name) == target then
+          seen[buf] = true
+          out[#out + 1] = buf
+        end
+      end
+    end
+  end
+  return out
+end
+
+---Refuse modifying or overwriting a dirty or non-modifiable target buffer.
+---@param path string
+---@return integer|nil clean_loaded_buf, string|nil err, integer[]|nil all_loaded_bufs
+local function inspect_target_buffer(path)
+  local bufs = find_buffers_for_path(path)
+  local loaded_bufs = {}
+  for _, buf in ipairs(bufs) do
+    if vim.bo[buf].modified then
+      return nil, "target test buffer (" .. vim.fs.basename(path) .. ") has unsaved changes — save or discard first"
+    end
+    if vim.api.nvim_buf_is_loaded(buf) then
+      if not vim.bo[buf].modifiable or vim.bo[buf].readonly then
+        return nil, "target test buffer (" .. vim.fs.basename(path) .. ") is read-only or not modifiable"
+      end
+      loaded_bufs[#loaded_bufs + 1] = buf
+    end
+  end
+  return loaded_bufs[1], nil, loaded_bufs
+end
+
+local function utf8_next_cp(s, idx)
+  local b1 = s:byte(idx)
+  if not b1 then
+    return nil, idx
+  end
+  if b1 < 0x80 then
+    return b1, idx + 1
+  elseif b1 >= 0xC2 and b1 <= 0xDF then
+    local b2 = s:byte(idx + 1)
+    if b2 and b2 >= 0x80 and b2 <= 0xBF then
+      return (b1 - 0xC0) * 64 + (b2 - 0x80), idx + 2
+    end
+  elseif b1 >= 0xE0 and b1 <= 0xEF then
+    local b2, b3 = s:byte(idx + 1, idx + 2)
+    if b2 and b3 and b2 >= 0x80 and b2 <= 0xBF and b3 >= 0x80 and b3 <= 0xBF then
+      return (b1 - 0xE0) * 4096 + (b2 - 0x80) * 64 + (b3 - 0x80), idx + 3
+    end
+  elseif b1 >= 0xF0 and b1 <= 0xF4 then
+    local b2, b3, b4 = s:byte(idx + 1, idx + 3)
+    if b2 and b3 and b4 and b2 >= 0x80 and b2 <= 0xBF and b3 >= 0x80 and b3 <= 0xBF and b4 >= 0x80 and b4 <= 0xBF then
+      return (b1 - 0xF0) * 262144 + (b2 - 0x80) * 4096 + (b3 - 0x80) * 64 + (b4 - 0x80), idx + 4
+    end
+  end
+  return nil, idx + 1
+end
+
+local function encode_utf16(text, le)
+  local out = {}
+  local i, n = 1, #text
+  while i <= n do
+    local cp, nxt = utf8_next_cp(text, i)
+    if not cp then
+      return nil, "invalid UTF-8 in buffer"
+    end
+    i = nxt
+    if cp <= 0xFFFF then
+      local hi, lo = math.floor(cp / 256), cp % 256
+      out[#out + 1] = le and string.char(lo, hi) or string.char(hi, lo)
+    else
+      local v = cp - 0x10000
+      local w1 = 0xD800 + math.floor(v / 1024)
+      local w2 = 0xDC00 + (v % 1024)
+      for _, w in ipairs({ w1, w2 }) do
+        local hi, lo = math.floor(w / 256), w % 256
+        out[#out + 1] = le and string.char(lo, hi) or string.char(hi, lo)
+      end
+    end
+  end
+  return table.concat(out), nil
+end
+
+local function encode_utf32(text, le)
+  local out = {}
+  local i, n = 1, #text
+  while i <= n do
+    local cp, nxt = utf8_next_cp(text, i)
+    if not cp then
+      return nil, "invalid UTF-8 in buffer"
+    end
+    i = nxt
+    local b1 = cp % 256
+    local b2 = math.floor(cp / 256) % 256
+    local b3 = math.floor(cp / 65536) % 256
+    local b4 = math.floor(cp / 16777216) % 256
+    out[#out + 1] = le and string.char(b1, b2, b3, b4) or string.char(b4, b3, b2, b1)
+  end
+  return table.concat(out), nil
+end
+
+---Reconstruct exact disk bytes for a clean loaded buffer, honoring
+---`fileformat`, `eol`, `bomb`, and `fileencoding`.
+---@param buf integer
+---@return string|nil bytes, string|nil err
+local function buffer_to_disk_bytes(buf)
+  local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  local ff = vim.bo[buf].fileformat
+  local eol = vim.bo[buf].eol
+  local bomb = vim.bo[buf].bomb
+  local fenc = vim.bo[buf].fileencoding
+  if not fenc or fenc == "" then
+    fenc = vim.o.encoding
+  end
+  if not fenc or fenc == "" then
+    fenc = "utf-8"
+  end
+  fenc = fenc:lower()
+
+  local eol_str = (ff == "dos" and "\r\n") or (ff == "mac" and "\r") or "\n"
+  local text
+  if #lines == 1 and lines[1] == "" then
+    text = ""
+  else
+    local parts = {}
+    for idx, l in ipairs(lines) do
+      parts[idx] = l:gsub("\n", "\0")
+    end
+    text = table.concat(parts, eol_str)
+    if eol then
+      text = text .. eol_str
+    end
+  end
+
+  if fenc == "utf-8" or fenc == "utf8" then
+    return (bomb and "\xef\xbb\xbf" or "") .. text, nil
+  elseif fenc == "utf-16le" or fenc == "ucs-2le" then
+    local encoded, err = encode_utf16(text, true)
+    if not encoded then
+      return nil, err
+    end
+    return (bomb and "\xff\xfe" or "") .. encoded, nil
+  elseif fenc == "utf-16" or fenc == "utf-16be" or fenc == "ucs-2" or fenc == "ucs-2be" then
+    local encoded, err = encode_utf16(text, false)
+    if not encoded then
+      return nil, err
+    end
+    return (bomb and "\xfe\xff" or "") .. encoded, nil
+  elseif fenc == "utf-32le" or fenc == "ucs-4le" then
+    local encoded, err = encode_utf32(text, true)
+    if not encoded then
+      return nil, err
+    end
+    return (bomb and "\xff\xfe\x00\x00" or "") .. encoded, nil
+  elseif fenc == "utf-32" or fenc == "utf-32be" or fenc == "ucs-4" or fenc == "ucs-4be" then
+    local encoded, err = encode_utf32(text, false)
+    if not encoded then
+      return nil, err
+    end
+    return (bomb and "\x00\x00\xfe\xff" or "") .. encoded, nil
+  end
+
+  local ok, conv = pcall(vim.iconv, text, "utf-8", fenc)
+  if not ok or type(conv) ~= "string" then
+    return nil, "unsupported fileencoding: " .. fenc
+  end
+  local ok_back, roundtrip = pcall(vim.iconv, conv, fenc, "utf-8")
+  if not ok_back or roundtrip ~= text then
+    return nil, "buffer text does not round-trip in fileencoding: " .. fenc
+  end
+  return conv, nil
+end
+
+local function verify_loaded_buffers_match_disk(loaded_bufs, disk_data, path)
+  local name = vim.fs.basename(path)
+  for _, buf in ipairs(loaded_bufs or {}) do
+    local buf_bytes, conv_err = buffer_to_disk_bytes(buf)
+    if not buf_bytes then
+      return false, "could not verify buffer bytes for " .. name .. ": " .. tostring(conv_err)
+    end
+    if buf_bytes ~= disk_data then
+      return false,
+        "target test buffer (" .. name .. ") differs from file on disk — reload or reconcile before inserting test"
+    end
+  end
+  return true, nil
+end
+
+local function stat_matches(a, b)
+  if not a or not b then
+    return false
+  end
+  if a.type ~= "file" or b.type ~= "file" or a.dev == nil or a.ino == nil then
+    return false
+  end
+  if a.dev ~= b.dev or a.ino ~= b.ino or a.size ~= b.size or a.mode ~= b.mode then
+    return false
+  end
+  local am, bm = a.mtime, b.mtime
+  if (am == nil) ~= (bm == nil) then
+    return false
+  end
+  if am and bm and (am.sec ~= bm.sec or am.nsec ~= bm.nsec) then
+    return false
+  end
+  local ac, bc = a.ctime, b.ctime
+  if (ac == nil) ~= (bc == nil) then
+    return false
+  end
+  if ac and bc and (ac.sec ~= bc.sec or ac.nsec ~= bc.nsec) then
+    return false
+  end
+  return true
+end
+
+local function read_regular_file(path)
+  local name = vim.fs.basename(path)
+  local lstat = vim.uv.fs_lstat(path)
+  if not lstat then
+    return nil, name .. " does not exist", nil
+  end
+  if lstat.type == "link" then
+    return nil, name .. " is a symlink — refusing to modify", nil
+  end
+  if lstat.type ~= "file" then
+    return nil, name .. " is not a regular file", nil
+  end
+  local fd, open_err = vim.uv.fs_open(path, "r", 0)
+  if not fd then
+    return nil, "could not open " .. name .. (open_err and (": " .. open_err) or ""), nil
+  end
+  local fstat = vim.uv.fs_fstat(fd)
+  if not stat_matches(fstat, lstat) then
+    vim.uv.fs_close(fd)
+    return nil, name .. " changed or became a symlink while reading", nil
+  end
+  local chunks, offset = {}, 0
+  while true do
+    local chunk, read_err = vim.uv.fs_read(fd, 65536, offset)
+    if not chunk then
+      vim.uv.fs_close(fd)
+      return nil, "could not read " .. name .. (read_err and (": " .. read_err) or ""), nil
+    end
+    if chunk == "" then
+      break
+    end
+    chunks[#chunks + 1] = chunk
+    offset = offset + #chunk
+  end
+  vim.uv.fs_close(fd)
+  return table.concat(chunks), nil, fstat
+end
+
+---Mask Java comments (`//`, `/* */`) and string/char/text-block literals with
+---spaces while preserving `\n`, so line numbers remain exact.
+---@param text string
+---@return string masked, string|nil unclosed_err
+local function mask_java_comments_and_strings(text)
+  local out = {}
+  local unclosed_err = nil
+  local i, n = 1, #text
+  while i <= n do
+    local c = text:sub(i, i)
+    local two = text:sub(i, i + 1)
+    if two == "//" then
+      while i <= n do
+        local ch = text:sub(i, i)
+        if ch == "\n" or ch == "\r" then
+          out[#out + 1] = ch
+          i = i + 1
+          break
+        end
+        out[#out + 1] = " "
+        i = i + 1
+      end
+    elseif two == "/*" then
+      out[#out + 1] = "  "
+      i = i + 2
+      local closed = false
+      while i <= n do
+        if text:sub(i, i + 1) == "*/" then
+          out[#out + 1] = "  "
+          i = i + 2
+          closed = true
+          break
+        end
+        local ch = text:sub(i, i)
+        out[#out + 1] = (ch == "\n" or ch == "\r") and ch or " "
+        i = i + 1
+      end
+      if not closed and not unclosed_err then
+        unclosed_err = "unclosed block comment"
+      end
+    elseif text:sub(i, i + 2) == '"""' then
+      out[#out + 1] = "   "
+      i = i + 3
+      local closed = false
+      while i <= n do
+        local ch = text:sub(i, i)
+        if ch == "\\" then
+          out[#out + 1] = " "
+          if i + 1 <= n then
+            local nxt = text:sub(i + 1, i + 1)
+            out[#out + 1] = (nxt == "\n" or nxt == "\r") and nxt or " "
+          end
+          i = i + 2
+        elseif text:sub(i, i + 2) == '"""' then
+          out[#out + 1] = "   "
+          i = i + 3
+          closed = true
+          break
+        else
+          out[#out + 1] = (ch == "\n" or ch == "\r") and ch or " "
+          i = i + 1
+        end
+      end
+      if not closed and not unclosed_err then
+        unclosed_err = "unclosed text block literal"
+      end
+    elseif c == '"' or c == "'" then
+      local q = c
+      out[#out + 1] = " "
+      i = i + 1
+      local closed = false
+      while i <= n do
+        local ch = text:sub(i, i)
+        if ch == "\\" then
+          out[#out + 1] = " "
+          if i + 1 <= n then
+            local nxt = text:sub(i + 1, i + 1)
+            out[#out + 1] = (nxt == "\n" or nxt == "\r") and nxt or " "
+          end
+          i = i + 2
+        elseif ch == q then
+          out[#out + 1] = " "
+          i = i + 1
+          closed = true
+          break
+        elseif ch == "\n" or ch == "\r" then
+          out[#out + 1] = ch
+          i = i + 1
+          break
+        else
+          out[#out + 1] = " "
+          i = i + 1
+        end
+      end
+      if not closed and not unclosed_err then
+        unclosed_err = "unclosed string or character literal"
+      end
+    else
+      out[#out + 1] = c
+      i = i + 1
+    end
+  end
+  return table.concat(out), unclosed_err
+end
+
+local function detect_indent_unit(lines)
+  for i = 1, math.min(#lines, 200) do
+    local line = lines[i]
+    local tab = line:match("^(\t+)%S")
+    if tab then
+      return "\t"
+    end
+    local spaces = line:match("^( +)%S")
+    if spaces then
+      return string.rep(" ", #spaces)
+    end
+  end
+  return "  "
+end
+
+local function line_tail_needs_split(raw_tail, masked_tail)
+  if masked_tail:match("%S") ~= nil then
+    return true
+  end
+  local i, n = 1, #raw_tail
+  while i <= n do
+    local two = raw_tail:sub(i, i + 1)
+    if two == "//" then
+      return false
+    elseif two == "/*" then
+      local close = raw_tail:find("*/", i + 2, true)
+      if not close then
+        return true
+      end
+      i = close + 2
+    else
+      i = i + 1
+    end
+  end
+  return false
+end
+
+---Analyze an existing Java test file for package, imports, import conflicts,
+---existing method names, and exact closing brace of the target test class.
+---@param lines string[]
+---@param target_class_name string|nil
+---@return table
+local function analyze_test_file(lines, target_class_name)
+  local raw = table.concat(lines, "\n")
+  local masked, unclosed_err = mask_java_comments_and_strings(raw)
+  local masked_lines = vim.split(masked, "\n", { plain = true })
+
+  local pkg_stmt = nil
+  local last_import_stmt = nil
+  local last_static_import_line = nil
+  local has_exact_junit5_test = false
+  local has_wildcard_junit5_test = false
+  local conflicting_test_import = false
+  local conflicting_wildcard_test = false
+  local has_static_fail = false
+  local conflicting_fail_import = false
+  local has_assertions_class = false
+  local conflicting_assertions_import = false
+  local local_test_type = false
+  local malformed_reason = unclosed_err
+
+  local existing_methods = {}
+  local scope_stack = {}
+  local target_found = false
+  local target_open_line, target_close_line, target_close_col = nil, nil, nil
+  local first_type_decl_line = nil
+  local seen_first_type = false
+
+  -- Tokenize braces, punctuation, and identifiers on masked text while tracking line/col.
+  local line_no = 1
+  local col_no = 0
+  local tokens = {}
+  local i, n = 1, #masked
+  while i <= n do
+    local ch = masked:sub(i, i)
+    if ch == "\n" then
+      line_no = line_no + 1
+      col_no = 0
+      i = i + 1
+    elseif ch:match("[%a_$]") then
+      local start_col = col_no + 1
+      local j = i + 1
+      while j <= n and masked:sub(j, j):match("[%w_$]") do
+        j = j + 1
+      end
+      local word = masked:sub(i, j - 1)
+      tokens[#tokens + 1] = { kind = "id", val = word, line = line_no, col = start_col }
+      col_no = col_no + (j - i)
+      i = j
+    elseif
+      ch == "{"
+      or ch == "}"
+      or ch == "("
+      or ch == ")"
+      or ch == ";"
+      or ch == "="
+      or ch == "."
+      or ch == ":"
+      or ch == "*"
+      or ch == "@"
+    then
+      col_no = col_no + 1
+      tokens[#tokens + 1] = { kind = ch, val = ch, line = line_no, col = col_no }
+      i = i + 1
+    elseif masked:sub(i, i + 1) == "->" then
+      tokens[#tokens + 1] = { kind = "->", val = "->", line = line_no, col = col_no + 1 }
+      col_no = col_no + 2
+      i = i + 2
+    else
+      col_no = col_no + 1
+      i = i + 1
+    end
+  end
+
+  local ti = 1
+  local tn = #tokens
+  local paren_depth = 0
+
+  while ti <= tn do
+    local tok = tokens[ti]
+    local prev = tokens[ti - 1]
+    if
+      #scope_stack == 0
+      and not seen_first_type
+      and tok.kind == "id"
+      and (tok.val == "package" or tok.val == "import")
+      and not (prev and (prev.kind == "." or prev.kind == "@"))
+    then
+      local is_pkg = tok.val == "package"
+      local j = ti + 1
+      local is_static = false
+      if not is_pkg and tokens[j] and tokens[j].kind == "id" and tokens[j].val == "static" then
+        is_static = true
+        j = j + 1
+      end
+      local parts = {}
+      local semi_tok = nil
+      while j <= tn do
+        local nt = tokens[j]
+        if nt.kind == ";" then
+          semi_tok = nt
+          break
+        elseif nt.kind == "{" or nt.kind == "}" then
+          break
+        elseif nt.kind == "id" or nt.kind == "." or (not is_pkg and nt.kind == "*") then
+          parts[#parts + 1] = nt.val
+        else
+          parts = {}
+          break
+        end
+        j = j + 1
+      end
+      if semi_tok and #parts > 0 then
+        local stmt = {
+          start_line = tok.line,
+          start_col = tok.col,
+          end_line = semi_tok.line,
+          end_col = semi_tok.col,
+          name = table.concat(parts),
+        }
+        if is_pkg then
+          pkg_stmt = pkg_stmt or stmt
+        else
+          local imp_target = table.concat(parts)
+          last_import_stmt = stmt
+          if is_static then
+            last_static_import_line = semi_tok.line
+            if
+              imp_target == "org.junit.jupiter.api.Assertions.fail"
+              or imp_target == "org.junit.jupiter.api.Assertions.*"
+            then
+              has_static_fail = true
+            elseif imp_target:match("%.fail$") or imp_target == "org.junit.Assert.*" then
+              conflicting_fail_import = true
+            end
+          else
+            if imp_target == "org.junit.jupiter.api.Test" then
+              has_exact_junit5_test = true
+            elseif imp_target == "org.junit.jupiter.api.*" then
+              has_wildcard_junit5_test = true
+            elseif imp_target:match("%.Test$") then
+              conflicting_test_import = true
+            elseif imp_target == "org.junit.*" or imp_target == "org.testng.annotations.*" then
+              conflicting_wildcard_test = true
+            end
+            if imp_target == "org.junit.jupiter.api.Assertions" or imp_target == "org.junit.jupiter.api.*" then
+              has_assertions_class = true
+            elseif imp_target:match("%.Assertions$") then
+              conflicting_assertions_import = true
+            end
+          end
+        end
+        ti = j + 1
+      else
+        malformed_reason = malformed_reason or ("malformed " .. tok.val .. " declaration")
+        ti = ti + 1
+      end
+    elseif tok.kind == "(" then
+      paren_depth = paren_depth + 1
+      ti = ti + 1
+    elseif tok.kind == ")" and paren_depth > 0 then
+      paren_depth = paren_depth - 1
+      ti = ti + 1
+    elseif tok.kind == "{" then
+      local top = scope_stack[#scope_stack]
+      local is_class_open = false
+      local type_kw = nil
+      local class_name = nil
+      local is_annotation_type = false
+
+      local back = ti - 1
+      local bp = 0
+      local saw_throws_or_close_paren = false
+      local paren_close_idx = nil
+      local saw_non_method_op = false
+      while back >= 1 do
+        local bt = tokens[back]
+        if bt.kind == ")" then
+          if bp == 0 and not saw_throws_or_close_paren then
+            paren_close_idx = back
+            saw_throws_or_close_paren = true
+          end
+          bp = bp + 1
+        elseif bt.kind == "(" then
+          bp = bp - 1
+        elseif bp == 0 and (bt.kind == ";" or bt.kind == "{" or bt.kind == "}") then
+          break
+        elseif bp == 0 and (bt.kind == "=" or bt.kind == "->") then
+          saw_non_method_op = true
+          break
+        elseif bp == 0 and bt.kind == "id" then
+          if bt.val == "class" or bt.val == "interface" or bt.val == "enum" or bt.val == "record" then
+            local before_kw = tokens[back - 1]
+            if not (before_kw and before_kw.kind == ".") then
+              if tokens[back + 1] and tokens[back + 1].kind == "id" then
+                is_class_open = true
+                type_kw = bt.val
+                is_annotation_type = (bt.val == "interface" and before_kw and before_kw.kind == "@") == true
+                class_name = tokens[back + 1].val
+                first_type_decl_line = first_type_decl_line or tok.line
+              end
+              break
+            end
+          end
+        end
+        back = back - 1
+      end
+
+      if is_class_open and (#scope_stack == 0 or top == "class" or top == "target_class") then
+        if class_name == "Test" then
+          local_test_type = true
+        end
+        if #scope_stack == 0 then
+          seen_first_type = true
+        end
+        local is_exact_target = #scope_stack == 0
+          and type_kw == "class"
+          and not is_annotation_type
+          and type(target_class_name) == "string"
+          and target_class_name ~= ""
+          and class_name == target_class_name
+        if is_exact_target and not target_found then
+          target_found = true
+          target_open_line = tok.line
+          scope_stack[#scope_stack + 1] = "target_class"
+        else
+          scope_stack[#scope_stack + 1] = "class"
+        end
+      elseif (top == "class" or top == "target_class") and paren_close_idx and not saw_non_method_op then
+        local p = paren_close_idx - 1
+        local d = 1
+        while p >= 1 and d > 0 do
+          if tokens[p].kind == ")" then
+            d = d + 1
+          elseif tokens[p].kind == "(" then
+            d = d - 1
+          end
+          p = p - 1
+        end
+        local name_tok = tokens[p]
+        local prev_tok = tokens[p - 1]
+        if
+          name_tok
+          and name_tok.kind == "id"
+          and not JAVA_KEYWORDS[name_tok.val]
+          and not (prev_tok and prev_tok.kind == "id" and prev_tok.val == "new")
+          and not (prev_tok and (prev_tok.kind == "." or prev_tok.kind == ":" or prev_tok.kind == "="))
+        then
+          if top == "target_class" then
+            existing_methods[name_tok.val] = true
+          end
+          scope_stack[#scope_stack + 1] = "method"
+        else
+          scope_stack[#scope_stack + 1] = "other"
+        end
+      else
+        scope_stack[#scope_stack + 1] = "other"
+      end
+      ti = ti + 1
+    elseif tok.kind == "}" then
+      if #scope_stack == 0 then
+        malformed_reason = malformed_reason or "unbalanced braces in test file"
+      else
+        local popped = table.remove(scope_stack)
+        if popped == "target_class" then
+          target_close_line = tok.line
+          target_close_col = tok.col
+        end
+      end
+      ti = ti + 1
+    else
+      ti = ti + 1
+    end
+  end
+
+  if #scope_stack > 0 then
+    malformed_reason = malformed_reason or "unclosed brace in test file"
+    target_found = false
+    target_close_line = nil
+    target_close_col = nil
+  end
+
+  if existing_methods["fail"] then
+    conflicting_fail_import = true
+  end
+
+  local has_junit5_test = has_exact_junit5_test or (has_wildcard_junit5_test and not conflicting_wildcard_test)
+  if conflicting_wildcard_test or local_test_type then
+    conflicting_test_import = true
+  end
+
+  return {
+    pkg_stmt = pkg_stmt,
+    pkg_line = pkg_stmt and pkg_stmt.end_line or nil,
+    last_import_stmt = last_import_stmt,
+    last_import_line = last_import_stmt and last_import_stmt.end_line or nil,
+    last_static_import_line = last_static_import_line,
+    first_type_decl_line = first_type_decl_line,
+    has_junit5_test = has_junit5_test,
+    conflicting_test_import = conflicting_test_import,
+    has_static_fail = has_static_fail,
+    conflicting_fail_import = conflicting_fail_import,
+    has_assertions_class = has_assertions_class,
+    conflicting_assertions_import = conflicting_assertions_import,
+    local_test_type = local_test_type,
+    existing_methods = existing_methods,
+    target_found = target_found,
+    target_open_line = target_open_line,
+    target_close_line = target_close_line,
+    target_close_col = target_close_col,
+    malformed_reason = malformed_reason,
+    masked_lines = masked_lines,
+    indent = detect_indent_unit(lines),
+  }
+end
+
+local function java_string_escape(s)
+  return tostring(s or ""):gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\r", "\\r"):gsub("\n", "\\n")
+end
+
+---Choose safe JUnit 5 `@Test` annotation and needed imports for a target file.
+---@param analysis table
+---@return string test_annotation, string[] imports_to_add
+local function safe_junit5_syntax(analysis)
+  local imports_to_add = {}
+  local test_ann = "@Test"
+  if analysis.conflicting_test_import then
+    test_ann = "@org.junit.jupiter.api.Test"
+  elseif not analysis.has_junit5_test then
+    imports_to_add[#imports_to_add + 1] = "import org.junit.jupiter.api.Test;"
+  end
+  return test_ann, imports_to_add
+end
+
+local plan_existing_test_edit
+
+local function built_in_junit5_template(class_name, pkg)
+  local pkg_line = (pkg and pkg ~= "") and ("package " .. pkg .. ";\n\n") or ""
+  return pkg_line .. "import org.junit.jupiter.api.Test;\n\n" .. "public class " .. class_name .. " {\n}\n"
+end
+
+local function strip_dummy_junit5_test(rendered)
+  return (rendered:gsub("@[%w_.]*Test%s+[^;\n{}]*void%s+test%s*%(%s*%)%s*{%s*}", "", 1))
+end
+
+local function apply_plan_to_lines(base_lines, plan)
+  local be = plan.body_edit
+  for _ = 1, (be.end_row0 - be.start_row0) do
+    table.remove(base_lines, be.start_row0 + 1)
+  end
+  for k, line in ipairs(be.lines) do
+    table.insert(base_lines, be.start_row0 + k, line)
+  end
+  if plan.import_edit then
+    local ie = plan.import_edit
+    for _ = 1, (ie.end_row0 - ie.start_row0) do
+      table.remove(base_lines, ie.start_row0 + 1)
+    end
+    for k, line in ipairs(ie.lines) do
+      table.insert(base_lines, ie.start_row0 + k, line)
+    end
+  end
+  return base_lines
+end
+
+local function reindent_java_lines(base_lines, indent)
+  local raw = table.concat(base_lines, "\n")
+  local masked = mask_java_comments_and_strings(raw)
+  local masked_lines = vim.split(masked, "\n", { plain = true })
+
+  local formatted = {}
+  local depth = 0
+  for idx, line in ipairs(base_lines) do
+    local trimmed = vim.trim(line)
+    if trimmed == "" then
+      if #formatted > 0 and formatted[#formatted] ~= "" then
+        formatted[#formatted + 1] = ""
+      end
+    else
+      local mline = vim.trim(masked_lines[idx] or "")
+      local leading_close = 0
+      for c in mline:gmatch(".") do
+        if c == "}" then
+          leading_close = leading_close + 1
+        elseif c ~= " " and c ~= "\t" then
+          break
+        end
+      end
+      local line_depth = math.max(0, depth - leading_close)
+      formatted[#formatted + 1] = string.rep(indent, line_depth) .. trimmed
+      local opens = 0
+      for _ in mline:gmatch("{") do
+        opens = opens + 1
+      end
+      local closes = 0
+      for _ in mline:gmatch("}") do
+        closes = closes + 1
+      end
+      depth = math.max(0, depth + opens - closes)
+    end
+  end
+  while #formatted > 0 and formatted[#formatted] == "" do
+    table.remove(formatted)
+  end
+  return formatted
+end
+
+local function validate_rendered_method_test(formatted_lines, class_name, test_method_name)
+  local final_text = table.concat(formatted_lines, "\n") .. "\n"
+  local check = analyze_test_file(formatted_lines, class_name)
+  if check.malformed_reason or not check.target_found or not check.target_close_line then
+    return nil, "rendered test class is malformed or missing target class '" .. class_name .. "'"
+  end
+  if not check.existing_methods[test_method_name] then
+    return nil, "rendered test class does not contain method '" .. test_method_name .. "'"
+  end
+  if
+    not final_text:find("TODO: implement test for", 1, true)
+    or not final_text:find("java.lang.AssertionError", 1, true)
+  then
+    return nil, "rendered test class does not contain explicit pending failure skeleton"
+  end
+  return final_text, nil
+end
+
+---Render a brand-new JUnit 5 test class using `jc.templates` (when installed)
+---with an explicitly pending/failing skeleton for the chosen method.
+---Refuses incompatible `jc.templates` output instead of writing a skeleton-less file.
+---@param class_name string
+---@param pkg string|nil
+---@param test_method_name string
+---@param method_label string
+---@param indent string|nil
+---@return string|nil rendered, string|nil err
+local function render_junit5_for_method(class_name, pkg, test_method_name, method_label, indent)
+  indent = indent or "  "
+  local base_rendered
+  local ok_tpl, templates = pcall(require, "jc.templates")
+  if ok_tpl then
+    if type(templates) ~= "table" or type(templates.render) ~= "function" then
+      return nil, "incompatible jc.templates module (missing render function)"
+    end
+    local ok_r, rendered = pcall(templates.render, "junit5", {
+      name = class_name,
+      package = pkg or "",
+      fields = {},
+    })
+    if not ok_r or type(rendered) ~= "string" or vim.trim(rendered) == "" then
+      return nil, "incompatible jc.templates 'junit5' template (render failed or returned empty)"
+    end
+    base_rendered = rendered
+  else
+    base_rendered = built_in_junit5_template(class_name, pkg)
+  end
+
+  local stripped = strip_dummy_junit5_test(base_rendered)
+  local base_lines = vim.split(stripped:gsub("\r\n", "\n"), "\n", { plain = true })
+  local rendered_package = analyze_test_file(base_lines, class_name).pkg_stmt
+  if (rendered_package and rendered_package.name or "") ~= (pkg or "") then
+    return nil, "incompatible JUnit 5 template: package does not match target"
+  end
+  local plan, plan_err = plan_existing_test_edit(base_lines, class_name, test_method_name, method_label, indent)
+  if not plan then
+    local prefix = ok_tpl and "incompatible jc.templates 'junit5' template: " or "failed to build JUnit 5 template: "
+    return nil, prefix .. tostring(plan_err or "cannot insert test skeleton")
+  end
+
+  apply_plan_to_lines(base_lines, plan)
+  local formatted = reindent_java_lines(base_lines, indent)
+  return validate_rendered_method_test(formatted, class_name, test_method_name)
+end
+
+local function build_import_lines(anchor_is_pkg, imports_to_add, tail_nonblank)
+  local imp_lines = {}
+  if anchor_is_pkg then
+    imp_lines[#imp_lines + 1] = ""
+  end
+  vim.list_extend(imp_lines, imports_to_add)
+  if tail_nonblank then
+    imp_lines[#imp_lines + 1] = ""
+  end
+  return imp_lines
+end
+
+---Plan surgical buffer edits for inserting a test skeleton into an existing test file.
+---@param lines string[]
+---@param target_class_name string|nil
+---@param test_method_name string
+---@param method_label string
+---@param indent_override string|nil
+---@return table|nil plan, string|nil err
+plan_existing_test_edit = function(lines, target_class_name, test_method_name, method_label, indent_override)
+  local analysis = analyze_test_file(lines, target_class_name)
+  if analysis.malformed_reason then
+    return nil, analysis.malformed_reason .. " — refusing to modify"
+  end
+  if not analysis.target_found or not analysis.target_close_line or not analysis.target_close_col then
+    local target_desc = (type(target_class_name) == "string" and target_class_name ~= "")
+        and ("class '" .. target_class_name .. "'")
+      or "test class"
+    return nil, "could not locate " .. target_desc .. " — refusing to modify"
+  end
+  if analysis.existing_methods[test_method_name] then
+    return nil, "method '" .. test_method_name .. "' already exists in test class"
+  end
+
+  local indent = indent_override or analysis.indent or "  "
+  local test_ann, imports_to_add = safe_junit5_syntax(analysis)
+  local todo_msg = java_string_escape("TODO: implement test for " .. method_label)
+  local method_lines = {
+    indent .. test_ann,
+    indent .. "void " .. test_method_name .. "() {",
+    indent .. indent .. 'throw new java.lang.AssertionError("' .. todo_msg .. '");',
+    indent .. "}",
+  }
+
+  local close_idx = analysis.target_close_line
+  local close_col = analysis.target_close_col
+  local close_line = lines[close_idx] or ""
+  local before_brace = close_line:sub(1, close_col - 1)
+  local after_brace = close_line:sub(close_col + 1)
+
+  local anchor = analysis.last_import_stmt or analysis.pkg_stmt
+  local anchor_is_pkg = analysis.last_import_stmt == nil and analysis.pkg_stmt ~= nil
+  local anchor_needs_split = false
+  if #imports_to_add > 0 and anchor then
+    local raw_tail = (lines[anchor.end_line] or ""):sub(anchor.end_col + 1)
+    local masked_tail = (analysis.masked_lines[anchor.end_line] or ""):sub(anchor.end_col + 1)
+    anchor_needs_split = line_tail_needs_split(raw_tail, masked_tail)
+  end
+
+  -- When imports must be inserted onto the same line that holds the target class
+  -- closing brace (e.g. `package p; public class FooTest {}`), build one combined
+  -- surgical replacement so body and import edits never collide on the same row.
+  if #imports_to_add > 0 and anchor and anchor_needs_split and anchor.end_line == close_idx then
+    if anchor.end_col >= close_col then
+      return nil, "inline package/import layout conflicts with class closing brace — refusing to modify"
+    end
+    local before_anchor = close_line:sub(1, anchor.end_col)
+    local between = close_line:sub(anchor.end_col + 1, close_col - 1):gsub("^%s+", ""):gsub("%s+$", "")
+    local combined = { before_anchor }
+    vim.list_extend(combined, build_import_lines(anchor_is_pkg, imports_to_add, true))
+    combined[#combined + 1] = between
+    combined[#combined + 1] = ""
+    vim.list_extend(combined, method_lines)
+    local fail_offset = #combined - 1
+    combined[#combined + 1] = "}" .. after_brace
+    return {
+      body_edit = {
+        start_row0 = close_idx - 1,
+        end_row0 = close_idx,
+        lines = combined,
+        cursor_offset_in_insert = fail_offset,
+      },
+      import_edit = nil,
+    },
+      nil
+  end
+
+  local body_edit
+  if before_brace:match("^%s*$") then
+    local insert_lines = {}
+    local prev_line = close_idx > 1 and lines[close_idx - 1] or ""
+    if vim.trim(prev_line) ~= "" and not prev_line:match("{%s*$") then
+      insert_lines[#insert_lines + 1] = ""
+    end
+    vim.list_extend(insert_lines, method_lines)
+    body_edit = {
+      start_row0 = close_idx - 1,
+      end_row0 = close_idx - 1,
+      lines = insert_lines,
+      cursor_offset_in_insert = #insert_lines - 1,
+    }
+  else
+    local replacement = { before_brace:gsub("%s+$", ""), "" }
+    vim.list_extend(replacement, method_lines)
+    local fail_offset = #replacement - 1
+    replacement[#replacement + 1] = "}" .. after_brace
+    body_edit = {
+      start_row0 = close_idx - 1,
+      end_row0 = close_idx,
+      lines = replacement,
+      cursor_offset_in_insert = fail_offset,
+    }
+  end
+
+  local import_edit = nil
+  if #imports_to_add > 0 then
+    if anchor and anchor_needs_split then
+      local anchor_line = lines[anchor.end_line] or ""
+      local before_anchor = anchor_line:sub(1, anchor.end_col)
+      local after_anchor = anchor_line:sub(anchor.end_col + 1):gsub("^%s+", "")
+      local split_lines = { before_anchor }
+      vim.list_extend(split_lines, build_import_lines(anchor_is_pkg, imports_to_add, after_anchor ~= ""))
+      if after_anchor ~= "" then
+        split_lines[#split_lines + 1] = after_anchor
+      end
+      import_edit = {
+        start_row0 = anchor.end_line - 1,
+        end_row0 = anchor.end_line,
+        lines = split_lines,
+      }
+    elseif anchor then
+      local next_line = lines[anchor.end_line + 1]
+      local needs_trailing_blank = anchor_is_pkg and next_line ~= nil and vim.trim(next_line) ~= ""
+      import_edit = {
+        start_row0 = anchor.end_line,
+        end_row0 = anchor.end_line,
+        lines = build_import_lines(anchor_is_pkg, imports_to_add, needs_trailing_blank),
+      }
+    else
+      local needs_trailing_blank = lines[1] ~= nil and vim.trim(lines[1]) ~= ""
+      import_edit = {
+        start_row0 = 0,
+        end_row0 = 0,
+        lines = build_import_lines(false, imports_to_add, needs_trailing_blank),
+      }
+    end
+  end
+
+  return {
+    body_edit = body_edit,
+    import_edit = import_edit,
+  }, nil
+end
+
+local function find_fail_cursor_line(bufnr)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  for idx, line in ipairs(lines) do
+    if line:find("TODO: implement test for", 1, true) then
+      local col = (line:find("%S") or 1) - 1
+      return idx, col
+    end
+  end
+  return 1, 0
+end
+
+local function check_existing_target(path, expected_class_name)
+  local loaded_buf, buf_err, loaded_bufs = inspect_target_buffer(path)
+  if buf_err then
+    return nil, buf_err
+  end
+  local disk_data, read_err, disk_stat = read_regular_file(path)
+  if not disk_data then
+    return nil, read_err or "could not read target test file"
+  end
+  local ok_bytes, bytes_err = verify_loaded_buffers_match_disk(loaded_bufs, disk_data, path)
+  if not ok_bytes then
+    return nil, bytes_err
+  end
+
+  local lines
+  if loaded_buf then
+    lines = vim.api.nvim_buf_get_lines(loaded_buf, 0, -1, false)
+  else
+    local normalized = disk_data:gsub("^\xef\xbb\xbf", ""):gsub("\r\n", "\n")
+    lines = vim.split(normalized, "\n", { plain = true })
+  end
+  local analysis = analyze_test_file(lines, expected_class_name)
+  if analysis.malformed_reason then
+    return nil, analysis.malformed_reason .. " — refusing to modify"
+  end
+  if not analysis.target_found or not analysis.target_close_line or not analysis.target_close_col then
+    local target_desc = (type(expected_class_name) == "string" and expected_class_name ~= "")
+        and ("class '" .. expected_class_name .. "'")
+      or "test class"
+    return nil, "could not locate " .. target_desc .. " — refusing to modify"
+  end
+
+  return {
+    loaded_buf = loaded_buf,
+    loaded_bufs = loaded_bufs,
+    tick = loaded_buf and vim.b[loaded_buf].changedtick or nil,
+    disk_data = disk_data,
+    disk_stat = disk_stat,
+    analysis = analysis,
+  },
+    nil
+end
+
+local function create_new_test_file_for_method(target_path, class_name, pkg, test_method_name, method_label, src_indent)
+  local _, buf_err, loaded_bufs = inspect_target_buffer(target_path)
+  if buf_err then
+    ui.notify(buf_err, vim.log.levels.WARN)
+    return false
+  end
+  for _, buf in ipairs(loaded_bufs or {}) do
+    local b_bytes = buffer_to_disk_bytes(buf)
+    if b_bytes ~= "" then
+      ui.notify(
+        "target test buffer (" .. vim.fs.basename(target_path) .. ") has content not on disk — save or close first",
+        vim.log.levels.WARN
+      )
+      return false
+    end
+  end
+  local existing_lstat = vim.uv.fs_lstat(target_path)
+  if existing_lstat then
+    ui.notify("target test file already exists on disk — refusing to overwrite: " .. target_path, vim.log.levels.WARN)
+    return false
+  end
+
+  local rendered, render_err = render_junit5_for_method(class_name, pkg, test_method_name, method_label, src_indent)
+  if not rendered then
+    ui.notify(render_err or "could not render JUnit 5 test file", vim.log.levels.ERROR)
+    return false
+  end
+
+  vim.fn.mkdir(vim.fs.dirname(target_path), "p")
+
+  -- Exclusive creation (`O_CREAT | O_EXCL`) prevents overwriting a file or
+  -- dangling symlink that appeared after confirmation.
+  local fd, open_err = vim.uv.fs_open(target_path, "wx", 438)
+  if not fd then
+    ui.notify("could not create test file: " .. tostring(open_err), vim.log.levels.WARN)
+    return false
+  end
+  local written, write_err = vim.uv.fs_write(fd, rendered, 0)
+  local closed, close_err = vim.uv.fs_close(fd)
+  if written ~= #rendered or not closed then
+    pcall(vim.uv.fs_unlink, target_path)
+    ui.notify(
+      "could not finish writing test file: " .. tostring(write_err or close_err or "short write"),
+      vim.log.levels.ERROR
+    )
+    return false
+  end
+
+  if not open_file(target_path) then
+    return false
+  end
+  vim.b.jc_new_java_file = true
+  local cur_buf = vim.api.nvim_get_current_buf()
+  local row, col = find_fail_cursor_line(cur_buf)
+  pcall(vim.api.nvim_win_set_cursor, 0, { row, col })
+  return true
+end
+
+local function apply_existing_test_skeleton(target_path, target_class_name, test_method_name, method_label, snapshot)
+  local cur_snap, check_err = check_existing_target(target_path, target_class_name)
+  if not cur_snap then
+    ui.notify(check_err or "could not verify target test file", vim.log.levels.WARN)
+    return false
+  end
+  if snapshot.loaded_buf then
+    if
+      not vim.api.nvim_buf_is_valid(snapshot.loaded_buf) or vim.b[snapshot.loaded_buf].changedtick ~= snapshot.tick
+    then
+      ui.notify("target test buffer changed while waiting for confirmation — run again", vim.log.levels.WARN)
+      return false
+    end
+  end
+  if not stat_matches(cur_snap.disk_stat, snapshot.disk_stat) or cur_snap.disk_data ~= snapshot.disk_data then
+    ui.notify("target test file changed on disk while waiting for confirmation — run again", vim.log.levels.WARN)
+    return false
+  end
+
+  if cur_snap.loaded_buf then
+    vim.api.nvim_set_current_buf(cur_snap.loaded_buf)
+  elseif not open_file(target_path) then
+    return false
+  end
+
+  local target_buf = vim.api.nvim_get_current_buf()
+  if vim.bo[target_buf].modified then
+    ui.notify("target test buffer has unsaved changes — refusing to modify", vim.log.levels.WARN)
+    return false
+  end
+  if not vim.bo[target_buf].modifiable or vim.bo[target_buf].readonly then
+    ui.notify("target test buffer is read-only or not modifiable", vim.log.levels.WARN)
+    return false
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(target_buf, 0, -1, false)
+  local plan, plan_err = plan_existing_test_edit(lines, target_class_name, test_method_name, method_label)
+  if not plan then
+    ui.notify(plan_err or "could not plan test insertion", vim.log.levels.WARN)
+    return false
+  end
+
+  -- Apply bottom-up so body line numbers stay valid before inserting imports.
+  local be = plan.body_edit
+  vim.api.nvim_buf_set_lines(target_buf, be.start_row0, be.end_row0, false, be.lines)
+  local import_shift = 0
+  if plan.import_edit then
+    local ie = plan.import_edit
+    pcall(vim.cmd, "undojoin")
+    vim.api.nvim_buf_set_lines(target_buf, ie.start_row0, ie.end_row0, false, ie.lines)
+    import_shift = #ie.lines - (ie.end_row0 - ie.start_row0)
+  end
+
+  local target_row = be.start_row0 + import_shift + be.cursor_offset_in_insert
+  local target_line = vim.api.nvim_buf_get_lines(target_buf, target_row - 1, target_row, false)[1] or ""
+  local target_col = (target_line:find("%S") or 1) - 1
+  pcall(vim.api.nvim_win_set_cursor, 0, { target_row, target_col })
+  return true
+end
+
+local function method_display_label(method)
+  local prefix = (method.qualified_type and method.qualified_type ~= "") and (method.qualified_type .. ".") or ""
+  return prefix .. method.display_signature
+end
+
+local function path_under_root(root_dir, path)
+  local croot = canonical(root_dir)
+  local cpath = canonical(path)
+  if not croot or not cpath then
+    return false
+  end
+  return cpath == croot or cpath:sub(1, #croot + 1) == croot .. "/"
+end
+
+local function inspect_new_template_methods(class_name, pkg)
+  local ok_tpl, templates = pcall(require, "jc.templates")
+  if not ok_tpl then
+    return {}, nil
+  end
+  if type(templates) ~= "table" or type(templates.render) ~= "function" then
+    return nil, "incompatible jc.templates module (missing render function)"
+  end
+  local ok_r, rendered = pcall(templates.render, "junit5", {
+    name = class_name,
+    package = pkg or "",
+    fields = {},
+  })
+  if not ok_r or type(rendered) ~= "string" or vim.trim(rendered) == "" then
+    return nil, "incompatible jc.templates 'junit5' template (render failed or returned empty)"
+  end
+  local stripped = strip_dummy_junit5_test(rendered)
+  local base_lines = vim.split(stripped:gsub("\r\n", "\n"), "\n", { plain = true })
+  local analysis = analyze_test_file(base_lines, class_name)
+  if analysis.malformed_reason or not analysis.target_found or not analysis.target_close_line then
+    return nil,
+      "incompatible jc.templates 'junit5' template: " .. tostring(
+        analysis.malformed_reason or ("missing class '" .. class_name .. "'")
+      )
+  end
+  return analysis.existing_methods, nil
+end
+
+local function run_method_test_flow(ctx, nav)
+  local op_token = skeleton_ctrl:begin_operation()
+
+  local function abort_if_stale()
+    if not skeleton_ctrl:is_op_active(op_token) then
+      return true
+    end
+    if not skeleton_ctrl:context_still_valid(ctx, true, true) then
+      skeleton_ctrl:end_operation(op_token)
+      return true
+    end
+    return false
+  end
+
+  if nav.status == "match" then
+    local _, pre_err = check_existing_target(nav.target, nav.match.name)
+    if pre_err then
+      ui.notify(pre_err, vim.log.levels.WARN)
+      skeleton_ctrl:end_operation(op_token)
+      return
+    end
+  end
+
+  local function finish_confirm(dest, chosen_method, test_method_name, classpath_info, snapshot)
+    if abort_if_stale() then
+      return
+    end
+    local method_label = method_display_label(chosen_method)
+    local rel_target = ctx.project_root and vim.fs.relpath(ctx.project_root, dest.path) or dest.path
+    local confirm_label = dest.is_new and "✔ Create test file & skeleton" or "✔ Insert test skeleton"
+    local cancel_label = "✖ Cancel"
+    local items = {
+      confirm_label,
+      cancel_label,
+      "Method: " .. method_label,
+      "Test method: " .. test_method_name .. "()",
+      "Target: " .. (rel_target or dest.path) .. (dest.is_new and "  (new file)" or "  (existing file)"),
+      "Classpath: " .. classpath_info.summary,
+    }
+
+    ui.pick_one(items, "Java: Tests — confirm JUnit 5 test skeleton", function(choice)
+      if abort_if_stale() then
+        return
+      end
+      if choice == nil or choice == cancel_label then
+        skeleton_ctrl:end_operation(op_token)
+        return
+      end
+      if choice ~= confirm_label then
+        finish_confirm(dest, chosen_method, test_method_name, classpath_info, snapshot)
+        return
+      end
+      if dest.is_new then
+        local src_lines = vim.api.nvim_buf_get_lines(ctx.bufnr, 0, 200, false)
+        local src_indent = detect_indent_unit(src_lines)
+        create_new_test_file_for_method(
+          dest.path,
+          dest.class_name,
+          dest.pkg,
+          test_method_name,
+          method_label,
+          src_indent
+        )
+      else
+        apply_existing_test_skeleton(dest.path, dest.class_name, test_method_name, method_label, snapshot)
+      end
+      skeleton_ctrl:end_operation(op_token)
+    end)
+  end
+
+  local function ask_test_name(dest, chosen_method, classpath_info, snapshot, existing_methods, suggested_name)
+    if abort_if_stale() then
+      return
+    end
+    ui.ask("Java: Tests — test method name: ", suggested_name, function(input_name)
+      if abort_if_stale() then
+        return
+      end
+      if input_name == nil then
+        skeleton_ctrl:end_operation(op_token)
+        return
+      end
+      local trimmed = vim.trim(input_name)
+      if not is_java_identifier(trimmed) then
+        ui.notify("invalid Java method identifier: " .. (trimmed == "" and "(empty)" or trimmed), vim.log.levels.WARN)
+        ask_test_name(dest, chosen_method, classpath_info, snapshot, existing_methods, suggested_name)
+        return
+      end
+      if existing_methods[trimmed] then
+        ui.notify(
+          "method '" .. trimmed .. "' already exists in " .. vim.fs.basename(dest.path) .. " — choose another name",
+          vim.log.levels.WARN
+        )
+        ask_test_name(dest, chosen_method, classpath_info, snapshot, existing_methods, suggested_name)
+        return
+      end
+      finish_confirm(dest, chosen_method, trimmed, classpath_info, snapshot)
+    end)
+  end
+
+  local function prepare_target_and_ask_name(dest, chosen_method, classpath_info)
+    if abort_if_stale() then
+      return
+    end
+
+    if dest.is_new then
+      local _, buf_err, loaded_bufs = inspect_target_buffer(dest.path)
+      if buf_err then
+        ui.notify(buf_err, vim.log.levels.WARN)
+        skeleton_ctrl:end_operation(op_token)
+        return
+      end
+      for _, buf in ipairs(loaded_bufs or {}) do
+        local b_bytes = buffer_to_disk_bytes(buf)
+        if b_bytes ~= "" then
+          ui.notify(
+            "target test buffer (" .. vim.fs.basename(dest.path) .. ") has content not on disk — save or close first",
+            vim.log.levels.WARN
+          )
+          skeleton_ctrl:end_operation(op_token)
+          return
+        end
+      end
+      if vim.uv.fs_lstat(dest.path) then
+        ui.notify(
+          "target test file already exists on disk — refusing to overwrite: " .. dest.path,
+          vim.log.levels.WARN
+        )
+        skeleton_ctrl:end_operation(op_token)
+        return
+      end
+      local tpl_methods, tpl_err = inspect_new_template_methods(dest.class_name, dest.pkg)
+      if not tpl_methods then
+        ui.notify(tpl_err or "incompatible jc.templates 'junit5' template", vim.log.levels.ERROR)
+        skeleton_ctrl:end_operation(op_token)
+        return
+      end
+      local suggested = default_test_method_name(chosen_method, tpl_methods)
+      ask_test_name(dest, chosen_method, classpath_info, nil, tpl_methods, suggested)
+      return
+    end
+
+    local snapshot, check_err = check_existing_target(dest.path, dest.class_name)
+    if not snapshot then
+      ui.notify(check_err or "could not verify target test file", vim.log.levels.WARN)
+      skeleton_ctrl:end_operation(op_token)
+      return
+    end
+
+    local existing_methods = snapshot.analysis.existing_methods
+    local suggested = default_test_method_name(chosen_method, existing_methods)
+    ask_test_name(dest, chosen_method, classpath_info, snapshot, existing_methods, suggested)
+  end
+
+  local function verify_target_classpath(client, dest, chosen_method)
+    if abort_if_stale() then
+      return
+    end
+    local target_mod = dest.module or nav.module
+    local target_lbl = dest.module_label or nav.module_label
+    local is_other_module = target_mod ~= nav.module
+
+    if
+      is_other_module
+      and type(client.root_dir) == "string"
+      and client.root_dir ~= ""
+      and not path_under_root(client.root_dir, dest.path)
+    then
+      ui.notify(
+        "cannot verify JUnit 5 on test classpath for module "
+          .. tostring(target_lbl)
+          .. " (selected jdtls client is rooted at another directory) — confirm carefully before writing",
+        vim.log.levels.WARN
+      )
+      prepare_target_and_ask_name(dest, chosen_method, {
+        status = "unverified",
+        summary = "UNVERIFIED (target module " .. tostring(target_lbl) .. " outside jdtls client root)",
+      })
+      return
+    end
+
+    if not supports_command(client, ctx.bufnr, "java.project.getClasspaths") then
+      local msg = is_other_module
+          and ("cannot verify JUnit 5 on test classpath for module " .. tostring(target_lbl) .. " (jdtls client does not advertise java.project.getClasspaths) — confirm carefully before writing")
+        or "cannot verify JUnit 5 on test classpath (jdtls client does not advertise java.project.getClasspaths) — confirm carefully before writing"
+      ui.notify(msg, vim.log.levels.WARN)
+      prepare_target_and_ask_name(dest, chosen_method, {
+        status = "unverified",
+        summary = is_other_module and ("UNVERIFIED (jdtls lacks java.project.getClasspaths for " .. tostring(
+          target_lbl
+        ) .. ")") or "UNVERIFIED (jdtls lacks java.project.getClasspaths)",
+      })
+      return
+    end
+
+    local query_uri = is_other_module and vim.uri_from_fname(dest.path)
+      or vim.lsp.util.make_text_document_params(ctx.bufnr).uri
+
+    if hierarchy.client_stopped(client) then
+      ui.notify("jdtls client stopped during " .. skeleton_ctrl.feature_label, vim.log.levels.WARN)
+      skeleton_ctrl:end_operation(op_token)
+      return
+    end
+    local req_token = skeleton_ctrl:begin_request(op_token, client, ctx.bufnr, "verify JUnit 5 test classpath")
+    if not req_token then
+      return
+    end
+
+    local ok, req_id = client:request("workspace/executeCommand", {
+      command = "java.project.getClasspaths",
+      arguments = { query_uri, vim.fn.json_encode({ scope = "test" }) },
+    }, function(err, cp_result)
+      vim.schedule(function()
+        if not skeleton_ctrl:is_request_current(op_token, req_token) then
+          return
+        end
+        skeleton_ctrl:clear_pending(req_token)
+        if hierarchy.client_stopped(client) then
+          ui.notify("jdtls client stopped during " .. skeleton_ctrl.feature_label, vim.log.levels.WARN)
+          skeleton_ctrl:end_operation(op_token)
+          return
+        end
+        if abort_if_stale() then
+          return
+        end
+        if err then
+          if type(err) == "table" and err.code == hierarchy.REQUEST_CANCELLED_CODE then
+            skeleton_ctrl:handle_request_error(err, "workspace/executeCommand")
+            skeleton_ctrl:end_operation(op_token)
+            return
+          end
+          if is_other_module then
+            ui.notify(
+              "could not verify JUnit 5 on test classpath for module "
+                .. tostring(target_lbl)
+                .. " — confirm carefully before writing",
+              vim.log.levels.WARN
+            )
+            prepare_target_and_ask_name(dest, chosen_method, {
+              status = "unverified",
+              summary = "UNVERIFIED (could not query classpath for " .. tostring(target_lbl) .. ")",
+            })
+            return
+          end
+          skeleton_ctrl:handle_request_error(err, "workspace/executeCommand")
+          skeleton_ctrl:end_operation(op_token)
+          return
+        end
+
+        local info = inspect_junit5_classpath(cp_result, is_other_module and target_lbl or nil)
+        if info.status == "invalid" then
+          if is_other_module then
+            ui.notify(
+              "could not verify JUnit 5 on test classpath for module "
+                .. tostring(target_lbl)
+                .. " (unexpected java.project.getClasspaths response) — confirm carefully before writing",
+              vim.log.levels.WARN
+            )
+            prepare_target_and_ask_name(dest, chosen_method, {
+              status = "unverified",
+              summary = "UNVERIFIED (unexpected classpath response for " .. tostring(target_lbl) .. ")",
+            })
+            return
+          end
+          ui.notify(
+            "could not verify JUnit 5 on test classpath (unexpected java.project.getClasspaths response)",
+            vim.log.levels.WARN
+          )
+          skeleton_ctrl:end_operation(op_token)
+          return
+        end
+        if info.status == "missing" then
+          local reason
+          if info.saw_engine_only then
+            reason = "JUnit 5 API (org.junit.jupiter.api.Test) was not found on the JDTLS test classpath for "
+              .. tostring(target_lbl)
+              .. " (junit-jupiter-engine alone does not provide the API) — add junit-jupiter-api to your build and sync JDTLS"
+          elseif info.saw_junit4 then
+            reason =
+              "JUnit 5 (org.junit.jupiter.api.Test) is not on the JDTLS test classpath (only JUnit 3/4 found) — add junit-jupiter-api to your build and sync JDTLS"
+          else
+            reason = "JUnit 5 (org.junit.jupiter.api.Test) was not found on the JDTLS test classpath for "
+              .. tostring(target_lbl)
+              .. " — add junit-jupiter-api to your build file and sync JDTLS"
+          end
+          ui.notify(reason, vim.log.levels.WARN)
+          skeleton_ctrl:end_operation(op_token)
+          return
+        end
+        if info.status == "unverified" then
+          ui.notify(info.summary .. " — confirm carefully before writing", vim.log.levels.WARN)
+        end
+        prepare_target_and_ask_name(dest, chosen_method, info)
+      end)
+    end, ctx.bufnr)
+
+    if not skeleton_ctrl:attach_request_id(op_token, req_token, ok, req_id) then
+      ui.notify("failed to send workspace/executeCommand request to jdtls", vim.log.levels.ERROR)
+    end
+  end
+
+  local function resolve_destination(client, chosen_method)
+    if abort_if_stale() then
+      return
+    end
+    if nav.status == "match" then
+      verify_target_classpath(client, {
+        path = nav.target,
+        class_name = nav.match.name,
+        pkg = nav.pkg,
+        module = nav.module,
+        module_label = nav.module_label,
+        is_new = false,
+      }, chosen_method)
+      return
+    end
+
+    if nav.status == "missing" then
+      verify_target_classpath(client, {
+        path = nav.default_target,
+        class_name = nav.default_name,
+        pkg = nav.pkg,
+        module = nav.module,
+        module_label = nav.module_label,
+        is_new = true,
+      }, chosen_method)
+      return
+    end
+
+    if nav.status == "ambiguous" then
+      local labels, by_label = {}, {}
+      for _, m in ipairs(nav.matches) do
+        local label = nav.multimodule and (m.module_label .. " · " .. m.fqn) or m.fqn
+        labels[#labels + 1] = label
+        by_label[label] = {
+          path = m.path,
+          class_name = m.name,
+          pkg = nav.pkg,
+          module = m.module,
+          module_label = m.module_label,
+          is_new = false,
+        }
+      end
+      ui.pick_one(labels, "Java: Tests — select target test class", function(choice)
+        if abort_if_stale() then
+          return
+        end
+        local dest = by_label[choice]
+        if not dest then
+          skeleton_ctrl:end_operation(op_token)
+          return
+        end
+        verify_target_classpath(client, dest, chosen_method)
+      end)
+      return
+    end
+
+    -- cross_module
+    local labels, by_label = {}, {}
+    for _, m in ipairs(nav.matches) do
+      local label = "Use " .. m.module_label .. " · " .. m.fqn
+      labels[#labels + 1] = label
+      by_label[label] = {
+        path = m.path,
+        class_name = m.name,
+        pkg = nav.pkg,
+        module = m.module,
+        module_label = m.module_label,
+        is_new = false,
+      }
+    end
+    local create_label = "Create " .. (nav.multimodule and (nav.module_label .. " · ") or "") .. nav.default_fqn
+    labels[#labels + 1] = create_label
+    by_label[create_label] = {
+      path = nav.default_target,
+      class_name = nav.default_name,
+      pkg = nav.pkg,
+      module = nav.module,
+      module_label = nav.module_label,
+      is_new = true,
+    }
+    ui.pick_one(labels, "Java: Tests — select destination test class", function(choice)
+      if abort_if_stale() then
+        return
+      end
+      local dest = by_label[choice]
+      if not dest then
+        skeleton_ctrl:end_operation(op_token)
+        return
+      end
+      verify_target_classpath(client, dest, chosen_method)
+    end)
+  end
+
+  local function select_method(client, methods)
+    if abort_if_stale() then
+      return
+    end
+    local ordered = {}
+    for _, m in ipairs(methods) do
+      if m.at_cursor then
+        ordered[#ordered + 1] = m
+      end
+    end
+    for _, m in ipairs(methods) do
+      if not m.at_cursor then
+        ordered[#ordered + 1] = m
+      end
+    end
+
+    local labels, by_label, seen = {}, {}, {}
+    for _, m in ipairs(ordered) do
+      local base_label = method_display_label(m) .. (m.at_cursor and "  [at cursor]" or "")
+      local label = hierarchy.unique_label(base_label, seen)
+      labels[#labels + 1] = label
+      by_label[label] = m
+    end
+
+    ui.pick_one(labels, "Java: Tests — select method", function(choice)
+      if abort_if_stale() then
+        return
+      end
+      local picked = by_label[choice]
+      if not picked then
+        skeleton_ctrl:end_operation(op_token)
+        return
+      end
+      resolve_destination(client, picked)
+    end)
+  end
+
+  skeleton_ctrl:select_client(op_token, ctx, {
+    prompt = "Java: Tests — select JDTLS client",
+    supports = supports_document_symbol,
+    unsupported_reason = "does not support textDocument/documentSymbol",
+    unsupported_tag = "[no documentSymbol]",
+  }, function(client)
+    local pos_params = hierarchy.build_position_params(ctx.bufnr, ctx.cursor, client)
+    skeleton_ctrl:request(
+      op_token,
+      client,
+      ctx.bufnr,
+      "textDocument/documentSymbol",
+      { textDocument = pos_params.textDocument },
+      "list methods (documentSymbol)",
+      ctx,
+      function(resp)
+        local methods = extract_methods_from_symbols(resp, pos_params.position)
+        if #methods == 0 then
+          ui.notify("no methods found in this Java file", vim.log.levels.WARN)
+          skeleton_ctrl:end_operation(op_token)
+          return
+        end
+        select_method(client, methods)
+      end
+    )
+  end)
+end
+
+local function method_test_entry(bufnr, is_java, nav)
+  local label = "Create JUnit 5 Test for Method…"
+  if not is_java then
+    return {
+      key = "create_method_test",
+      label = label,
+      enabled = false,
+      reason = "open a .java file",
+    }
+  end
+  if not nav or not nav.resolvable then
+    return {
+      key = "create_method_test",
+      label = label,
+      enabled = false,
+      reason = (nav and nav.reason) or "open a .java file under src/main/java",
+    }
+  end
+  if nav.direction ~= "to_test" then
+    return {
+      key = "create_method_test",
+      label = label,
+      enabled = false,
+      reason = "open a .java source file under src/main/java",
+    }
+  end
+  local ready, reason = skeleton_ctrl:menu_availability(
+    bufnr,
+    supports_document_symbol,
+    "jdtls client does not support textDocument/documentSymbol"
+  )
+  return {
+    key = "create_method_test",
+    label = label,
+    enabled = ready,
+    reason = reason,
+  }
+end
+
+---Cancel the active test-skeleton LSP request/flow, if any.
+---@return boolean cancelled
+function M.cancel()
+  return skeleton_ctrl:cancel(true)
+end
+
+---Create an explicitly pending/failing JUnit 5 test skeleton for a method
+---selected from JDTLS `textDocument/documentSymbol`.
+function M.create_method_test()
+  local ctx = hierarchy.capture_context()
+  if not ctx then
+    ui.notify("the target buffer no longer exists", vim.log.levels.WARN)
+    return
+  end
+  if vim.bo[ctx.bufnr].buftype ~= "" or vim.bo[ctx.bufnr].filetype ~= "java" then
+    ui.notify("open a .java file under src/main/java", vim.log.levels.WARN)
+    return
+  end
+  local root = ctx.project_root
+  if not root then
+    ui.notify("no Maven/Gradle project (pom.xml, build.gradle) from this buffer", vim.log.levels.WARN)
+    return
+  end
+  local nav = resolve_counterpart(ctx.bufnr, root)
+  if not nav.resolvable or nav.direction ~= "to_test" then
+    ui.notify(
+      (not nav.resolvable and nav.reason) or "open a .java source file under src/main/java",
+      vim.log.levels.WARN
+    )
+    return
+  end
+  run_method_test_flow(ctx, nav)
+end
+
 ---Entry point of `<leader>jt`.
 function M.tests()
   local cur = vim.api.nvim_get_current_buf()
@@ -735,6 +3131,10 @@ function M.tests()
   local cur_mod = ctx_path ~= "" and owning_module(ctx_path, mods) or nil
   local mod_desc = cur_mod and module_label(root, cur_mod) or vim.fs.basename(root)
   local nav = is_java and resolve_counterpart(cur, root) or nil
+  local ctx = hierarchy.capture_context()
+  local opened_seq = skeleton_ctrl:seq()
+  local pending = skeleton_ctrl:pending()
+  local opened_pending_token = pending and pending.token or nil
 
   if is_java and vim.bo[cur].modified then
     ui.notify(
@@ -824,18 +3224,62 @@ function M.tests()
       reason = no_jc,
     },
     goto_test = goto_entry(is_java, nav),
+    create_method_test = method_test_entry(cur, is_java, nav),
   }
 
   local order
   if not is_java then
-    order = { "suite", "pick", "last", "stop", "summary", "output", "precompile", "nearest", "file", "goto_test" }
+    order = {
+      "suite",
+      "pick",
+      "last",
+      "stop",
+      "summary",
+      "output",
+      "precompile",
+      "nearest",
+      "file",
+      "goto_test",
+      "create_method_test",
+    }
   elseif not run_enabled and by_key.goto_test.enabled then
-    order = { "goto_test", "nearest", "file", "suite", "pick", "last", "stop", "summary", "output", "precompile" }
+    order = {
+      "goto_test",
+      "create_method_test",
+      "nearest",
+      "file",
+      "suite",
+      "pick",
+      "last",
+      "stop",
+      "summary",
+      "output",
+      "precompile",
+    }
   else
-    order = { "nearest", "file", "goto_test", "suite", "pick", "last", "stop", "summary", "output", "precompile" }
+    order = {
+      "nearest",
+      "file",
+      "goto_test",
+      "create_method_test",
+      "suite",
+      "pick",
+      "last",
+      "stop",
+      "summary",
+      "output",
+      "precompile",
+    }
   end
 
   local entries = {}
+  if pending then
+    entries[#entries + 1] = {
+      key = "cancel",
+      label = "Cancel active request (" .. pending.label .. ")",
+      enabled = true,
+    }
+  end
   for _, key in ipairs(order) do
     entries[#entries + 1] = by_key[key]
   end
@@ -844,8 +3288,18 @@ function M.tests()
     or ("Java: Tests — " .. vim.fs.basename(root))
 
   ui.menu(entries, prompt, function(entry)
+    if entry.key == "cancel" then
+      if skeleton_ctrl:seq() ~= opened_seq then
+        return
+      end
+      local cur_pending = skeleton_ctrl:pending()
+      if cur_pending and cur_pending.token == opened_pending_token then
+        M.cancel()
+      end
+      return
+    end
     -- runs use jc/neotest classpath/commands, which resolve the client
-    -- globally; stop/summary/output/goto_test do not start a client request
+    -- globally; stop/summary/output/goto_test/create_method_test do not
     local run_keys = { nearest = true, file = true, suite = true, pick = true, last = true }
     if run_keys[entry.key] then
       local jc_guard = lsp.jc_global_reason("Tests")
@@ -880,6 +3334,14 @@ function M.tests()
       jc.toggle_precompile()
     elseif entry.key == "goto_test" then
       goto_counterpart(cur, root)
+    elseif entry.key == "create_method_test" then
+      if skeleton_ctrl:seq() ~= opened_seq then
+        return
+      end
+      if not skeleton_ctrl:context_still_valid(ctx, true, true) then
+        return
+      end
+      run_method_test_flow(ctx, nav)
     end
   end)
 end
@@ -890,5 +3352,14 @@ M._run_file = run_file
 M._resolve_counterpart = resolve_counterpart
 M._goto_counterpart = goto_counterpart
 M._owning_module = owning_module
+M._extract_methods_from_symbols = extract_methods_from_symbols
+M._default_test_method_name = default_test_method_name
+M._analyze_test_file = analyze_test_file
+M._plan_existing_test_edit = plan_existing_test_edit
+M._render_junit5_for_method = render_junit5_for_method
+M._inspect_junit5_classpath = inspect_junit5_classpath
+M._reset = function()
+  skeleton_ctrl:reset()
+end
 
 return M
