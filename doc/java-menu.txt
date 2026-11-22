@@ -230,9 +230,11 @@ in .env instead.
 Output lines longer than 64 KiB are truncated and the remainder is suppressed
 until the next newline. Captured process output is limited to 4 MiB per run.
 Partial lines can be delayed until newline or exit.
-Restart refuses automatic termination if the process group cannot be verified.
-Background processes left after normal exit can outlive Java Menu's stop
-controls. Repeat Last uses Java Menu's own canonical-root history only and
+Background groups left after normal exit remain tracked for Stop; Restart
+waits for verified groups in the same project to exit. If group identity
+cannot be verified, Java Menu avoids sending signals and blocks automatic
+restart until the group exits or is stopped manually. Verification depends on
+operating-system process information and may be unavailable outside Linux. Repeat Last uses Java Menu's own canonical-root history only and
 neither reads nor writes jc.nvim's `build-last` (`JCbuildLast`), as
 jc.settings uses non-injective path keys without cross-session ownership.
 Short .env values may cause unrelated arguments to be excluded from saved

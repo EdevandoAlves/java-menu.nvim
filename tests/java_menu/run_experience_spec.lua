@@ -1149,11 +1149,13 @@ end
 do
   local root_bg, main_bg = fixtures.maven_project("run7d-bg-exit", "com.demo.bg", "App")
   local bg_pid_file = root_bg .. "/bg_child.pid"
+  local bg_gate_file = root_bg .. "/bg_child.gate"
   fixtures.write(root_bg .. "/mvnw", {
     "#!/bin/sh",
     "sleep 30 &",
     "bpid=$!",
     'printf "%s" "$bpid" > ' .. vim.fn.shellescape(bg_pid_file),
+    "while [ ! -f " .. vim.fn.shellescape(bg_gate_file) .. " ]; do sleep 0.02; done",
     "exit 0",
   })
   vim.fn.system({ "chmod", "+x", root_bg .. "/mvnw" })
@@ -1165,6 +1167,14 @@ do
   notices = {}
   build.build()
   menu_cb(entry("compile"))
+  assert(
+    fixtures.wait_for(5000, function()
+      return build._state.running and vim.fn.filereadable(bg_pid_file) == 1
+    end),
+    "processo líder deveria ter iniciado filho em background"
+  )
+  build.build()
+  fixtures.write(bg_gate_file, { "go" })
   assert(
     fixtures.wait_for(5000, function()
       return not build._state.running and build._state.status == "success" and vim.fn.filereadable(bg_pid_file) == 1
@@ -2709,6 +2719,1073 @@ do
   assert(#output < 512, "output exceeded the bounded capture limit")
   build._max_output_bytes = original_limit
   build._max_line_bytes = original_line_limit
+end
+
+-- ========== 19. Issue #7: Safer process lifecycle (surviving background group, stubborn child, cross-project & PID reuse) ==========
+
+do
+  local root_7a, main_7a = fixtures.maven_project("run7d-i7-alpha", "com.demo.i7a", "App")
+  local root_7b, main_7b = fixtures.maven_project("run7d-i7-beta", "com.demo.i7b", "App")
+  local root_7c, main_7c = fixtures.maven_project("run7d-i7-gamma", "com.demo.i7c", "App")
+
+  local stubborn_bg_pid_file = root_7a .. "/stubborn_bg.pid"
+  local stubborn_bg_gate_file = root_7a .. "/stubborn_bg.gate"
+  fixtures.write(root_7a .. "/mvnw", {
+    "#!/bin/sh",
+    '(trap "" TERM; exec sleep 30) &',
+    "bpid=$!",
+    'printf "%s" "$bpid" > ' .. vim.fn.shellescape(stubborn_bg_pid_file),
+    "while [ ! -f " .. vim.fn.shellescape(stubborn_bg_gate_file) .. " ]; do sleep 0.02; done",
+    "exit 0",
+  })
+  vim.fn.system({ "chmod", "+x", root_7a .. "/mvnw" })
+
+  fixtures.write(root_7b .. "/mvnw", { "#!/bin/sh", "exit 0" })
+  vim.fn.system({ "chmod", "+x", root_7b .. "/mvnw" })
+  fixtures.write(root_7c .. "/mvnw", { "#!/bin/sh", "exit 0" })
+  vim.fn.system({ "chmod", "+x", root_7c .. "/mvnw" })
+
+  local orig_bg_grace = build._background_grace_ms
+  local orig_stop_grace = build._stop_grace_ms
+  local orig_restart_timeout = build._restart_timeout_ms
+  build._background_grace_ms = 120
+  build._stop_grace_ms = 200
+  build._restart_timeout_ms = 5000
+
+  local ext_job = vim.fn.jobstart({ "sleep", "30" })
+  assert(ext_job > 0, "processo externo de controle não iniciou")
+  local ext_pid = vim.fn.jobpid(ext_job)
+
+  -- 19a. Líder sai com exit 0 deixando filho resistente em background; lock libera mas grupo continua rastreado
+  open_file(main_7a)
+  notices = {}
+  build.build()
+  menu_cb(entry("compile"))
+  assert(
+    fixtures.wait_for(5000, function()
+      return build._state.running and vim.fn.filereadable(stubborn_bg_pid_file) == 1
+    end),
+    "líder de alpha deveria ter iniciado filho resistente"
+  )
+  build.build()
+  fixtures.write(stubborn_bg_gate_file, { "go" })
+  assert(
+    fixtures.wait_for(5000, function()
+      return not build._state.running
+        and build._state.status == "success"
+        and vim.fn.filereadable(stubborn_bg_pid_file) == 1
+    end),
+    "líder de alpha deveria ter saído deixando filho resistente"
+  )
+  local bg_stubborn_pid = tonumber(read_raw(stubborn_bg_pid_file))
+  assert(bg_stubborn_pid and pid_alive(bg_stubborn_pid), "filho resistente em background deveria estar vivo")
+
+  assert(
+    fixtures.wait_for(3000, function()
+      return not build._is_draining() and has_notice("surviving background group")
+    end),
+    "monitor deveria liberar o build lock após _background_grace_ms"
+  )
+  assert(pid_alive(bg_stubborn_pid), "saída normal do líder não pode matar grupo sobrevivente")
+  assert(#build._background_groups >= 1, "grupo sobrevivente deve permanecer rastreado após liberar lock")
+
+  -- 19b. Novo build em outro projeto (beta) não fica bloqueado e NÃO apaga o rastreamento do grupo de alpha
+  open_file(main_7b)
+  local seq_b = build._state.seq
+  notices = {}
+  build.build()
+  menu_cb(entry("compile"))
+  assert(
+    fixtures.wait_for(5000, function()
+      return build._state.seq > seq_b and not build._state.running and build._state.status == "success"
+    end),
+    "build em beta deveria rodar normalmente sem ser bloqueado pelo background de alpha"
+  )
+  assert(pid_alive(bg_stubborn_pid), "build em beta não pode matar grupo em background de alpha")
+
+  -- Menu em beta ainda expõe Stop identificando o projeto de origem (alpha) e avisando sobre confirmação
+  build.build()
+  local stop_entry_b = entry("stop")
+  assert(
+    stop_entry_b and stop_entry_b.enabled,
+    "Stop deve continuar habilitado para grupo em background após novo build"
+  )
+  assert(
+    stop_entry_b.label:find("i7-alpha", 1, true),
+    "Stop deveria identificar o projeto de origem (alpha), obteve: " .. tostring(stop_entry_b.label)
+  )
+  assert(
+    stop_entry_b.reason:find("another project", 1, true),
+    "Stop deveria avisar que é de outro projeto: " .. tostring(stop_entry_b.reason)
+  )
+
+  -- 19c. Confirmação stale de stop em background (mudança de projeto antes de responder) não age
+  local captured_bg_stop_cb
+  local saved_pick_i7 = ui.pick_one
+  ui.pick_one = function(_, _, on_choice)
+    captured_bg_stop_cb = on_choice
+  end
+  build.stop()
+  ui.pick_one = saved_pick_i7
+  assert(type(captured_bg_stop_cb) == "function", "Stop de background de outro projeto deveria pedir confirmação")
+
+  open_file(main_7c)
+  notices = {}
+  captured_bg_stop_cb("Yes — stop the run7d-i7-alpha project background process")
+  assert(pid_alive(bg_stubborn_pid), "callback stale após troca para projeto gamma matou background de alpha!")
+  assert(has_notice("stale"), "callback stale deveria notificar")
+
+  -- 19d. Em beta: escolher No mantém vivo; escolher Yes envia SIGTERM -> SIGKILL após grace no filho resistente
+  open_file(main_7b)
+  notices = {}
+  pick_script = { "No" }
+  build.build()
+  menu_cb(entry("stop"))
+  assert(pid_alive(bg_stubborn_pid), "escolha No matou grupo em background de alpha!")
+  assert(has_notice("kept running"), "escolha No deveria informar que foi mantido")
+
+  notices = {}
+  pick_script = { "Yes" }
+  build.build()
+  menu_cb(entry("stop"))
+  assert(
+    fixtures.wait_for(5000, function()
+      return not build._is_draining() and not pid_alive(bg_stubborn_pid)
+    end),
+    "Stop confirmado de outro projeto deveria encerrar filho resistente em background via SIGKILL após grace"
+  )
+  assert(has_notice("background process was stopped"), "Stop de outro projeto deveria informar origem")
+  assert(pid_alive(ext_pid), "Stop de background matou processo externo não relacionado!")
+
+  build.build()
+  assert(entry("stop").enabled == false, "Stop deveria ficar desabilitado após encerramento do grupo em background")
+
+  -- 19e. Saída natural posterior do grupo em background faz pruning automático e nunca mata PID reutilizado/não relacionado
+  local short_bg_pid_file = root_7a .. "/short_bg.pid"
+  local short_bg_gate_file = root_7a .. "/short_bg.gate"
+  fixtures.write(root_7a .. "/mvnw", {
+    "#!/bin/sh",
+    "sleep 0.5 &",
+    "bpid=$!",
+    'printf "%s" "$bpid" > ' .. vim.fn.shellescape(short_bg_pid_file),
+    "while [ ! -f " .. vim.fn.shellescape(short_bg_gate_file) .. " ]; do sleep 0.02; done",
+    "exit 0",
+  })
+  vim.fn.system({ "chmod", "+x", root_7a .. "/mvnw" })
+  open_file(main_7a)
+  build.build()
+  menu_cb(entry("compile"))
+  assert(
+    fixtures.wait_for(5000, function()
+      return build._state.running and vim.fn.filereadable(short_bg_pid_file) == 1
+    end),
+    "build com filho curto não iniciou"
+  )
+  build.build()
+  fixtures.write(short_bg_gate_file, { "go" })
+  assert(
+    fixtures.wait_for(5000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(short_bg_pid_file) == 1
+    end),
+    "build com filho curto em background não concluiu release"
+  )
+  local short_bg_pid = tonumber(read_raw(short_bg_pid_file))
+  assert(
+    fixtures.wait_for(3000, function()
+      return not pid_alive(short_bg_pid)
+    end),
+    "filho curto deveria ter saído naturalmente"
+  )
+  notices = {}
+  build.build()
+  assert(entry("stop").enabled == false, "grupo encerrado naturalmente deveria ser removido do menu")
+  build.stop(true)
+  assert(has_notice("no Java process is running"), "stop após saída natural não deveria encontrar processo")
+
+  -- Proteção contra PID/PGID reutilizado (líder vivo com start_ticks distinto)
+  local reuse_job = vim.fn.jobstart({ "sleep", "30" })
+  assert(reuse_job > 0)
+  local reuse_pid = vim.fn.jobpid(reuse_job)
+  local reuse_info = build._read_proc_info(reuse_pid)
+  assert(
+    reuse_info and reuse_info.pgid == reuse_pid and reuse_info.start_ticks,
+    "processo de teste deveria ter PGID e start_ticks próprios"
+  )
+  table.insert(build._background_groups, {
+    seq = 999991,
+    pgid = reuse_info.pgid,
+    start_ticks = reuse_info.start_ticks - 50,
+    sid = reuse_info.sid,
+    members = { [reuse_pid] = reuse_info.start_ticks - 50 },
+    root = root_7a,
+    canon_root = run_config.canonical(root_7a),
+    kind = "compile",
+    exit_code = 0,
+    stopping = false,
+  })
+  notices = {}
+  build.stop(true)
+  assert(pid_alive(reuse_pid), "NUNCA pode matar processo com start_ticks diferente (PID reutilizado)!")
+  assert(has_notice("no Java process is running"), "entrada com PID reutilizado deveria ser descartada com segurança")
+  vim.fn.jobstop(reuse_job)
+
+  -- Proteção contra PID reutilizado quando líder já saiu deixando filho não relacionado (leader == nil, members sem correspondência)
+  local orphan_child_file = root_7a .. "/orphan_unrelated.pid"
+  local orphan_parent_file = root_7a .. "/orphan_parent.pid"
+  local orphan_job = vim.fn.jobstart({
+    "sh",
+    "-c",
+    'printf "%s" "$$" > '
+      .. vim.fn.shellescape(orphan_parent_file)
+      .. '; sleep 30 & printf "%s" "$!" > '
+      .. vim.fn.shellescape(orphan_child_file),
+  })
+  assert(orphan_job > 0)
+  assert(
+    fixtures.wait_for(5000, function()
+      return vim.fn.filereadable(orphan_parent_file) == 1 and vim.fn.filereadable(orphan_child_file) == 1
+    end),
+    "processo órfão não relacionado não gravou PIDs"
+  )
+  local unrelated_parent_pid = tonumber(read_raw(orphan_parent_file))
+  local unrelated_child_pid = tonumber(read_raw(orphan_child_file))
+  assert(
+    fixtures.wait_for(5000, function()
+      return not pid_alive(unrelated_parent_pid) and pid_alive(unrelated_child_pid)
+    end),
+    "líder órfão não saiu mantendo filho vivo"
+  )
+  table.insert(build._background_groups, {
+    seq = 999992,
+    pgid = unrelated_parent_pid,
+    start_ticks = 1,
+    sid = unrelated_parent_pid,
+    members = { [999998] = 1 },
+    root = root_7a,
+    canon_root = run_config.canonical(root_7a),
+    kind = "compile",
+    exit_code = 0,
+    stopping = false,
+  })
+  notices = {}
+  build.stop(true)
+  assert(
+    pid_alive(unrelated_child_pid),
+    "NUNCA pode matar filho remanescente quando nenhum membro rastreado corresponde!"
+  )
+  assert(has_notice("no Java process is running"))
+  vim.fn.system({ "kill", "-KILL", tostring(unrelated_child_pid) })
+
+  -- 19f. Restart no mesmo projeto para grupo sobrevivente em background (inclusive filho resistente)
+  local restart_bg_pid_file = root_7a .. "/restart_bg.pid"
+  local restart_bg_gate_file = root_7a .. "/restart_bg.gate"
+  fixtures.write(root_7a .. "/mvnw", {
+    "#!/bin/sh",
+    '(trap "" TERM; exec sleep 30) &',
+    "bpid=$!",
+    'printf "%s" "$bpid" > ' .. vim.fn.shellescape(restart_bg_pid_file),
+    "while [ ! -f " .. vim.fn.shellescape(restart_bg_gate_file) .. " ]; do sleep 0.02; done",
+    "exit 0",
+  })
+  vim.fn.system({ "chmod", "+x", root_7a .. "/mvnw" })
+
+  open_file(main_7a)
+  build.build()
+  menu_cb(entry("compile"))
+  assert(
+    fixtures.wait_for(5000, function()
+      return build._state.running and vim.fn.filereadable(restart_bg_pid_file) == 1
+    end),
+    "build inicial para teste de restart em background não iniciou"
+  )
+  build.build()
+  fixtures.write(restart_bg_gate_file, { "go" })
+  assert(
+    fixtures.wait_for(5000, function()
+      return not build._state.running and not build._is_draining() and vim.fn.filereadable(restart_bg_pid_file) == 1
+    end),
+    "build inicial para teste de restart em background não liberou"
+  )
+  local first_restart_bg_pid = tonumber(read_raw(restart_bg_pid_file))
+  assert(first_restart_bg_pid and pid_alive(first_restart_bg_pid))
+
+  -- Timeout antes do grace period cancela restart mantendo o grupo vivo sem relançar duplicata
+  build._stop_grace_ms = 5000
+  build._restart_timeout_ms = 180
+  local seq_before_cancel = build._state.seq
+  notices = {}
+  build.restart()
+  assert(
+    fixtures.wait_for(3000, function()
+      return not build._state.restarting and has_notice("did not exit in time")
+    end),
+    "restart sobre grupo em background resistente deveria cancelar no timeout"
+  )
+  assert(build._state.seq == seq_before_cancel, "restart cancelado não pode lançar novo processo")
+  assert(pid_alive(first_restart_bg_pid), "grupo em background deveria permanecer vivo após cancelamento")
+
+  -- Com grace normal, restart envia SIGKILL, espera drenagem e relança o comando do projeto
+  build._stop_grace_ms = 200
+  build._restart_timeout_ms = 5000
+  vim.fn.delete(restart_bg_pid_file)
+  vim.fn.delete(restart_bg_gate_file)
+  notices = {}
+  build.restart()
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > seq_before_cancel
+        and build._state.running
+        and vim.fn.filereadable(restart_bg_pid_file) == 1
+    end),
+    "restart em alpha não relançou após drenar grupo sobrevivente em background"
+  )
+  build.build()
+  fixtures.write(restart_bg_gate_file, { "go" })
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > seq_before_cancel
+        and not build._state.running
+        and not build._is_draining()
+        and vim.fn.filereadable(restart_bg_pid_file) == 1
+    end),
+    "restart em alpha não concluiu release após relançar"
+  )
+  local second_restart_bg_pid = tonumber(read_raw(restart_bg_pid_file))
+  assert(not pid_alive(first_restart_bg_pid), "primeiro filho resistente sobreviveu ao Restart!")
+  assert(second_restart_bg_pid and second_restart_bg_pid ~= first_restart_bg_pid and pid_alive(second_restart_bg_pid))
+
+  build.stop(true)
+  assert(
+    fixtures.wait_for(5000, function()
+      return not build._state.running and not build._is_draining() and not pid_alive(second_restart_bg_pid)
+    end),
+    "stop final do grupo relançado não concluiu"
+  )
+  assert(pid_alive(ext_pid), "processo externo foi afetado durante os testes de ciclo de vida!")
+  vim.fn.jobstop(ext_job)
+
+  build._background_grace_ms = orig_bg_grace
+  build._stop_grace_ms = orig_stop_grace
+  build._restart_timeout_ms = orig_restart_timeout
+
+  -- Unverified PGIDs/PIDs are never accepted as process identity.
+  assert(not build._group_alive(reuse_info.pgid, nil), "PGID without a captured start time must fail closed")
+  assert(
+    not build._group_alive(reuse_info.pgid, nil, { [reuse_pid] = reuse_info.start_ticks }),
+    "PGID without leader start time must fail closed even with a member table"
+  )
+  local unverified_kill_job = vim.fn.jobstart({ "sleep", "30" })
+  local unverified_kill_pid = vim.fn.jobpid(unverified_kill_job)
+  local saved_proc_reader = build._read_proc_info
+  build._read_proc_info = function(p)
+    if p == unverified_kill_pid then
+      return { pid = p, ppid = vim.uv.os_getpid(), pgid = p, sid = nil, start_ticks = nil }
+    end
+    return saved_proc_reader(p)
+  end
+  local no_ticks_pgid, _, no_ticks_reason = build._verify_own_pgid(unverified_kill_pid)
+  assert(
+    no_ticks_pgid == nil and type(no_ticks_reason) == "string" and no_ticks_reason:find("start time", 1, true),
+    "verify_own_pgid must fail closed when /proc start time is unavailable: " .. tostring(no_ticks_reason)
+  )
+  build._read_proc_info = function()
+    return nil
+  end
+  build._kill_tree(unverified_kill_pid, "KILL", nil)
+  build._read_proc_info = saved_proc_reader
+  assert(pid_alive(unverified_kill_pid), "PID fallback must not signal when /proc identity is unavailable")
+  vim.fn.jobstop(unverified_kill_job)
+
+  -- A background confirmation captures the exact set; a later group for that
+  -- project is not added to the confirmed stop. Per-group timers also survive
+  -- pruning one group while another target is still draining.
+  local function add_test_background(root)
+    local job = vim.fn.jobstart({ "sh", "-c", 'trap "" TERM; exec sleep 30' })
+    assert(job > 0)
+    local pid = vim.fn.jobpid(job)
+    local info = build._read_proc_info(pid)
+    assert(info and info.pgid == pid and info.start_ticks, "test background group needs verifiable identity")
+    local bg = {
+      seq = 999900 + #build._background_groups,
+      pgid = info.pgid,
+      start_ticks = info.start_ticks,
+      sid = info.sid,
+      members = { [pid] = info.start_ticks },
+      root = root,
+      canon_root = run_config.canonical(root),
+      kind = "compile",
+      stopping = false,
+    }
+    build._background_groups[#build._background_groups + 1] = bg
+    return job, pid, bg
+  end
+  local first_job, first_pid = add_test_background(root_7a)
+  local second_job, second_pid = add_test_background(root_7a)
+  open_file(main_7b)
+  local captured_stop
+  local saved_pick = ui.pick_one
+  ui.pick_one = function(_, _, callback)
+    captured_stop = callback
+  end
+  build.stop()
+  ui.pick_one = saved_pick
+  assert(type(captured_stop) == "function", "cross-project background stop should request confirmation")
+  local late_job, late_pid = add_test_background(root_7a)
+  captured_stop("Yes — stop the i7-alpha project background process")
+  assert(pid_alive(late_pid), "confirmation must not expand to groups added after the prompt")
+  -- Remove one tracked member while the other group is still draining. Its
+  -- timer must not be the sole timer shared by the remaining group.
+  vim.uv.kill(first_pid, "sigkill")
+  assert(
+    fixtures.wait_for(5000, function()
+      return not pid_alive(first_pid) and not pid_alive(second_pid)
+    end),
+    "pruning one background group must not cancel the other group's drain timer"
+  )
+  assert(pid_alive(late_pid), "late background group was incorrectly included in confirmed stop")
+  vim.uv.kill(late_pid, "sigkill")
+  vim.fn.jobstop(first_job)
+  vim.fn.jobstop(second_job)
+  vim.fn.jobstop(late_job)
+
+  -- If one captured background group exits before confirmation, the remaining
+  -- captured group still stops, while any late group stays untouched.
+  local partial_a_job, partial_a_pid = add_test_background(root_7a)
+  local partial_b_job, partial_b_pid = add_test_background(root_7a)
+  open_file(main_7b)
+  local captured_partial_stop
+  saved_pick = ui.pick_one
+  ui.pick_one = function(_, _, callback)
+    captured_partial_stop = callback
+  end
+  build.stop()
+  ui.pick_one = saved_pick
+  assert(type(captured_partial_stop) == "function")
+  local late_partial_job, late_partial_pid = add_test_background(root_7a)
+  vim.uv.kill(partial_a_pid, "sigkill")
+  assert(
+    fixtures.wait_for(3000, function()
+      return not pid_alive(partial_a_pid)
+    end),
+    "first captured group should exit before confirmation"
+  )
+  captured_partial_stop("Yes — stop the i7-alpha project background process")
+  assert(
+    fixtures.wait_for(5000, function()
+      return not pid_alive(partial_b_pid)
+    end),
+    "remaining captured group must still stop after sibling exited"
+  )
+  assert(pid_alive(late_partial_pid), "late group must not be stopped after partial sibling exit")
+  vim.uv.kill(late_partial_pid, "sigkill")
+  vim.fn.jobstop(partial_a_job)
+  vim.fn.jobstop(partial_b_job)
+  vim.fn.jobstop(late_partial_job)
+
+  -- Pruning a draining background group via _is_draining() before the timer
+  -- ticks must not cancel the monitor and deadlock restart launch.
+  local prune_bg_job, prune_bg_pid = add_test_background(root_7b)
+  open_file(main_7b)
+  local prune_restart_seq = build._state.seq
+  build.restart()
+  assert(build._state.restarting, "restart should enter draining state for background group")
+  vim.uv.kill(prune_bg_pid, "sigkill")
+  assert(
+    fixtures.wait_for(2000, function()
+      return not pid_alive(prune_bg_pid)
+    end),
+    "draining background group did not exit"
+  )
+  local _ = build._is_draining()
+  assert(
+    fixtures.wait_for(5000, function()
+      return build._state.seq > prune_restart_seq and not build._state.running and not build._state.restarting
+    end),
+    "pruning draining group before timer tick must not deadlock restart launch"
+  )
+  vim.fn.jobstop(prune_bg_job)
+
+  -- A confirmed restart from alpha into beta must also drain beta's existing
+  -- background groups before launching beta's remembered command.
+  local dest_job, dest_pid = add_test_background(root_7b)
+  fixtures.write(root_7a .. "/mvnw", { "#!/bin/sh", "exec sleep 30" })
+  vim.fn.system({ "chmod", "+x", root_7a .. "/mvnw" })
+  open_file(main_7a)
+  build.build()
+  menu_cb(entry("compile"))
+  assert(
+    fixtures.wait_for(5000, function()
+      return build._state.running and build._state.root == root_7a
+    end),
+    "foreground process for cross-project restart did not start"
+  )
+  local restart_seq = build._state.seq
+  open_file(main_7b)
+  local captured_restart
+  saved_pick = ui.pick_one
+  ui.pick_one = function(_, _, callback)
+    captured_restart = callback
+  end
+  build.restart()
+  ui.pick_one = saved_pick
+  assert(type(captured_restart) == "function", "cross-project restart should request confirmation")
+  captured_restart("Yes — stop the i7-alpha project process and restart")
+  assert(
+    fixtures.wait_for(10000, function()
+      return build._state.seq > restart_seq
+        and not build._state.running
+        and build._state.root == root_7b
+        and not pid_alive(dest_pid)
+    end),
+    "cross-project restart must drain destination groups before relaunching beta"
+  )
+  vim.fn.jobstop(dest_job)
+
+  -- Regression (1): finish() must refresh via refresh_verified_members with
+  -- previous members and retain old identities when there is no intersection,
+  -- never signaling an uncertain group.
+  do
+    build._background_grace_ms = 80
+    build._stop_grace_ms = 80
+    build._restart_timeout_ms = 240
+
+    local dis_parent_file = root_7a .. "/finish_disjoint_parent.pid"
+    local dis_child_file = root_7a .. "/finish_disjoint_child.pid"
+    local dis_job = vim.fn.jobstart({
+      "sh",
+      "-c",
+      'printf "%s" "$$" > '
+        .. vim.fn.shellescape(dis_parent_file)
+        .. '; (trap "" TERM; exec sleep 30) & printf "%s" "$!" > '
+        .. vim.fn.shellescape(dis_child_file),
+    })
+    assert(dis_job > 0)
+    assert(
+      fixtures.wait_for(5000, function()
+        return vim.fn.filereadable(dis_parent_file) == 1 and vim.fn.filereadable(dis_child_file) == 1
+      end),
+      "disjoint finish test failed to write pid files"
+    )
+    local dis_leader_pid = tonumber(read_raw(dis_parent_file))
+    local dis_child_pid = tonumber(read_raw(dis_child_file))
+    assert(
+      fixtures.wait_for(5000, function()
+        return not pid_alive(dis_leader_pid) and pid_alive(dis_child_pid)
+      end),
+      "disjoint finish leader did not exit while child stayed alive"
+    )
+    local child_info = build._read_proc_info(dis_child_pid)
+    assert(
+      child_info and child_info.pgid == dis_leader_pid and type(child_info.start_ticks) == "number",
+      "disjoint finish child must share exited leader PGID"
+    )
+    local stale_leader_ticks = math.max(1, child_info.start_ticks - 1)
+    local orig_uv_kill = vim.uv.kill
+    local signaled = {}
+    vim.uv.kill = function(target, sig)
+      if sig ~= 0 and (target == -dis_leader_pid or target == dis_child_pid or target == dis_leader_pid) then
+        signaled[#signaled + 1] = { target = target, sig = sig }
+      end
+      return orig_uv_kill(target, sig)
+    end
+
+    local finish_buf = vim.api.nvim_create_buf(false, true)
+    local finish_seq = build._state.seq + 1
+    build._state.seq = finish_seq
+    build._state.running = true
+    build._state.stopping = false
+    build._state.restarting = false
+    build._state.buf = finish_buf
+    build._state.root = root_7a
+    build._state.kind = "compile"
+    build._state.pgid = dis_leader_pid
+    build._state.pgid_start_ticks = stale_leader_ticks
+    build._state.pgid_sid = child_info.sid
+    build._state.pgid_members = { [dis_leader_pid] = stale_leader_ticks }
+    build._reset_streams()
+
+    build._finish(finish_seq, 0, {})
+    assert(build._state.pgid_uncertain == true, "finish() must classify disjoint PGID as uncertain")
+    assert(
+      build._state.pgid_members
+        and build._state.pgid_members[dis_leader_pid] == stale_leader_ticks
+        and build._state.pgid_members[dis_child_pid] == nil,
+      "finish() must retain old verified identities when snapshot has no intersection"
+    )
+    assert(
+      fixtures.wait_for(2000, function()
+        return not build._is_draining()
+      end),
+      "uncertain disjoint group did not release from foreground drain monitor"
+    )
+    assert(pid_alive(dis_child_pid), "uncertain disjoint group must not be signaled on background release")
+    assert(#signaled == 0, "finish() / drain monitor signaled an uncertain group: " .. vim.inspect(signaled))
+    local recorded_bg = nil
+    for _, bg in ipairs(build._background_groups) do
+      if bg.seq == finish_seq and bg.pgid == dis_leader_pid then
+        recorded_bg = bg
+        break
+      end
+    end
+    assert(recorded_bg and recorded_bg.uncertain == true, "recorded background group must remain uncertain")
+    assert(
+      recorded_bg.members
+        and recorded_bg.members[dis_leader_pid] == stale_leader_ticks
+        and recorded_bg.members[dis_child_pid] == nil,
+      "recorded background group must retain old verified identities"
+    )
+    build.stop(true)
+    assert(pid_alive(dis_child_pid), "stop() must not signal uncertain background group")
+    assert(#signaled == 0, "stop() signaled uncertain background group")
+
+    -- Also verify finish() when stopping=true never replaces members or signals uncertain group.
+    for i = #build._background_groups, 1, -1 do
+      if build._background_groups[i].seq == finish_seq then
+        table.remove(build._background_groups, i)
+      end
+    end
+    local finish_stop_seq = build._state.seq + 1
+    build._state.seq = finish_stop_seq
+    build._state.running = true
+    build._state.stopping = true
+    build._state.restarting = true
+    build._state.buf = finish_buf
+    build._state.root = root_7a
+    build._state.kind = "compile"
+    build._state.pgid = dis_leader_pid
+    build._state.pgid_start_ticks = stale_leader_ticks
+    build._state.pgid_sid = child_info.sid
+    build._state.pgid_members = { [dis_leader_pid] = stale_leader_ticks }
+    build._reset_streams()
+    notices = {}
+    build._finish(finish_stop_seq, 0, {})
+    assert(build._state.pgid_uncertain == true)
+    assert(
+      build._state.pgid_members
+        and build._state.pgid_members[dis_leader_pid] == stale_leader_ticks
+        and build._state.pgid_members[dis_child_pid] == nil,
+      "stopping finish() must retain old verified identities"
+    )
+    assert(
+      fixtures.wait_for(2000, function()
+        return not build._state.restarting
+          and build._state.drain_timer == nil
+          and has_notice("identity became uncertain while stopping")
+      end),
+      "stopping drain monitor for uncertain group did not settle at timeout"
+    )
+    assert(pid_alive(dis_child_pid), "stopping drain monitor must not signal uncertain group")
+    assert(#signaled == 0, "stopping drain monitor signaled uncertain group: " .. vim.inspect(signaled))
+
+    vim.uv.kill = orig_uv_kill
+    vim.uv.kill(dis_child_pid, "sigkill")
+    assert(
+      fixtures.wait_for(2000, function()
+        return not pid_alive(dis_child_pid) and not build._is_draining()
+      end),
+      "draining state did not clear after manual kill of uncertain group"
+    )
+    vim.fn.jobstop(dis_job)
+    pcall(vim.api.nvim_buf_delete, finish_buf, { force = true })
+  end
+
+  -- Regression (2a): foreground start_drain_monitor must not mark sigkill_sent
+  -- while uncertain, and must send SIGKILL if identity recovers before timeout.
+  do
+    build._stop_grace_ms = 120
+    build._restart_timeout_ms = 2000
+    fixtures.write(root_7a .. "/mvnw", { "#!/bin/sh", 'trap "" TERM', "exec sleep 30" })
+    vim.fn.system({ "chmod", "+x", root_7a .. "/mvnw" })
+    open_file(main_7a)
+    build.build()
+    menu_cb(entry("compile"))
+    assert(
+      fixtures.wait_for(5000, function()
+        return build._state.running and build._state.pgid ~= nil
+      end),
+      "stubborn foreground process for uncertain recovery test did not start"
+    )
+    local fg_pid = build._state.pid
+    local fg_pgid = build._state.pgid
+    local orig_proc_reader = build._read_proc_info
+    local orig_uv_kill = vim.uv.kill
+    local fg_obscured = false
+    local fg_sigkills = 0
+    build._read_proc_info = function(p)
+      if fg_obscured and p == fg_pid then
+        return nil
+      end
+      return orig_proc_reader(p)
+    end
+    vim.uv.kill = function(target, sig)
+      if target == -fg_pgid and sig == "sigkill" then
+        fg_sigkills = fg_sigkills + 1
+      end
+      return orig_uv_kill(target, sig)
+    end
+
+    build.stop(true)
+    fg_obscured = true
+    assert(
+      fixtures.wait_for(1000, function()
+        return build._state.pgid_uncertain == true
+      end),
+      "foreground drain monitor did not enter uncertain state"
+    )
+    vim.wait(220, function()
+      return false
+    end)
+    assert(fg_sigkills == 0, "foreground monitor marked/sent SIGKILL while status was uncertain")
+    assert(pid_alive(fg_pid), "foreground process should still be alive while identity is uncertain")
+
+    fg_obscured = false
+    assert(
+      fixtures.wait_for(2000, function()
+        return not build._state.running and not build._is_draining() and not pid_alive(fg_pid)
+      end),
+      "foreground monitor must re-evaluate and send SIGKILL when identity recovers before timeout"
+    )
+    assert(fg_sigkills == 1, "expected exactly 1 SIGKILL after foreground identity recovery, got " .. fg_sigkills)
+    assert(build._state.pgid_uncertain == false, "pgid_uncertain should clear after exit")
+
+    build._read_proc_info = orig_proc_reader
+    vim.uv.kill = orig_uv_kill
+  end
+
+  -- Regression (2b): multi-group start_bg_drain_monitor tracks sigkill_sent per
+  -- target only after a verifiable attempt and re-evaluates recovering targets.
+  do
+    build._stop_grace_ms = 120
+    build._restart_timeout_ms = 2000
+    local bg1_job, bg1_pid, bg1 = add_test_background(root_7a)
+    local bg2_job, bg2_pid, bg2 = add_test_background(root_7a)
+    local orig_proc_reader = build._read_proc_info
+    local orig_uv_kill = vim.uv.kill
+    local bg2_obscured = false
+    local sigkill_counts = {}
+    build._read_proc_info = function(p)
+      if bg2_obscured and p == bg2_pid then
+        return nil
+      end
+      return orig_proc_reader(p)
+    end
+    vim.uv.kill = function(target, sig)
+      if sig == "sigkill" then
+        sigkill_counts[target] = (sigkill_counts[target] or 0) + 1
+      end
+      return orig_uv_kill(target, sig)
+    end
+
+    open_file(main_7a)
+    notices = {}
+    build.stop(true)
+    bg2_obscured = true
+    assert(
+      fixtures.wait_for(2000, function()
+        return not pid_alive(bg1_pid) and bg2.uncertain == true
+      end),
+      "verifiable sibling bg1 should exit via SIGKILL while bg2 becomes uncertain"
+    )
+    vim.wait(220, function()
+      return false
+    end)
+    assert(sigkill_counts[-bg1.pgid] == 1, "verifiable target bg1 should receive exactly 1 SIGKILL")
+    assert((sigkill_counts[-bg2.pgid] or 0) == 0, "uncertain target bg2 must not receive SIGKILL")
+    assert(pid_alive(bg2_pid), "uncertain target bg2 must remain alive while identity is unverified")
+
+    bg2_obscured = false
+    assert(
+      fixtures.wait_for(2000, function()
+        return not build._is_draining() and not pid_alive(bg2_pid)
+      end),
+      "bg drain monitor must re-evaluate and SIGKILL bg2 once identity recovers before timeout"
+    )
+    assert(sigkill_counts[-bg1.pgid] == 1, "already-signaled target bg1 must not be re-signaled")
+    assert(sigkill_counts[-bg2.pgid] == 1, "recovered target bg2 should receive exactly 1 SIGKILL")
+    assert(not has_notice("automatic SIGKILL skipped"), "recovered target should not report skipped SIGKILL")
+
+    build._read_proc_info = orig_proc_reader
+    vim.uv.kill = orig_uv_kill
+    vim.fn.jobstop(bg1_job)
+    vim.fn.jobstop(bg2_job)
+  end
+
+  -- Regression (3a): monitor A (uncertain, ignored by first_stopping_bg) finishing
+  -- before restart B's monitor must not steal/launch restart B prematurely or
+  -- clear restart B's state while B's target is still draining.
+  do
+    build._stop_grace_ms = 5000
+    build._restart_timeout_ms = 5000
+    local bg_a_job, bg_a_pid, bg_a = add_test_background(root_7a)
+    local bg_b_job, bg_b_pid, bg_b = add_test_background(root_7b)
+    local orig_proc_reader = build._read_proc_info
+    local bg_a_obscured = false
+    build._read_proc_info = function(p)
+      if bg_a_obscured and p == bg_a_pid then
+        return nil
+      end
+      return orig_proc_reader(p)
+    end
+
+    open_file(main_7a)
+    build.stop(true)
+    bg_a_obscured = true
+    assert(
+      fixtures.wait_for(2000, function()
+        return bg_a.uncertain == true and bg_a.drain_monitor ~= nil
+      end),
+      "monitor A did not enter uncertain state"
+    )
+    assert(not build._is_draining(), "first_stopping_bg should ignore uncertain monitor A")
+    assert(not build._state.restarting, "stop on monitor A should not set restarting")
+
+    open_file(main_7b)
+    local seq_before = build._state.seq
+    build.restart()
+    assert(build._state.restarting, "restart B should enter restarting state")
+    assert(bg_b.drain_monitor ~= nil, "restart B should start independent monitor B")
+
+    -- Finish monitor A before monitor B while bg_b is still alive.
+    bg_a_obscured = false
+    vim.uv.kill(bg_a_pid, "sigkill")
+    assert(
+      fixtures.wait_for(2000, function()
+        return not pid_alive(bg_a_pid) and bg_a.drain_monitor == nil
+      end),
+      "monitor A did not finish after bg_a exit"
+    )
+    vim.wait(120, function()
+      return false
+    end)
+    assert(build._state.restarting, "monitor A exit must not clear restart B's restarting state")
+    assert(build._state.seq == seq_before, "monitor A exit must not prematurely launch restart B")
+    assert(pid_alive(bg_b_pid) and bg_b.drain_monitor ~= nil, "monitor B must remain active for bg_b")
+
+    vim.uv.kill(bg_b_pid, "sigkill")
+    assert(
+      fixtures.wait_for(5000, function()
+        return build._state.seq > seq_before
+          and not build._state.running
+          and not build._state.restarting
+          and build._state.root == root_7b
+      end),
+      "restart B did not launch after bg_b exited"
+    )
+
+    build._read_proc_info = orig_proc_reader
+    vim.fn.jobstop(bg_a_job)
+    vim.fn.jobstop(bg_b_job)
+  end
+
+  -- Regression (3b): monitor A (uncertain, ignored by first_stopping_bg) timing out
+  -- before restart B's monitor must not cancel restart B or emit restart cancelled.
+  do
+    build._stop_grace_ms = 5000
+    build._restart_timeout_ms = 450
+    local bg_a_job, bg_a_pid, bg_a = add_test_background(root_7a)
+    local bg_b_job, bg_b_pid, bg_b = add_test_background(root_7b)
+    local orig_proc_reader = build._read_proc_info
+    local bg_a_obscured = false
+    build._read_proc_info = function(p)
+      if bg_a_obscured and p == bg_a_pid then
+        return nil
+      end
+      return orig_proc_reader(p)
+    end
+
+    open_file(main_7a)
+    build.stop(true)
+    bg_a_obscured = true
+    assert(
+      fixtures.wait_for(2000, function()
+        return bg_a.uncertain == true and bg_a.drain_monitor ~= nil
+      end),
+      "monitor A did not enter uncertain state before timeout test"
+    )
+    -- Give monitor A a deterministic head start so it expires before monitor B.
+    vim.wait(220, function()
+      return false
+    end)
+
+    open_file(main_7b)
+    notices = {}
+    local seq_before = build._state.seq
+    build.restart()
+    assert(build._state.restarting, "restart B should be active while monitor A is pending")
+    assert(bg_b.drain_monitor ~= nil, "restart B should have its own monitor B")
+
+    assert(
+      fixtures.wait_for(2000, function()
+        return not bg_a.stopping and bg_a.drain_monitor == nil
+      end),
+      "monitor A did not time out as expected"
+    )
+    build._restart_timeout_ms = 5000
+    assert(build._state.restarting, "monitor A timeout must not cancel restart B")
+    assert(build._state.seq == seq_before, "monitor A timeout must not alter restart B seq")
+    assert(not has_notice("restart cancelled"), "non-restart monitor A timeout must not notify restart cancelled")
+    assert(has_notice("automatic SIGKILL skipped"), "monitor A timeout should report skipped SIGKILL")
+    assert(pid_alive(bg_b_pid) and bg_b.drain_monitor ~= nil, "monitor B must stay active after monitor A timeout")
+
+    vim.uv.kill(bg_b_pid, "sigkill")
+    assert(
+      fixtures.wait_for(5000, function()
+        return build._state.seq > seq_before
+          and not build._state.running
+          and not build._state.restarting
+          and build._state.root == root_7b
+      end),
+      "restart B must still complete after monitor A timed out"
+    )
+
+    bg_a_obscured = false
+    build._read_proc_info = orig_proc_reader
+    vim.uv.kill(bg_a_pid, "sigkill")
+    assert(
+      fixtures.wait_for(2000, function()
+        return not pid_alive(bg_a_pid) and not build._is_draining()
+      end),
+      "cleanup of bg_a failed after timeout test"
+    )
+    vim.fn.jobstop(bg_a_job)
+    vim.fn.jobstop(bg_b_job)
+  end
+
+  -- Regression (3c): an obsolete restart monitor (cancelled by a subsequent stop
+  -- on another group) finishing before a newer restart B must neither invoke its
+  -- stale callback nor launch/clear restart B prematurely.
+  do
+    build._stop_grace_ms = 5000
+    build._restart_timeout_ms = 5000
+    local stale_flag = root_7a .. "/stale_restart_a.flag"
+    vim.fn.delete(stale_flag)
+    fixtures.write(root_7a .. "/mvnw", {
+      "#!/bin/sh",
+      "printf '1' > " .. vim.fn.shellescape(stale_flag),
+      "exit 0",
+    })
+    vim.fn.system({ "chmod", "+x", root_7a .. "/mvnw" })
+    open_file(main_7a)
+    build.build()
+    menu_cb(entry("compile"))
+    assert(
+      fixtures.wait_for(5000, function()
+        return vim.fn.filereadable(stale_flag) == 1 and not build._state.running
+      end),
+      "failed to record alpha command for obsolete restart test"
+    )
+    vim.fn.delete(stale_flag)
+
+    local bg_a_job, bg_a_pid, bg_a = add_test_background(root_7a)
+    local orig_proc_reader = build._read_proc_info
+    local bg_a_obscured = false
+    build._read_proc_info = function(p)
+      if bg_a_obscured and p == bg_a_pid then
+        return nil
+      end
+      return orig_proc_reader(p)
+    end
+
+    open_file(main_7a)
+    build.restart()
+    assert(build._state.restarting and bg_a.drain_monitor ~= nil, "restart A should start monitor A")
+    bg_a_obscured = true
+    assert(
+      fixtures.wait_for(2000, function()
+        return bg_a.uncertain == true
+      end),
+      "monitor A did not become uncertain"
+    )
+
+    -- Cancel restart A by stopping an unrelated background group on beta, leaving
+    -- monitor A running with an obsolete restart operation.
+    local bg_c_job, bg_c_pid = add_test_background(root_7b)
+    open_file(main_7b)
+    build.stop(true)
+    assert(not build._state.restarting, "stop on beta should cancel pending restart A")
+    vim.uv.kill(bg_c_pid, "sigkill")
+    assert(
+      fixtures.wait_for(2000, function()
+        return not pid_alive(bg_c_pid) and not build._is_draining()
+      end),
+      "bg_c stop did not finish"
+    )
+
+    local bg_b_job, bg_b_pid, bg_b = add_test_background(root_7b)
+    local seq_before = build._state.seq
+    build.restart()
+    assert(build._state.restarting and bg_b.drain_monitor ~= nil, "restart B should start monitor B")
+
+    -- Finish obsolete monitor A while monitor B is still draining bg_b.
+    bg_a_obscured = false
+    vim.uv.kill(bg_a_pid, "sigkill")
+    assert(
+      fixtures.wait_for(2000, function()
+        return not pid_alive(bg_a_pid) and bg_a.drain_monitor == nil
+      end),
+      "obsolete monitor A did not finish"
+    )
+    vim.wait(120, function()
+      return false
+    end)
+    assert(vim.fn.filereadable(stale_flag) == 0, "obsolete monitor A must not invoke stale restart A callback")
+    assert(build._state.restarting, "obsolete monitor A must not clear restart B")
+    assert(build._state.seq == seq_before, "obsolete monitor A must not prematurely launch restart B")
+    assert(pid_alive(bg_b_pid) and bg_b.drain_monitor ~= nil, "monitor B must remain active")
+
+    vim.uv.kill(bg_b_pid, "sigkill")
+    assert(
+      fixtures.wait_for(5000, function()
+        return build._state.seq > seq_before
+          and not build._state.running
+          and not build._state.restarting
+          and build._state.root == root_7b
+      end),
+      "restart B did not complete after bg_b exited"
+    )
+    assert(vim.fn.filereadable(stale_flag) == 0, "stale restart A callback must never execute")
+
+    build._read_proc_info = orig_proc_reader
+    vim.fn.jobstop(bg_a_job)
+    vim.fn.jobstop(bg_b_job)
+    vim.fn.jobstop(bg_c_job)
+  end
+
+  build._background_grace_ms = orig_bg_grace
+  build._stop_grace_ms = orig_stop_grace
+  build._restart_timeout_ms = orig_restart_timeout
+end
+
+-- A callback queued by an old timer must not close its replacement.
+do
+  local original_new_timer = vim.uv.new_timer
+  local original_schedule_wrap = vim.schedule_wrap
+  local timers = {}
+  vim.uv.new_timer = function()
+    local timer = { closed = false }
+    function timer:start(_, _, callback)
+      self.callback = callback
+    end
+    function timer:stop() end
+    function timer:close()
+      self.closed = true
+    end
+    timers[#timers + 1] = timer
+    return timer
+  end
+  vim.schedule_wrap = function(callback)
+    return callback
+  end
+  local seq = build._state.seq
+  build._start_drain_monitor(seq, nil, nil, {})
+  build._start_drain_monitor(seq, nil, nil, {})
+  assert(timers[1].closed, "old drain timer should be closed")
+  timers[1].callback()
+  assert(build._state.drain_timer == timers[2] and not timers[2].closed, "stale callback closed the new timer")
+  timers[2].callback()
+  assert(timers[2].closed, "current drain timer did not finish")
+  vim.uv.new_timer = original_new_timer
+  vim.schedule_wrap = original_schedule_wrap
 end
 
 -- Limpeza e restauração

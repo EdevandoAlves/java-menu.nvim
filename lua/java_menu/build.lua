@@ -22,9 +22,14 @@ local LIFECYCLE = {
 local state = {
   job = nil,
   pid = nil,
+  pid_start_ticks = nil,
   pgid = nil,
   pgid_start_ticks = nil,
+  pgid_sid = nil,
+  pgid_members = nil,
   pgid_reason = nil,
+  pgid_uncertain = false,
+  pgid_uncertain_reason = nil,
   draining_pgid = nil,
   draining_start_ticks = nil,
   drain_timer = nil,
@@ -41,8 +46,14 @@ local state = {
   redactions = {},
   after_exit = nil,
   restarting = false,
+  restart_op = nil,
   stopping = false,
 }
+
+---Tracked surviving process groups released from the foreground build lock
+---after ordinary leader exit, keyed in order of release so they can still be
+---safely stopped without blocking future builds or risking PID reuse.
+local background_groups = {}
 
 M._stop_grace_ms = 1000
 M._restart_timeout_ms = 5000
@@ -610,10 +621,19 @@ local function read_proc_info(pid)
       local rest = data:match("^%d+%s+%(.*%)%s+(.+)$")
       if rest then
         local fields = vim.split(vim.trim(rest), "%s+")
+        local ppid = tonumber(fields[2])
         local pgid = tonumber(fields[3])
+        local sid = tonumber(fields[4])
         local start_ticks = tonumber(fields[20])
         if pgid then
-          return { pgid = pgid, start_ticks = start_ticks, state = fields[1] }
+          return {
+            pid = pid,
+            ppid = ppid,
+            pgid = pgid,
+            sid = sid,
+            start_ticks = start_ticks,
+            state = fields[1],
+          }
         end
       end
     end
@@ -622,7 +642,7 @@ local function read_proc_info(pid)
   if ok and type(out) == "table" and out[1] then
     local pgid = tonumber(vim.trim(out[1]))
     if pgid then
-      return { pgid = pgid, start_ticks = nil, state = nil }
+      return { pid = pid, ppid = nil, pgid = pgid, sid = nil, start_ticks = nil, state = nil }
     end
   end
   return nil
@@ -632,11 +652,11 @@ local function verify_own_pgid(pid)
   if type(pid) ~= "number" or pid <= 1 then
     return nil, nil, "invalid process PID"
   end
-  local my = read_proc_info(vim.uv.os_getpid())
+  local my = M._read_proc_info(vim.uv.os_getpid())
   if not my then
     return nil, nil, "could not read editor process group"
   end
-  local info = read_proc_info(pid)
+  local info = M._read_proc_info(pid)
   if not info then
     return nil, nil, "could not read child process group (/proc and ps unavailable)"
   end
@@ -646,54 +666,418 @@ local function verify_own_pgid(pid)
   if info.pgid ~= pid then
     return nil, nil, ("child pgid (%d) differs from pid (%d)"):format(info.pgid, pid)
   end
+  if type(info.start_ticks) ~= "number" then
+    return nil, nil, "could not verify child process group identity (/proc start time unavailable)"
+  end
   return info.pgid, info.start_ticks, nil
 end
 
-local function group_alive(pgid, leader_start_ticks)
-  if type(pgid) ~= "number" or pgid <= 1 then
-    return false
+local function snapshot_group_members(pgid, min_start_ticks, expected_sid)
+  if type(pgid) ~= "number" or pgid <= 1 or type(min_start_ticks) ~= "number" then
+    return nil
   end
-  local my = read_proc_info(vim.uv.os_getpid())
-  if my and my.pgid == pgid then
-    return false
+  local dir = vim.uv.fs_scandir("/proc")
+  if not dir then
+    return nil
   end
-  -- If the leader PID now belongs to a different start time, the original
-  -- process group already exited and the OS recycled the PID.
-  local leader = read_proc_info(pgid)
-  if leader and leader_start_ticks and leader.start_ticks and leader.start_ticks ~= leader_start_ticks then
-    return false
+  local my_pid = vim.uv.os_getpid()
+  local members = {}
+  while true do
+    local name, kind = vim.uv.fs_scandir_next(dir)
+    if not name then
+      break
+    end
+    if (kind == "directory" or kind == nil) and name:match("^%d+$") then
+      local pid = tonumber(name)
+      if pid and pid > 1 and pid ~= my_pid then
+        local info = M._read_proc_info(pid)
+        if info and info.pgid == pgid and type(info.start_ticks) == "number" then
+          local ticks_ok = info.start_ticks >= min_start_ticks
+          local sid_ok = type(expected_sid) ~= "number" or (type(info.sid) == "number" and info.sid == expected_sid)
+          if ticks_ok and sid_ok then
+            members[pid] = info.start_ticks
+          end
+        end
+      end
+    end
   end
+  return members
+end
+
+local function pgid_exists(pgid)
   if type(vim.uv.kill) == "function" then
-    local ok, _, code = vim.uv.kill(-pgid, 0)
-    return ok == 0 or (not ok and code ~= "ESRCH")
+    local ok, _, err_code = vim.uv.kill(-pgid, 0)
+    return ok == 0 or err_code == "EPERM"
   end
   vim.fn.system({ "kill", "-0", "-" .. tostring(pgid) })
   return vim.v.shell_error == 0
 end
 
-local function signal_group(pgid, leader_start_ticks, sig)
-  if not group_alive(pgid, leader_start_ticks) then
+---Verify continuity before accepting a refreshed `/proc` snapshot: at least
+---one previously verified `(pid, start_ticks)` identity (the original leader or
+---a tracked member) must still be present in the new snapshot.
+---
+---Limitations:
+---  1. Polling gap: because `/proc` is sampled on lifecycle transitions and
+---     menu/drain polls rather than kernel process-event streams, if every
+---     verified member spawns a child in the same PGID and exits before the
+---     next poll, continuity is permanently lost and the group becomes
+---     `"uncertain"` until that PGID exits.
+---  2. Fail-closed safety: `"uncertain"` groups are never refreshed from `/proc`
+---     and never signaled (to avoid killing unrelated processes after PID/PGID
+---     reuse), and `M.restart()` blocks until the PGID exits or is manually
+---     stopped.
+---  3. Non-atomic POSIX `kill(2)`: a process can exit and its PGID be reused in
+---     the microsecond between checking `/proc` and calling `kill(-pgid, sig)`.
+---  4. Platforms without `/proc`: `ps` fallback lacks `start_ticks`, so PGID
+---     verification fails closed and live PGIDs cannot be proven `"alive"`.
+---@param pgid number
+---@param start_ticks number
+---@param sid number|nil
+---@param prev_members table<number, number>|nil
+---@return table<number, number>|nil
+local function refresh_verified_members(pgid, start_ticks, sid, prev_members)
+  local latest = snapshot_group_members(pgid, start_ticks, sid)
+  if not latest or next(latest) == nil then
+    return nil
+  end
+  if type(start_ticks) == "number" and latest[pgid] == start_ticks then
+    return latest
+  end
+  if type(prev_members) == "table" then
+    for mpid, mticks in pairs(prev_members) do
+      if type(mticks) == "number" and latest[mpid] == mticks then
+        return latest
+      end
+    end
+  end
+  return nil
+end
+
+---Classify a tracked process group as `"alive"`, `"uncertain"`, or `"exited"`.
+---Differentiates an unverified live PGID (`"uncertain"`) from a confirmed exit
+---(`"exited"`): never signals `"uncertain"` groups and never prunes them as
+---exited while processes remain in that PGID.
+---@param pgid number|nil
+---@param leader_start_ticks number|nil
+---@param members table<number, number>|nil
+---@return "alive"|"uncertain"|"exited", string|nil
+local function group_status(pgid, leader_start_ticks, members)
+  if type(pgid) ~= "number" or pgid <= 1 or type(leader_start_ticks) ~= "number" then
+    return "exited", "missing verified process group identity"
+  end
+  local my = M._read_proc_info(vim.uv.os_getpid())
+  if my and my.pgid == pgid then
+    return "exited", "process group matches editor process group"
+  end
+  if not pgid_exists(pgid) then
+    return "exited", nil
+  end
+  if not my then
+    return "uncertain", "could not read editor process group to verify continuity"
+  end
+  -- A PGID alone is not an identity: require a matching /proc start time for
+  -- its leader or a previously captured member before treating it as ours.
+  -- The check and later kill cannot be atomic with POSIX kill(2); a process
+  -- can exit and its PID/PGID can be reused in that narrow interval.
+  local leader = M._read_proc_info(pgid)
+  if leader and type(leader.start_ticks) == "number" then
+    if leader.start_ticks ~= leader_start_ticks then
+      -- On Linux, PID `pgid` cannot be reused until every process referencing
+      -- that PGID has exited and been reaped, so a new start_ticks proves the
+      -- original group has exited.
+      return "exited", nil
+    end
+    if leader.pgid == pgid then
+      return "alive", nil
+    end
+  end
+  -- Leader exited (or lacked start_ticks / left PGID): a previously captured
+  -- member PID + start-time pair can still prove continuity.
+  if type(members) == "table" then
+    for mpid, mticks in pairs(members) do
+      local minfo = M._read_proc_info(mpid)
+      if type(mticks) == "number" and minfo and minfo.pgid == pgid and minfo.start_ticks == mticks then
+        return "alive", nil
+      end
+    end
+  end
+  return "uncertain",
+    ("process group %d still has live processes, but neither leader nor any tracked member remains to prove continuity"):format(
+      pgid
+    )
+end
+
+local function group_alive(pgid, leader_start_ticks, members)
+  local status, reason = group_status(pgid, leader_start_ticks, members)
+  return status == "alive", status, reason
+end
+
+local function signal_group(pgid, leader_start_ticks, sig, members)
+  if not group_alive(pgid, leader_start_ticks, members) then
     return false
   end
   if type(vim.uv.kill) == "function" then
-    local ok, _, code = vim.uv.kill(-pgid, sig)
-    return ok == 0 or (not ok and code ~= "ESRCH")
+    local ok = vim.uv.kill(-pgid, sig)
+    return ok == 0
   end
   local flag = sig == "sigkill" and "-KILL" or "-TERM"
   vim.fn.system({ "kill", flag, "-" .. tostring(pgid) })
   return vim.v.shell_error == 0
 end
 
-local function is_draining()
+local function stop_bg_monitor(monitor)
+  if not monitor or monitor.done then
+    return
+  end
+  monitor.done = true
+  for bg in pairs(monitor.targets) do
+    if bg.drain_monitor == monitor then
+      bg.drain_monitor = nil
+    end
+  end
+  monitor.targets = {}
+  if monitor.timer then
+    local timer = monitor.timer
+    monitor.timer = nil
+    pcall(function()
+      timer:stop()
+      timer:close()
+    end)
+  end
+end
+
+local function detach_bg_monitor(bg)
+  local monitor = bg and bg.drain_monitor
+  if not monitor then
+    return
+  end
+  bg.drain_monitor = nil
+  monitor.targets[bg] = nil
+  if not next(monitor.targets) then
+    stop_bg_monitor(monitor)
+  end
+end
+
+local function bg_group_status(bg, refresh)
+  if type(bg) ~= "table" then
+    return "exited", nil
+  end
+  local status, reason = group_status(bg.pgid, bg.start_ticks, bg.members)
+  if status == "exited" then
+    bg.uncertain = false
+    bg.uncertain_reason = nil
+    return "exited", reason
+  end
+  if status == "uncertain" then
+    bg.uncertain = true
+    bg.uncertain_reason = reason
+    return "uncertain", reason
+  end
+  bg.uncertain = false
+  bg.uncertain_reason = nil
+  if refresh and bg.members ~= nil then
+    local latest = refresh_verified_members(bg.pgid, bg.start_ticks, bg.sid, bg.members)
+    if latest then
+      bg.members = latest
+    end
+  end
+  return "alive", nil
+end
+
+local function bg_group_alive(bg, refresh)
+  local status, reason = bg_group_status(bg, refresh)
+  return status == "alive", status, reason
+end
+
+local function prune_background_groups(refresh)
+  local kept = {}
+  for _, bg in ipairs(background_groups) do
+    if bg_group_status(bg, refresh) ~= "exited" then
+      kept[#kept + 1] = bg
+    end
+  end
+  for i = 1, #background_groups do
+    background_groups[i] = nil
+  end
+  for i, bg in ipairs(kept) do
+    background_groups[i] = bg
+  end
+end
+
+local function record_background_group(seq, pgid, start_ticks, opts)
+  opts = opts or {}
+  local bg_root = opts.root or state.root
+  local prev_members = opts.members or state.pgid_members
+  local status, reason = group_status(pgid, start_ticks, prev_members)
+  if status == "exited" then
+    return false, false
+  end
+  local members = prev_members
+  local uncertain = (status == "uncertain")
+  if not uncertain then
+    local refreshed = refresh_verified_members(pgid, start_ticks, opts.sid, prev_members)
+    if refreshed then
+      members = refreshed
+    end
+  end
+  prune_background_groups(false)
+  for _, existing in ipairs(background_groups) do
+    if existing.seq == seq and existing.pgid == pgid then
+      existing.uncertain = uncertain
+      existing.uncertain_reason = uncertain and reason or nil
+      if members ~= nil then
+        existing.members = members
+      end
+      return true, existing.uncertain
+    end
+  end
+  background_groups[#background_groups + 1] = {
+    seq = seq,
+    pgid = pgid,
+    start_ticks = start_ticks,
+    sid = opts.sid,
+    members = members,
+    root = bg_root,
+    canon_root = bg_root and run_config.canonical(bg_root) or nil,
+    kind = opts.kind or state.kind,
+    exit_code = opts.exit_code,
+    stopping = false,
+    uncertain = uncertain,
+    uncertain_reason = uncertain and reason or nil,
+    drain_monitor = nil,
+  }
+  return true, uncertain
+end
+
+local function first_stopping_bg()
+  prune_background_groups(false)
+  for _, bg in ipairs(background_groups) do
+    if bg.stopping and not bg.uncertain then
+      return bg
+    end
+  end
+  return nil
+end
+
+local function find_background_groups_for_root(canon_root)
+  if not canon_root then
+    return {}
+  end
+  prune_background_groups(true)
+  local out = {}
+  for _, bg in ipairs(background_groups) do
+    if bg.canon_root == canon_root then
+      out[#out + 1] = bg
+    end
+  end
+  return out
+end
+
+local function find_uncertain_bg(canon_root)
+  local fallback = nil
+  for i = #background_groups, 1, -1 do
+    local bg = background_groups[i]
+    if bg.uncertain then
+      if canon_root and bg.canon_root == canon_root then
+        return bg
+      end
+      if not fallback then
+        fallback = bg
+      end
+    end
+  end
+  return fallback
+end
+
+local function find_live_background_group(seq, pgid, origin_root)
+  prune_background_groups(true)
+  for _, bg in ipairs(background_groups) do
+    if
+      not bg.uncertain
+      and (seq == nil or bg.seq == seq)
+      and (pgid == nil or bg.pgid == pgid)
+      and (origin_root == nil or bg.canon_root == origin_root)
+    then
+      return bg
+    end
+  end
+  return nil
+end
+
+local function select_background_targets(canon_root, only_stopping)
+  prune_background_groups(true)
+  if #background_groups == 0 then
+    return nil
+  end
+  local chosen = nil
+  if only_stopping then
+    for _, bg in ipairs(background_groups) do
+      if bg.stopping and not bg.uncertain then
+        chosen = bg
+        break
+      end
+    end
+    if not chosen then
+      return nil
+    end
+  else
+    if canon_root then
+      for i = #background_groups, 1, -1 do
+        local bg = background_groups[i]
+        if not bg.uncertain and bg.canon_root == canon_root then
+          chosen = bg
+          break
+        end
+      end
+    end
+    if not chosen then
+      for i = #background_groups, 1, -1 do
+        local bg = background_groups[i]
+        if not bg.uncertain then
+          chosen = bg
+          break
+        end
+      end
+    end
+    if not chosen then
+      return nil
+    end
+  end
+  local targets = {}
+  for _, bg in ipairs(background_groups) do
+    if not bg.uncertain and bg.canon_root == chosen.canon_root and (not only_stopping or bg.stopping) then
+      targets[#targets + 1] = bg
+    end
+  end
+  return targets, chosen
+end
+
+local function is_fg_draining()
   if not state.draining_pgid then
     return false
   end
-  if group_alive(state.draining_pgid, state.draining_start_ticks) then
+  local status, reason = group_status(state.draining_pgid, state.draining_start_ticks, state.pgid_members)
+  if status ~= "exited" then
+    state.pgid_uncertain = (status == "uncertain")
+    state.pgid_uncertain_reason = reason
     return true
   end
   state.draining_pgid = nil
   state.draining_start_ticks = nil
+  state.pgid_sid = nil
+  state.pgid_members = nil
+  state.pgid_reason = nil
+  state.pgid_uncertain = false
+  state.pgid_uncertain_reason = nil
   return false
+end
+
+local function is_draining()
+  if is_fg_draining() then
+    return true
+  end
+  return first_stopping_bg() ~= nil
 end
 
 local function stop_drain_timer()
@@ -706,20 +1090,96 @@ local function stop_drain_timer()
   end
 end
 
-local function kill_tree(pid, sig)
-  if not pid or pid <= 0 then
-    return
+local restart_seq = 0
+
+local function clear_restart_state(expected_op)
+  if expected_op ~= nil and state.restart_op ~= expected_op then
+    return false
+  end
+  if state.restart_op then
+    state.restart_op.active = false
+  end
+  state.restarting = false
+  state.after_exit = nil
+  state.restart_op = nil
+  return true
+end
+
+local function begin_restart(cb)
+  restart_seq = restart_seq + 1
+  if state.restart_op then
+    state.restart_op.active = false
+  end
+  local op = {
+    id = restart_seq,
+    after_exit = cb,
+    active = true,
+  }
+  state.restarting = true
+  state.after_exit = cb
+  state.restart_op = op
+  return op
+end
+
+local function monitor_owns_restart(restart_op, allow_legacy_restart)
+  if restart_op ~= nil then
+    return restart_op.active and state.restarting and state.restart_op == restart_op
+  end
+  if allow_legacy_restart then
+    return state.restarting and state.restart_op == nil
+  end
+  return false
+end
+
+local function signal_pid(pid, sig)
+  if type(pid) ~= "number" or pid <= 1 or pid == vim.uv.os_getpid() then
+    return false
+  end
+  if type(vim.uv.kill) == "function" then
+    local ok = vim.uv.kill(pid, sig)
+    return ok == 0
+  end
+  local flag = sig == "sigkill" and "-KILL" or "-TERM"
+  vim.fn.system({ "kill", flag, tostring(pid) })
+  return vim.v.shell_error == 0
+end
+
+local function kill_tree(pid, sig, expected_start_ticks)
+  if type(pid) ~= "number" or pid <= 1 or pid == vim.uv.os_getpid() then
+    return false
+  end
+  local info = M._read_proc_info(pid)
+  if
+    type(expected_start_ticks) ~= "number"
+    or not info
+    or type(info.start_ticks) ~= "number"
+    or info.start_ticks ~= expected_start_ticks
+  then
+    return false
   end
   local ok, children = pcall(vim.fn.systemlist, { "pgrep", "-P", tostring(pid) })
-  if ok then
-    for _, child in ipairs(children or {}) do
-      local child_pid = tonumber(child)
-      if child_pid then
-        kill_tree(child_pid, sig)
+  if ok and type(children) == "table" then
+    for _, child in ipairs(children) do
+      local child_pid = tonumber(vim.trim(child))
+      if child_pid and child_pid > 1 and child_pid ~= vim.uv.os_getpid() then
+        local cinfo = M._read_proc_info(child_pid)
+        if
+          cinfo
+          and cinfo.ppid == pid
+          and type(cinfo.start_ticks) == "number"
+          and cinfo.start_ticks >= info.start_ticks
+        then
+          kill_tree(child_pid, sig, cinfo.start_ticks)
+        end
       end
     end
   end
-  pcall(vim.fn.system, { "kill", "-" .. (sig or "TERM"), tostring(pid) })
+  local latest = M._read_proc_info(pid)
+  if not latest or latest.start_ticks ~= expected_start_ticks then
+    return false
+  end
+  local uv_sig = (sig == "KILL" or sig == "sigkill") and "sigkill" or "sigterm"
+  return signal_pid(pid, uv_sig)
 end
 
 ---Safely terminate the running job or draining process group.
@@ -728,31 +1188,64 @@ local function terminate_active(sig)
   local pgid = state.pgid or state.draining_pgid
   local start_ticks = state.pgid and state.pgid_start_ticks or state.draining_start_ticks
   if pgid then
-    signal_group(pgid, start_ticks, sig)
+    local status, reason = group_status(pgid, start_ticks, state.pgid_members)
+    if status == "uncertain" then
+      state.pgid_uncertain = true
+      state.pgid_uncertain_reason = reason
+      return false
+    end
+    if status == "alive" then
+      state.pgid_uncertain = false
+      state.pgid_uncertain_reason = nil
+      if state.pgid_members ~= nil then
+        local latest = refresh_verified_members(pgid, start_ticks, state.pgid_sid, state.pgid_members)
+        if latest then
+          state.pgid_members = latest
+        end
+      end
+      signal_group(pgid, start_ticks, sig, state.pgid_members)
+    end
   end
   local job = state.job
   if job then
     if not pgid then
       local ok_pid, pid = pcall(vim.fn.jobpid, job)
-      if ok_pid and pid and pid > 0 then
-        kill_tree(pid, sig == "sigkill" and "KILL" or "TERM")
+      if ok_pid and pid and pid > 1 and pid == state.pid then
+        kill_tree(pid, sig == "sigkill" and "KILL" or "TERM", state.pid_start_ticks)
       end
     end
     if sig == "sigterm" then
       pcall(vim.fn.jobstop, job)
     end
   end
+  return true
 end
 
 local function start_drain_monitor(seq, pgid, start_ticks, opts)
   stop_drain_timer()
   opts = opts or {}
+  local restart_op = opts.restart_op
+  local allow_legacy_restart = (
+    restart_op == nil
+    and not opts.background
+    and state.restarting
+    and state.restart_op == nil
+  )
   local timer = vim.uv.new_timer()
   if not timer then
     if opts.background and not state.stopping and not state.restarting then
+      if pgid then
+        record_background_group(seq, pgid, start_ticks, opts)
+      end
       state.draining_pgid = nil
       state.draining_start_ticks = nil
+      state.pgid_sid = nil
+      state.pgid_members = nil
       state.pgid_reason = nil
+      state.pgid_uncertain = false
+      state.pgid_uncertain_reason = nil
+    elseif monitor_owns_restart(restart_op, allow_legacy_restart) then
+      clear_restart_state(restart_op)
     end
     return
   end
@@ -764,6 +1257,9 @@ local function start_drain_monitor(seq, pgid, start_ticks, opts)
     50,
     50,
     vim.schedule_wrap(function()
+      if state.drain_timer ~= timer then
+        return
+      end
       if state.seq ~= seq then
         stop_drain_timer()
         return
@@ -772,44 +1268,90 @@ local function start_drain_monitor(seq, pgid, start_ticks, opts)
       local active_pgid = pgid or state.draining_pgid or state.pgid
       local active_ticks = start_ticks or state.draining_start_ticks or state.pgid_start_ticks
       local still_running = state.running
-      local still_alive = active_pgid ~= nil and group_alive(active_pgid, active_ticks)
+      local status, uncertain_reason = "exited", nil
+      if active_pgid ~= nil then
+        status, uncertain_reason = group_status(active_pgid, active_ticks, opts.members or state.pgid_members)
+      end
 
-      if not still_running and not still_alive then
+      if not still_running and status == "exited" then
         stop_drain_timer()
         state.pgid = nil
         state.pgid_start_ticks = nil
+        state.pgid_sid = nil
+        state.pgid_members = nil
         state.pgid_reason = nil
+        state.pgid_uncertain = false
+        state.pgid_uncertain_reason = nil
         state.draining_pgid = nil
         state.draining_start_ticks = nil
-        state.stopping = false
-        if state.restarting and state.after_exit then
-          local cb = state.after_exit
-          state.after_exit = nil
-          state.restarting = false
-          cb()
+        state.stopping = first_stopping_bg() ~= nil
+        if monitor_owns_restart(restart_op, allow_legacy_restart) then
+          local cb = state.after_exit or (restart_op and restart_op.after_exit)
+          clear_restart_state(restart_op)
+          if cb then
+            cb()
+          end
         end
         return
+      end
+
+      if status == "alive" then
+        state.pgid_uncertain = false
+        state.pgid_uncertain_reason = nil
+        local cur_members = opts.members or state.pgid_members
+        if cur_members ~= nil then
+          local updated = refresh_verified_members(active_pgid, active_ticks, opts.sid or state.pgid_sid, cur_members)
+          if updated then
+            if opts.members ~= nil then
+              opts.members = updated
+            end
+            state.pgid_members = updated
+          end
+        end
+      elseif status == "uncertain" then
+        state.pgid_uncertain = true
+        state.pgid_uncertain_reason = uncertain_reason
       end
 
       local elapsed = vim.uv.now() - start_ms
 
       -- Ordinary leader exit with surviving background group: monitor briefly
-      -- without killing, then release the build lock so future runs are not
-      -- blocked indefinitely (stop/restart still enforces full group drain).
+      -- without killing, then release the build lock while retaining safe PGID
+      -- tracking so the user can still inspect and stop it later.
       if opts.background and not state.stopping and not state.restarting then
         local bg_grace_ms = M._background_grace_ms or 500
         if elapsed >= bg_grace_ms then
           stop_drain_timer()
+          local tracked, tracked_uncertain = false, false
+          if active_pgid then
+            tracked, tracked_uncertain = record_background_group(seq, active_pgid, active_ticks, opts)
+          end
           state.draining_pgid = nil
           state.draining_start_ticks = nil
+          state.pgid_sid = nil
+          state.pgid_members = nil
           state.pgid_reason = nil
-          ui.notify(
-            ("process exited (%s) with surviving background group (pgid %s) — released from build lock without killing"):format(
-              tostring(opts.exit_code),
-              tostring(active_pgid)
-            ),
-            vim.log.levels.WARN
-          )
+          state.pgid_uncertain = false
+          state.pgid_uncertain_reason = nil
+          if tracked then
+            if tracked_uncertain then
+              ui.notify(
+                ("process exited (%s) with surviving process group (pgid %s) whose identity became uncertain — released from build lock without signaling (verify and stop manually before Restart)"):format(
+                  tostring(opts.exit_code),
+                  tostring(active_pgid)
+                ),
+                vim.log.levels.WARN
+              )
+            else
+              ui.notify(
+                ("process exited (%s) with surviving background group (pgid %s) — released from build lock without killing (use Stop to terminate)"):format(
+                  tostring(opts.exit_code),
+                  tostring(active_pgid)
+                ),
+                vim.log.levels.WARN
+              )
+            end
+          end
         end
         return
       end
@@ -818,26 +1360,160 @@ local function start_drain_monitor(seq, pgid, start_ticks, opts)
       local timeout_ms = M._restart_timeout_ms or 5000
 
       if not sigkill_sent and elapsed >= grace_ms then
-        sigkill_sent = true
         if active_pgid then
-          signal_group(active_pgid, active_ticks, "sigkill")
+          if status == "alive" then
+            if signal_group(active_pgid, active_ticks, "sigkill", opts.members or state.pgid_members) then
+              sigkill_sent = true
+            end
+          end
         elseif state.pid then
-          kill_tree(state.pid, "KILL")
+          if kill_tree(state.pid, "KILL", state.pid_start_ticks) then
+            sigkill_sent = true
+          end
         end
       end
 
       if elapsed >= timeout_ms then
         stop_drain_timer()
-        local was_restarting = state.restarting
-        state.restarting = false
-        state.after_exit = nil
-        state.stopping = false
+        local was_restarting = monitor_owns_restart(restart_op, allow_legacy_restart)
         if was_restarting then
-          ui.notify("previous process did not exit in time — restart cancelled", vim.log.levels.WARN)
+          clear_restart_state(restart_op)
+        end
+        state.stopping = first_stopping_bg() ~= nil
+        if was_restarting then
+          if status == "uncertain" then
+            ui.notify(
+              "previous process group identity became uncertain while stopping — restart cancelled; verify and stop it manually",
+              vim.log.levels.WARN
+            )
+          else
+            ui.notify("previous process did not exit in time — restart cancelled", vim.log.levels.WARN)
+          end
         end
       end
     end)
   )
+end
+
+local function start_bg_drain_monitor(targets, opts)
+  opts = opts or {}
+  local restart_op = opts.restart_op
+  if type(targets) ~= "table" or #targets == 0 then
+    if restart_op then
+      clear_restart_state(restart_op)
+    end
+    return
+  end
+  local timer = vim.uv.new_timer()
+  if not timer then
+    for _, bg in ipairs(targets) do
+      bg.stopping = false
+    end
+    if restart_op then
+      clear_restart_state(restart_op)
+    end
+    state.stopping = first_stopping_bg() ~= nil
+    return
+  end
+
+  local monitor = {
+    timer = timer,
+    targets = {},
+    done = false,
+    restart_op = restart_op,
+  }
+  for _, bg in ipairs(targets) do
+    detach_bg_monitor(bg)
+    bg.drain_monitor = monitor
+    monitor.targets[bg] = true
+  end
+
+  local start_ms = vim.uv.now()
+  local sigkill_sent = {}
+
+  local function poll()
+    if monitor.done then
+      return
+    end
+    prune_background_groups(false)
+    local live = {}
+    local uncertain = {}
+    local exited = {}
+    for bg in pairs(monitor.targets) do
+      local status = bg_group_status(bg, true)
+      if status == "alive" then
+        live[#live + 1] = bg
+      elseif status == "uncertain" then
+        uncertain[#uncertain + 1] = bg
+      else
+        exited[#exited + 1] = bg
+      end
+    end
+    for _, bg in ipairs(exited) do
+      monitor.targets[bg] = nil
+      sigkill_sent[bg] = nil
+      if bg.drain_monitor == monitor then
+        bg.drain_monitor = nil
+      end
+    end
+    if #live == 0 and #uncertain == 0 then
+      stop_bg_monitor(monitor)
+      state.stopping = first_stopping_bg() ~= nil
+      if monitor_owns_restart(monitor.restart_op, false) then
+        local cb = state.after_exit or monitor.restart_op.after_exit
+        clear_restart_state(monitor.restart_op)
+        if cb then
+          cb()
+        end
+      end
+      return
+    end
+
+    local elapsed = vim.uv.now() - start_ms
+    local grace_ms = M._stop_grace_ms or 1000
+    local timeout_ms = M._restart_timeout_ms or 5000
+
+    if elapsed >= grace_ms then
+      for _, bg in ipairs(live) do
+        if not sigkill_sent[bg] then
+          if signal_group(bg.pgid, bg.start_ticks, "sigkill", bg.members) then
+            sigkill_sent[bg] = true
+          end
+        end
+      end
+    end
+
+    if elapsed >= timeout_ms then
+      for bg in pairs(monitor.targets) do
+        if bg.drain_monitor == monitor then
+          bg.stopping = false
+        end
+      end
+      stop_bg_monitor(monitor)
+      local was_restarting = monitor_owns_restart(monitor.restart_op, false)
+      if was_restarting then
+        clear_restart_state(monitor.restart_op)
+      end
+      state.stopping = first_stopping_bg() ~= nil
+      if was_restarting then
+        if #uncertain > 0 and #live == 0 then
+          ui.notify(
+            "previous process group identity became uncertain while stopping — restart cancelled; verify and stop it manually",
+            vim.log.levels.WARN
+          )
+        else
+          ui.notify("previous process did not exit in time — restart cancelled", vim.log.levels.WARN)
+        end
+      elseif #uncertain > 0 and #live == 0 then
+        ui.notify(
+          "process group identity became uncertain while stopping — automatic SIGKILL skipped; verify and stop it manually",
+          vim.log.levels.WARN
+        )
+      end
+    end
+  end
+
+  timer:start(50, 50, vim.schedule_wrap(poll))
 end
 
 local function finish(seq, code, redactions)
@@ -847,15 +1523,28 @@ local function finish(seq, code, redactions)
   local buf = state.buf
   local pgid = state.pgid
   local start_ticks = state.pgid_start_ticks
+  local sid = state.pgid_sid
+  local members = pgid and state.pgid_members or nil
+  if pgid then
+    local refreshed = refresh_verified_members(pgid, start_ticks, sid, members)
+    if refreshed then
+      members = refreshed
+      state.pgid_members = refreshed
+    end
+  end
+  local root = state.root
+  local kind = state.kind
 
   drain_append(seq, buf)
 
   state.running = false
   state.job = nil
   state.pid = nil
+  state.pid_start_ticks = nil
   state.cmd = nil
   state.pgid = nil
   state.pgid_start_ticks = nil
+  state.pgid_sid = nil
   state.status = code == 0 and "success" or "failed"
 
   local limit = math.max(1, math.floor(tonumber(M._max_line_bytes) or 65536))
@@ -896,16 +1585,27 @@ local function finish(seq, code, redactions)
 
   state.redactions = {}
 
-  if pgid and group_alive(pgid, start_ticks) then
+  local status, uncertain_reason = "exited", nil
+  if pgid then
+    status, uncertain_reason = group_status(pgid, start_ticks, members)
+  end
+
+  if pgid and status ~= "exited" then
     state.draining_pgid = pgid
     state.draining_start_ticks = start_ticks
+    state.pgid_uncertain = (status == "uncertain")
+    state.pgid_uncertain_reason = uncertain_reason
     if not state.drain_timer then
       if state.stopping or state.restarting then
-        start_drain_monitor(seq, pgid, start_ticks)
+        start_drain_monitor(seq, pgid, start_ticks, { restart_op = state.restart_op })
       else
         start_drain_monitor(seq, pgid, start_ticks, {
           background = true,
           exit_code = code,
+          root = root,
+          kind = kind,
+          sid = sid,
+          members = members,
         })
       end
     end
@@ -913,13 +1613,15 @@ local function finish(seq, code, redactions)
   end
 
   stop_drain_timer()
+  state.pgid_members = nil
   state.pgid_reason = nil
+  state.pgid_uncertain = false
+  state.pgid_uncertain_reason = nil
   state.draining_pgid = nil
   state.draining_start_ticks = nil
-  state.stopping = false
-  local cb = state.after_exit
-  state.after_exit = nil
-  state.restarting = false
+  state.stopping = first_stopping_bg() ~= nil
+  local cb = state.after_exit or (state.restart_op and state.restart_op.after_exit)
+  clear_restart_state()
   if cb then
     cb()
   end
@@ -944,6 +1646,8 @@ local function start(kind, cmd, cwd, root, opts)
     ui.notify("previous process group is still exiting — wait before starting another", vim.log.levels.WARN)
     return
   end
+  prune_background_groups(false)
+  clear_restart_state()
 
   local project_root = root or cwd
   local canon_root = run_config.canonical(project_root)
@@ -1033,11 +1737,21 @@ local function start(kind, cmd, cwd, root, opts)
   local ok_pid, job_pid = pcall(vim.fn.jobpid, job)
   local pid = ok_pid and job_pid or nil
   local pgid, start_ticks, pgid_reason = M._verify_own_pgid(pid)
+  local pinfo = pid and M._read_proc_info(pid) or nil
   state.job = job
   state.pid = pid
+  state.pid_start_ticks = pinfo and pinfo.start_ticks or nil
   state.pgid = pgid
   state.pgid_start_ticks = start_ticks
+  state.pgid_sid = (pgid and pinfo and pinfo.pgid == pgid) and pinfo.sid or nil
+  state.pgid_members = pgid
+      and (refresh_verified_members(pgid, start_ticks, state.pgid_sid, { [pid] = start_ticks }) or {
+        [pid] = start_ticks,
+      })
+    or nil
   state.pgid_reason = pgid_reason
+  state.pgid_uncertain = false
+  state.pgid_uncertain_reason = nil
   state.draining_pgid = nil
   state.draining_start_ticks = nil
   state.stopping = false
@@ -1088,56 +1802,222 @@ local function start(kind, cmd, cwd, root, opts)
   )
 end
 
----Stop the current process (and only its process group). When the process belongs to
----another project, require an explicit user choice — never silently kill a
----job from a project other than the current buffer.
+---Stop the current process (and only its process group), or a tracked surviving
+---background process group. When the process belongs to another project,
+---require an explicit user choice — never silently kill a job from a project
+---other than the current buffer.
 ---@param confirmed boolean|table|nil
 function M.stop(confirmed)
   local current_root = project.root(context_buf())
   local cur_canon = current_root and run_config.canonical(current_root) or nil
   local active_root = state.root and run_config.canonical(state.root) or nil
-  local draining = is_draining()
-  local active = (state.running and state.job ~= nil) or draining
-
-  if type(confirmed) == "table" then
-    if
-      not active
-      or state.seq ~= confirmed.seq
-      or active_root ~= confirmed.origin_root
-      or (confirmed.context_root ~= nil and cur_canon ~= confirmed.context_root)
-    then
-      ui.notify("stop confirmation is stale — process or project changed", vim.log.levels.WARN)
-      return
+  local fg_draining = is_fg_draining()
+  local fg_active = (state.running and state.job ~= nil) or fg_draining
+  local fg_pgid = state.pgid or state.draining_pgid
+  if fg_active and fg_pgid then
+    local fg_ticks = state.pgid and state.pgid_start_ticks or state.draining_start_ticks
+    local fg_status, fg_uncertain_reason = group_status(fg_pgid, fg_ticks, state.pgid_members)
+    if fg_status == "uncertain" then
+      state.pgid_uncertain = true
+      state.pgid_uncertain_reason = fg_uncertain_reason
+    elseif fg_status == "alive" then
+      state.pgid_uncertain = false
+      state.pgid_uncertain_reason = nil
+      if state.pgid_members ~= nil then
+        local latest = refresh_verified_members(fg_pgid, fg_ticks, state.pgid_sid, state.pgid_members)
+        if latest then
+          state.pgid_members = latest
+        end
+      end
     end
   end
 
-  if not active then
-    ui.notify("no Java process is running", vim.log.levels.WARN)
+  if fg_active then
+    if type(confirmed) == "table" then
+      if
+        confirmed.is_background
+        or state.seq ~= confirmed.seq
+        or active_root ~= confirmed.origin_root
+        or (confirmed.context_root ~= nil and cur_canon ~= confirmed.context_root)
+      then
+        ui.notify("stop confirmation is stale — process or project changed", vim.log.levels.WARN)
+        return
+      end
+    end
+
+    if state.pgid_uncertain then
+      clear_restart_state()
+      state.stopping = first_stopping_bg() ~= nil
+      ui.notify(
+        ("cannot automatically stop process group %s: %s — verify and stop it manually"):format(
+          tostring(fg_pgid),
+          state.pgid_uncertain_reason or "identity could not be verified"
+        ),
+        vim.log.levels.WARN
+      )
+      return
+    end
+
+    local from_other_project = active_root ~= nil and cur_canon ~= nil and active_root ~= cur_canon
+    if from_other_project and not confirmed then
+      local origin = vim.fs.basename(state.root)
+      local token = {
+        seq = state.seq,
+        origin_root = active_root,
+        context_root = cur_canon,
+      }
+      ui.pick_one(
+        {
+          ("No — keep the %s project process"):format(origin),
+          ("Yes — stop the %s project process"):format(origin),
+        },
+        "Java: Build — process belongs to another project",
+        function(choice)
+          if choice and choice:find("^Yes") then
+            M.stop(token)
+          elseif choice then
+            local now_root = project.root(context_buf())
+            local now_canon = now_root and run_config.canonical(now_root) or nil
+            local still_fg = (state.running and state.job ~= nil) or is_fg_draining()
+            local still_root = state.root and run_config.canonical(state.root) or nil
+            local still_bg = (not still_fg and state.seq == token.seq)
+                and find_live_background_group(token.seq, nil, token.origin_root)
+              or nil
+            if
+              ((still_fg and state.seq == token.seq and still_root == token.origin_root) or still_bg)
+              and (token.context_root == nil or now_canon == token.context_root)
+            then
+              ui.notify(("the %s project process was kept running"):format(origin), vim.log.levels.INFO)
+            else
+              ui.notify("stop confirmation is stale — process or project changed", vim.log.levels.WARN)
+            end
+          end
+        end
+      )
+      return
+    end
+
+    local was_stopping = state.stopping
+    clear_restart_state()
+    state.stopping = true
+    terminate_active((not state.running and fg_draining and was_stopping) and "sigkill" or "sigterm")
+    start_drain_monitor(
+      state.seq,
+      state.pgid or state.draining_pgid,
+      state.pgid_start_ticks or state.draining_start_ticks
+    )
+    ui.notify(
+      from_other_project and ("the %s project process was stopped"):format(vim.fs.basename(state.root))
+        or "process stopped",
+      vim.log.levels.INFO
+    )
     return
   end
 
-  local from_other_project = active_root ~= nil and cur_canon ~= nil and active_root ~= cur_canon
+  local function resolve_confirmed_bg_targets(token)
+    if type(token) ~= "table" or not token.is_background or type(token.targets) ~= "table" then
+      return nil
+    end
+    prune_background_groups(true)
+    local resolved = {}
+    for _, identity in ipairs(token.targets) do
+      for _, bg in ipairs(background_groups) do
+        if
+          not bg.uncertain
+          and bg.seq == identity.seq
+          and bg.pgid == identity.pgid
+          and bg.canon_root == identity.origin_root
+        then
+          if bg.start_ticks ~= identity.start_ticks then
+            return nil
+          end
+          resolved[#resolved + 1] = bg
+          break
+        end
+      end
+    end
+    if #resolved == 0 then
+      return nil
+    end
+    return resolved, resolved[1]
+  end
+
+  local targets, chosen
+  if type(confirmed) == "table" then
+    if confirmed.context_root ~= nil and cur_canon ~= confirmed.context_root then
+      ui.notify("stop confirmation is stale — process or project changed", vim.log.levels.WARN)
+      return
+    end
+    if confirmed.is_background then
+      targets, chosen = resolve_confirmed_bg_targets(confirmed)
+    elseif state.seq == confirmed.seq then
+      local match = find_live_background_group(confirmed.seq, nil, confirmed.origin_root)
+      if match then
+        targets = { match }
+        chosen = match
+      end
+    end
+    if not targets or #targets == 0 or not chosen then
+      ui.notify("stop confirmation is stale — process or project changed", vim.log.levels.WARN)
+      return
+    end
+  else
+    targets, chosen = select_background_targets(cur_canon, true)
+    if not targets or #targets == 0 then
+      targets, chosen = select_background_targets(cur_canon, false)
+    end
+  end
+
+  if not targets or #targets == 0 or not chosen then
+    local uncertain_bg = find_uncertain_bg(cur_canon)
+    if uncertain_bg then
+      ui.notify(
+        ("no Java process is running (tracked process group %s identity could not be verified and was not signaled — verify and stop it manually)"):format(
+          tostring(uncertain_bg.pgid)
+        ),
+        vim.log.levels.WARN
+      )
+    else
+      ui.notify("no Java process is running", vim.log.levels.WARN)
+    end
+    return
+  end
+
+  local bg_canon = chosen.canon_root
+  local from_other_project = bg_canon ~= nil and cur_canon ~= nil and bg_canon ~= cur_canon
   if from_other_project and not confirmed then
-    local origin = vim.fs.basename(state.root)
+    local origin = vim.fs.basename(chosen.root)
     local token = {
-      seq = state.seq,
-      origin_root = active_root,
+      is_background = true,
+      seq = chosen.seq,
+      pgid = chosen.pgid,
+      origin_root = bg_canon,
       context_root = cur_canon,
+      targets = {},
     }
+    for _, bg in ipairs(targets) do
+      token.targets[#token.targets + 1] = {
+        seq = bg.seq,
+        pgid = bg.pgid,
+        origin_root = bg.canon_root,
+        start_ticks = bg.start_ticks,
+      }
+    end
     ui.pick_one(
       {
-        ("No — keep the %s project process"):format(origin),
-        ("Yes — stop the %s project process"):format(origin),
+        ("No — keep the %s project background process"):format(origin),
+        ("Yes — stop the %s project background process"):format(origin),
       },
-      "Java: Build — process belongs to another project",
+      "Java: Build — background process belongs to another project",
       function(choice)
         if choice and choice:find("^Yes") then
           M.stop(token)
         elseif choice then
-          local still_active = (state.running and state.job ~= nil) or is_draining()
-          local still_root = state.root and run_config.canonical(state.root) or nil
-          if still_active and state.seq == token.seq and still_root == token.origin_root then
-            ui.notify(("the %s project process was kept running"):format(origin), vim.log.levels.INFO)
+          local now_root = project.root(context_buf())
+          local now_canon = now_root and run_config.canonical(now_root) or nil
+          local still_targets = resolve_confirmed_bg_targets(token)
+          if still_targets and (token.context_root == nil or now_canon == token.context_root) then
+            ui.notify(("the %s project background process was kept running"):format(origin), vim.log.levels.INFO)
           else
             ui.notify("stop confirmation is stale — process or project changed", vim.log.levels.WARN)
           end
@@ -1147,19 +2027,17 @@ function M.stop(confirmed)
     return
   end
 
-  local was_stopping = state.stopping
-  state.after_exit = nil
-  state.restarting = false
+  clear_restart_state()
   state.stopping = true
-  terminate_active((not state.running and draining and was_stopping) and "sigkill" or "sigterm")
-  start_drain_monitor(
-    state.seq,
-    state.pgid or state.draining_pgid,
-    state.pgid_start_ticks or state.draining_start_ticks
-  )
+  for _, bg in ipairs(targets) do
+    local sig = bg.stopping and "sigkill" or "sigterm"
+    bg.stopping = true
+    signal_group(bg.pgid, bg.start_ticks, sig, bg.members)
+  end
+  start_bg_drain_monitor(targets)
   ui.notify(
-    from_other_project and ("the %s project process was stopped"):format(vim.fs.basename(state.root))
-      or "process stopped",
+    from_other_project and ("the %s project background process was stopped"):format(vim.fs.basename(chosen.root))
+      or "background process stopped",
     vim.log.levels.INFO
   )
 end
@@ -1170,13 +2048,13 @@ end
 function M.restart(confirmed)
   local root = project.root(context_buf())
   local canon_root = root and run_config.canonical(root) or nil
-  local draining = is_draining()
-  local active = (state.running and state.job ~= nil) or draining
+  local fg_draining = is_fg_draining()
+  local fg_active = (state.running and state.job ~= nil) or fg_draining
   local active_root = state.root and run_config.canonical(state.root) or nil
 
   if type(confirmed) == "table" then
     if
-      not active
+      not fg_active
       or state.seq ~= confirmed.seq
       or active_root ~= confirmed.origin_root
       or canon_root ~= confirmed.target_root
@@ -1202,18 +2080,90 @@ function M.restart(confirmed)
     return
   end
 
-  local function launch()
+  local function launch_recorded()
     start(rec.kind, vim.deepcopy(rec.cmd), rec.cwd, rec.root, { use_env = rec.use_env })
   end
 
-  if not active then
+  -- A restart targets the destination project's full process set. This also
+  -- runs after a confirmed cross-project foreground stop, where the target
+  -- may already have a surviving background group of its own.
+  local function find_uncertain_own_bg()
+    local own_bgs = find_background_groups_for_root(canon_root)
+    for _, bg in ipairs(own_bgs) do
+      if bg.uncertain then
+        return bg, own_bgs
+      end
+    end
+    return nil, own_bgs
+  end
+
+  local function launch()
+    local uncertain_bg, own_bgs = find_uncertain_own_bg()
+    if uncertain_bg then
+      ui.notify(
+        ("cannot automatically restart: %s — verify and stop it manually before restarting"):format(
+          uncertain_bg.uncertain_reason
+            or ("process group %s identity could not be verified"):format(tostring(uncertain_bg.pgid))
+        ),
+        vim.log.levels.WARN
+      )
+      return
+    end
+    if #own_bgs == 0 then
+      launch_recorded()
+      return
+    end
+    local op = begin_restart(launch_recorded)
+    state.stopping = true
+    for _, bg in ipairs(own_bgs) do
+      bg.stopping = true
+      signal_group(bg.pgid, bg.start_ticks, "sigterm", bg.members)
+    end
+    start_bg_drain_monitor(own_bgs, { restart_op = op })
+  end
+
+  local uncertain_own = find_uncertain_own_bg()
+  if uncertain_own then
+    ui.notify(
+      ("cannot automatically restart: %s — verify and stop it manually before restarting"):format(
+        uncertain_own.uncertain_reason
+          or ("process group %s identity could not be verified"):format(tostring(uncertain_own.pgid))
+      ),
+      vim.log.levels.WARN
+    )
+    return
+  end
+
+  if not fg_active then
+    local stopping_bg = first_stopping_bg()
+    if stopping_bg and stopping_bg.canon_root ~= canon_root then
+      ui.notify("previous process group is still exiting — wait before starting another", vim.log.levels.WARN)
+      return
+    end
     launch()
     return
   end
 
   local target_pgid = state.pgid or state.draining_pgid
-  if not target_pgid then
-    local reason = state.pgid_reason or "process group could not be verified"
+  if target_pgid then
+    local target_ticks = state.pgid and state.pgid_start_ticks or state.draining_start_ticks
+    local fg_status, fg_uncertain_reason = group_status(target_pgid, target_ticks, state.pgid_members)
+    if fg_status == "uncertain" then
+      state.pgid_uncertain = true
+      state.pgid_uncertain_reason = fg_uncertain_reason
+    elseif fg_status == "alive" then
+      state.pgid_uncertain = false
+      state.pgid_uncertain_reason = nil
+      if state.pgid_members ~= nil then
+        local latest = refresh_verified_members(target_pgid, target_ticks, state.pgid_sid, state.pgid_members)
+        if latest then
+          state.pgid_members = latest
+        end
+      end
+    end
+  end
+  if not target_pgid or state.pgid_uncertain then
+    local reason = state.pgid_uncertain_reason or state.pgid_reason or "process group could not be verified"
     ui.notify(
       ("cannot automatically restart running process: %s — stop it manually before restarting"):format(reason),
       vim.log.levels.WARN
@@ -1241,7 +2191,7 @@ function M.restart(confirmed)
         elseif choice then
           local cur_root = project.root(context_buf())
           local cur_canon = cur_root and run_config.canonical(cur_root) or nil
-          local still_active = (state.running and state.job ~= nil) or is_draining()
+          local still_active = (state.running and state.job ~= nil) or is_fg_draining()
           local still_root = state.root and run_config.canonical(state.root) or nil
           if
             still_active
@@ -1261,11 +2211,10 @@ function M.restart(confirmed)
 
   local seq = state.seq
   local target_ticks = state.pgid and state.pgid_start_ticks or state.draining_start_ticks
-  state.restarting = true
+  local op = begin_restart(launch)
   state.stopping = true
-  state.after_exit = launch
   terminate_active("sigterm")
-  start_drain_monitor(seq, target_pgid, target_ticks)
+  start_drain_monitor(seq, target_pgid, target_ticks, { restart_op = op })
 end
 
 ---Show the last output (from any project — the origin is identified in the menu).
@@ -1858,9 +2807,49 @@ function M.build()
   local can_build = tool ~= nil and tool.runner ~= nil
   local build_reason = (tool and tool.reason) or "no build tool found"
   local rec = last_runs[canon_root]
-  local draining = is_draining()
-  local active = state.running or draining
+  local fg_draining = is_fg_draining()
+  local fg_active = state.running or fg_draining
   local active_root = state.root and run_config.canonical(state.root) or nil
+  local fg_pgid = state.pgid or state.draining_pgid
+  if fg_active and fg_pgid then
+    local fg_ticks = state.pgid and state.pgid_start_ticks or state.draining_start_ticks
+    local fg_status, fg_uncertain_reason = group_status(fg_pgid, fg_ticks, state.pgid_members)
+    if fg_status == "uncertain" then
+      state.pgid_uncertain = true
+      state.pgid_uncertain_reason = fg_uncertain_reason
+    elseif fg_status == "alive" then
+      state.pgid_uncertain = false
+      state.pgid_uncertain_reason = nil
+      if state.pgid_members ~= nil then
+        local latest = refresh_verified_members(fg_pgid, fg_ticks, state.pgid_sid, state.pgid_members)
+        if latest then
+          state.pgid_members = latest
+        end
+      end
+    end
+  end
+  local bg_targets, bg_chosen
+  if not fg_active then
+    bg_targets, bg_chosen = select_background_targets(canon_root, true)
+    if not bg_targets or #bg_targets == 0 then
+      bg_targets, bg_chosen = select_background_targets(canon_root, false)
+    end
+  else
+    prune_background_groups(true)
+  end
+  local own_uncertain_bg = nil
+  for _, bg in ipairs(background_groups) do
+    if bg.uncertain and bg.canon_root == canon_root then
+      own_uncertain_bg = bg
+      break
+    end
+  end
+  local any_uncertain_bg = own_uncertain_bg or find_uncertain_bg(canon_root)
+  local stopping_bg = (not fg_active and bg_chosen and bg_chosen.stopping) and bg_chosen or nil
+  local fg_unverified = fg_active and (not fg_pgid or state.pgid_uncertain)
+  local fg_unverified_reason = state.pgid_uncertain_reason or state.pgid_reason or "process group could not be verified"
+  local stop_active = (fg_active and not state.pgid_uncertain) or (bg_chosen ~= nil)
+  local stop_canon = fg_active and active_root or (bg_chosen and bg_chosen.canon_root) or nil
 
   local _, has_last_build = resolve_last_build(canon_root, false)
   local entries = {
@@ -1883,10 +2872,17 @@ function M.build()
     {
       key = "restart",
       label = rec and ("Restart Last Process (%s)"):format(rec.kind) or "Restart Last Process",
-      enabled = rec ~= nil and not (active and not (state.pgid or state.draining_pgid)),
+      enabled = rec ~= nil
+        and not fg_unverified
+        and own_uncertain_bg == nil
+        and not (stopping_bg ~= nil and stopping_bg.canon_root ~= canon_root),
       reason = (not rec and "no previous command in this project")
-        or (active and not (state.pgid or state.draining_pgid) and ("cannot automatically restart running process (" .. (state.pgid_reason or "process group could not be verified") .. ") — stop it manually first"))
-        or (active and active_root ~= canon_root and "process from another project — will ask for confirmation")
+        or (fg_unverified and ("cannot automatically restart running process (" .. fg_unverified_reason .. ") — stop it manually first"))
+        or (own_uncertain_bg and ("cannot automatically restart (" .. (own_uncertain_bg.uncertain_reason or ("process group " .. tostring(
+          own_uncertain_bg.pgid
+        ) .. " identity could not be verified")) .. ") — verify and stop it manually first"))
+        or (fg_active and active_root ~= canon_root and "process from another project — will ask for confirmation")
+        or (stopping_bg and stopping_bg.canon_root ~= canon_root and "another project's background process is still stopping")
         or "",
     },
     {
@@ -1912,10 +2908,28 @@ function M.build()
     },
     {
       key = "stop",
-      label = active and state.root and ("Stop Running Process — project %s"):format(vim.fs.basename(state.root))
+      label = (
+        fg_active
+        and (
+          state.root and ("Stop Running Process — project %s"):format(vim.fs.basename(state.root))
+          or "Stop Running Process"
+        )
+      )
+        or (bg_chosen and (bg_chosen.root and ("Stop Background Process — project %s"):format(
+          vim.fs.basename(bg_chosen.root)
+        ) or "Stop Background Process"))
         or "Stop Running Process",
-      enabled = active,
-      reason = (active and active_root ~= canon_root and "process from another project — will ask for confirmation")
+      enabled = stop_active,
+      reason = (
+        fg_active
+        and state.pgid_uncertain
+        and ("cannot automatically stop (" .. fg_unverified_reason .. ") — verify and stop it manually")
+      )
+        or (fg_active and active_root ~= canon_root and "process from another project — will ask for confirmation")
+        or (bg_chosen and stop_canon ~= canon_root and "background process from another project — will ask for confirmation")
+        or (not fg_active and not bg_chosen and any_uncertain_bg and ("process group " .. tostring(
+          any_uncertain_bg.pgid
+        ) .. " identity could not be verified — verify and stop it manually"))
         or "no process running",
     },
     {
@@ -1972,7 +2986,14 @@ M._scope_args = scope_args
 M._last_builds = last_builds
 M._last_runs = last_runs
 M._is_draining = is_draining
+M._start_drain_monitor = start_drain_monitor
+M._background_groups = background_groups
+M._read_proc_info = read_proc_info
+M._group_status = group_status
+M._group_alive = group_alive
+M._bg_group_status = bg_group_status
 M._verify_own_pgid = verify_own_pgid
+M._kill_tree = kill_tree
 M._feed = feed
 M._finish = finish
 M._pending = pending
