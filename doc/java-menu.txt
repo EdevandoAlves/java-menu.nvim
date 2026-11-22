@@ -56,8 +56,13 @@ inside a Java project; they are not gated on |filetype| alone.
   Initializr; `curl`/`wget` also enables optional Maven Central search —
   Plain Java, Maven creation and manual Maven dependency entry work offline).
 
-Developed and tested on Neovim 0.12, Linux. The practical Neovim floor is
-the one jc.nvim itself requires; older versions are untested.
+Developed and fully tested on Neovim 0.12, Linux. CI also runs portable
+smoke checks on macOS and Windows for setup, project discovery and
+WorkspaceEdit preview. Live JDTLS, build processes, wrappers, permissions
+and symlinks are not covered by those checks. Process-group verification may
+be unavailable outside Linux; automatic stop/restart can then be disabled.
+The practical Neovim floor is the one jc.nvim itself requires; older
+versions are untested.
 
 java-menu.nvim never downloads, installs, bundles, or updates jc.nvim,
 jdtls, optional plugins, or build tools. You install and manage them
