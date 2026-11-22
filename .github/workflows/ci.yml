@@ -1,7 +1,6 @@
-# CI inicial do java-menu.nvim — Linux, validação estática e local.
-# Escopo desta fase: FAST (12 specs), stylua --check e checagem de :help.
-# Os 4 specs INTEGRATION (JDTLS/Maven/DAP reais) rodam localmente e
-# permanecem fora do CI por enquanto.
+# CI do java-menu.nvim — Linux, validação estática e local.
+# FAST roda contra jc.nvim v1.7.0 (SHA fixado como baseline) e upstream main (detecção de mudanças).
+# stylua --check e checagem de :help rodam uma vez; INTEGRATION continua local.
 
 name: CI
 
@@ -15,8 +14,6 @@ permissions:
 env:
   # Versão do Neovim usada no desenvolvimento/testes locais.
   NVIM_VERSION: v0.12.6
-  # Revisão do jc.nvim contra a qual a suíte foi validada.
-  JC_REVISION: 0aaf5bbc07ed1a69d66779187d48bfea6ec863b6
   # Stylua fixado na mesma versão do desenvolvimento local.
   STYLUA_VERSION: v2.6.0
   # Dados do Neovim dentro do workspace: é por aqui que o runner localiza
@@ -25,9 +22,19 @@ env:
 
 jobs:
   fast:
-    name: FAST specs (Neovim v0.12.6)
+    name: FAST specs / jc.nvim ${{ matrix.jc_label }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - jc_label: v1.7.0 baseline (0aaf5bbc)
+            jc_ref: 0aaf5bbc07ed1a69d66779187d48bfea6ec863b6
+            jc_pinned: true
+          - jc_label: upstream main (change detection)
+            jc_ref: main
+            jc_pinned: false
     steps:
       - uses: actions/checkout@v7
 
@@ -41,17 +48,18 @@ jobs:
           echo "/tmp/nvim/bin" >> "$GITHUB_PATH"
           /tmp/nvim/bin/nvim --version | head -1
 
-      - name: Install jc.nvim at pinned revision
+      - name: Install jc.nvim (${{ matrix.jc_label }})
         run: |
           set -euo pipefail
           mkdir -p "$XDG_DATA_HOME/nvim/lazy"
           git clone --no-checkout https://github.com/artur-shaik/jc.nvim "$XDG_DATA_HOME/nvim/lazy/jc.nvim"
-          git -C "$XDG_DATA_HOME/nvim/lazy/jc.nvim" checkout "$JC_REVISION"
+          git -C "$XDG_DATA_HOME/nvim/lazy/jc.nvim" checkout --detach "${{ matrix.jc_ref }}"
           actual="$(git -C "$XDG_DATA_HOME/nvim/lazy/jc.nvim" rev-parse HEAD)"
-          test "$actual" = "$JC_REVISION" || {
-            echo "jc.nvim checkout em $actual, esperado $JC_REVISION" >&2
+          echo "jc.nvim checked out at $actual (${{ matrix.jc_label }})"
+          if [ "${{ matrix.jc_pinned }}" = "true" ] && [ "$actual" != "${{ matrix.jc_ref }}" ]; then
+            echo "Expected jc.nvim commit ${{ matrix.jc_ref }}, got $actual" >&2
             exit 1
-          }
+          fi
 
       - name: Run FAST suite
         run: tests/java_menu/run.sh fast

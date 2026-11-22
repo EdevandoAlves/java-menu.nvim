@@ -85,6 +85,22 @@ local _, missing_set = jca.replace_import_api()
 assert(missing_set and missing_set:find("_set_import", 1, true), "ausência do _set_import não relatada")
 package.loaded["jc.jdtls"] = nil
 
+package.loaded["jc.jdtls"] = {
+  _filter_type_symbols = function()
+    return {}
+  end,
+  _prioritize_types = function()
+    return {}
+  end,
+  _set_import = function() end,
+}
+local _, missing_remember = jca.replace_import_api()
+assert(
+  missing_remember and missing_remember:find("_remember_regular", 1, true),
+  "ausência do _remember_regular não relatada"
+)
+package.loaded["jc.jdtls"] = nil
+
 package.loaded["jc.test"] = {
   _nothing_to_run = function()
     return true
@@ -111,6 +127,32 @@ local bad_fqns, bad_err = bad_parts.filter_type_symbols({}, "List")
 assert(
   bad_fqns == nil and bad_err:find("unexpected", 1, true),
   "contrato de retorno não validado: " .. tostring(bad_err)
+)
+package.loaded["jc.jdtls"] = nil
+
+package.loaded["jc.jdtls"] = {
+  _filter_type_symbols = function()
+    return {}
+  end,
+  _prioritize_types = function()
+    return "oops"
+  end,
+  _set_import = function()
+    error("buffer changed")
+  end,
+  _remember_regular = function()
+    error("settings readonly")
+  end,
+}
+local guarded_parts = jca.replace_import_api()
+local _, prioritize_err = guarded_parts.prioritize_types({}, 1)
+assert(prioritize_err and prioritize_err:find("unexpected", 1, true), "contrato de _prioritize_types não validado")
+local set_ok, set_err = guarded_parts.set_import(1, "List", "java.util.List")
+assert(not set_ok and set_err:find("buffer changed", 1, true), "falha de _set_import não foi segura")
+local remember_ok, remember_err = guarded_parts.remember_regular("List", "java.util.List")
+assert(
+  not remember_ok and remember_err:find("settings readonly", 1, true),
+  "falha de _remember_regular não foi segura"
 )
 package.loaded["jc.jdtls"] = nil
 
@@ -214,6 +256,263 @@ package.loaded["jc.import_style"] = nil
 package.loaded["jc.lsp"] = {}
 assert(jca.jdtls_busy() == false, "jdtls_busy ausente deveria devolver false")
 package.loaded["jc.lsp"] = nil
+
+-- ---------- 7. falhas adicionais de módulo, contrato e fallback (mock) ----------
+
+local function with_mock(mod_name, value_or_loader, fn)
+  local orig_loaded = package.loaded[mod_name]
+  local orig_preload = package.preload[mod_name]
+  if type(value_or_loader) == "function" then
+    package.loaded[mod_name] = nil
+    package.preload[mod_name] = value_or_loader
+  else
+    package.loaded[mod_name] = value_or_loader
+    package.preload[mod_name] = nil
+  end
+  local ok, err = pcall(fn)
+  package.loaded[mod_name] = orig_loaded
+  package.preload[mod_name] = orig_preload
+  if not ok then
+    error(err, 0)
+  end
+end
+
+-- módulos jc.* indisponíveis ou com tipo inválido
+with_mock("jc.jdtls", function()
+  error("module missing")
+end, function()
+  local api, err = jca.replace_import_api()
+  assert(
+    api == nil and err:find("unavailable", 1, true) and err:find("jc.jdtls", 1, true),
+    "falha ao carregar jc.jdtls não relatada: " .. tostring(err)
+  )
+end)
+
+with_mock("jc.jdtls", "not-a-table", function()
+  local api, err = jca.replace_import_api()
+  assert(api == nil and err:find("unavailable", 1, true), "jc.jdtls não-tabela não rejeitado: " .. tostring(err))
+end)
+
+with_mock("jc.jdtls", function()
+  return false
+end, function()
+  local api, err = jca.replace_import_api()
+  assert(api == nil and err:find("unavailable", 1, true), "jc.jdtls false não rejeitado: " .. tostring(err))
+end)
+
+with_mock("jc.settings", function()
+  error("settings missing")
+end, function()
+  local val, rerr = jca.read_build_last()
+  assert(
+    val == nil and rerr:find("unavailable", 1, true) and rerr:find("jc.settings", 1, true),
+    "falha ao carregar jc.settings em read não relatada: " .. tostring(rerr)
+  )
+  local ok, werr = jca.write_build_last("package")
+  assert(not ok and werr:find("unavailable", 1, true), "falha ao carregar jc.settings em write não relatada")
+end)
+
+with_mock("jc.import_style", function()
+  error("style missing")
+end, function()
+  local style_api, err = jca.import_style()
+  assert(
+    style_api == nil and err:find("unavailable", 1, true) and err:find("jc.import_style", 1, true),
+    "falha ao carregar jc.import_style não relatada: " .. tostring(err)
+  )
+end)
+
+with_mock("jc.test", function()
+  error("test missing")
+end, function()
+  local api, err = jca.test_discovery_api()
+  assert(
+    api == nil and err:find("unavailable", 1, true) and err:find("jc.test", 1, true),
+    "falha ao carregar jc.test não relatada: " .. tostring(err)
+  )
+end)
+
+with_mock("jc.lsp", function()
+  error("lsp missing")
+end, function()
+  assert(jca.jdtls_busy() == false, "jdtls_busy deveria retornar false se jc.lsp falhar ao carregar")
+end)
+
+-- funções ausentes nos módulos restantes
+with_mock("jc.jdtls", {
+  _filter_type_symbols = function()
+    return {}
+  end,
+  _set_import = function() end,
+  _remember_regular = function() end,
+}, function()
+  local api, err = jca.replace_import_api()
+  assert(
+    api == nil and err:find("_prioritize_types", 1, true),
+    "ausência de _prioritize_types não relatada: " .. tostring(err)
+  )
+end)
+
+with_mock("jc.test", {
+  _package_tests = function()
+    return {}
+  end,
+}, function()
+  local api, err = jca.test_discovery_api()
+  assert(
+    api == nil and err:find("_nothing_to_run", 1, true),
+    "ausência de _nothing_to_run não relatada: " .. tostring(err)
+  )
+end)
+
+with_mock("jc.settings", {}, function()
+  local _, rerr = jca.read_build_last()
+  assert(rerr and rerr:find("read_project", 1, true), "ausência de read_project não relatada")
+  local ok, werr = jca.write_build_last("test")
+  assert(not ok and werr:find("write_project", 1, true), "ausência de write_project não relatada")
+end)
+
+with_mock("jc.import_style", {
+  order = {},
+  load = function() end,
+  save = function() end,
+  no_wildcards = function()
+    return false
+  end,
+}, function()
+  local style_api, err = jca.import_style()
+  assert(style_api == nil and err:find("order", 1, true), "order vazia não rejeitada: " .. tostring(err))
+end)
+
+with_mock("jc.import_style", { order = { "Eclipse" } }, function()
+  local style_api, err = jca.import_style()
+  assert(
+    style_api == nil and err:find("load/save/no_wildcards", 1, true),
+    "funções ausentes em jc.import_style não relatadas: " .. tostring(err)
+  )
+end)
+
+-- erros e retornos inesperados adicionais nas chamadas
+with_mock("jc.settings", {
+  read_project = function()
+    return nil
+  end,
+  write_project = function()
+    error("disk full")
+  end,
+}, function()
+  local ok, err = jca.write_build_last("test")
+  assert(
+    not ok and err:find("disk full", 1, true) and err:find("failed", 1, true),
+    "erro de write_project não propagado claramente: " .. tostring(err)
+  )
+end)
+
+with_mock("jc.test", {
+  _nothing_to_run = function()
+    error("bad path")
+  end,
+  _package_tests = function()
+    error("scan error")
+  end,
+}, function()
+  local api = jca.test_discovery_api()
+  local nothing, nerr = api.nothing_to_run("/x")
+  assert(
+    nothing == false and nerr and nerr:find("bad path", 1, true) and nerr:find("failed", 1, true),
+    "erro de _nothing_to_run não capturado: " .. tostring(nerr)
+  )
+  local files, perr = api.package_tests("/x")
+  assert(
+    files == nil and perr and perr:find("scan error", 1, true) and perr:find("failed", 1, true),
+    "erro de _package_tests não capturado: " .. tostring(perr)
+  )
+end)
+
+with_mock("jc.test", {
+  _nothing_to_run = function()
+    return false
+  end,
+  _package_tests = function()
+    return nil
+  end,
+}, function()
+  local files, perr = jca.test_discovery_api().package_tests("/x")
+  assert(type(files) == "table" and #files == 0 and perr == nil, "nil em _package_tests deveria normalizar para {}")
+end)
+
+with_mock("jc.import_style", {
+  order = { "Eclipse" },
+  load = function()
+    error("corrupt")
+  end,
+  save = function() end,
+  no_wildcards = function()
+    error("io")
+  end,
+}, function()
+  local style_api = jca.import_style()
+  local ok_load, err_load = pcall(style_api.load)
+  assert(not ok_load and tostring(err_load):find("corrupt", 1, true), "erro de style.load não propagou")
+  local ok_nw, err_nw = pcall(style_api.no_wildcards)
+  assert(not ok_nw and tostring(err_nw):find("io", 1, true), "erro de style.no_wildcards não propagou")
+end)
+
+with_mock("jc.import_style", {
+  order = { "Eclipse" },
+  load = function()
+    return 123
+  end,
+  save = function() end,
+  no_wildcards = function()
+    return false
+  end,
+}, function()
+  local style_api = jca.import_style()
+  local ok_load, err_load = pcall(style_api.load)
+  assert(not ok_load and tostring(err_load):find("unexpected style", 1, true), "load() não-string não rejeitado")
+end)
+
+with_mock("jc.lsp", {
+  jdtls_busy = function()
+    error("lsp down")
+  end,
+}, function()
+  assert(jca.jdtls_busy() == false, "erro em jc.lsp.jdtls_busy deveria retornar false")
+end)
+
+with_mock("jc.lsp", {
+  jdtls_busy = function()
+    return "yes"
+  end,
+}, function()
+  assert(jca.jdtls_busy() == false, "retorno não-booleano em jdtls_busy deveria retornar false")
+end)
+
+-- fallback determinístico quando jc.templates falha
+local create = require("java_menu.create")
+with_mock("jc.templates", function()
+  error("templates missing")
+end, function()
+  local body = create._main_body("com.compat", "Demo")
+  assert(body:find("package com.compat;", 1, true), "fallback sem package")
+  assert(body:find("static void main", 1, true), "fallback sem main")
+  assert(body:find("Hello from Demo!", 1, true), "fallback sem saudação")
+end)
+
+with_mock("jc.templates", {
+  get = function()
+    return {}
+  end,
+  render = function()
+    error("render boom")
+  end,
+}, function()
+  local body = create._main_body("com.compat", "Demo")
+  assert(body:find("Hello from Demo!", 1, true), "fallback após erro em render falhou")
+end)
+
+vim.fn.delete(root, "rf")
 
 print("jc_compat_spec: OK")
 vim.cmd("qa!")

@@ -101,6 +101,8 @@ Note on jdtls capabilities: jc.nvim expects jdtls started with its extended clie
 
 Plain Java and Maven project creation need nothing beyond jc.nvim (Maven and `javac`, when present, are used only by *you* to compile and run what the wizard generated). Spring Boot project creation additionally requires network access to `https://start.spring.io`, `curl` (or `wget`), and `unzip`.
 
+**No automatic installs.** `java-menu.nvim` never downloads, installs, bundles, vendors, or updates `jc.nvim`, `jdtls`, optional plugins (`snacks.nvim`, `which-key.nvim`, `neotest`, `nvim-dap`), or external build tools (`java`, `mvn`, `gradle`, `curl`, `wget`, `unzip`). You install and manage `jc.nvim` through your plugin manager; `java-menu.nvim` only detects what is present and reports clear errors or disabled reasons when something is missing or incompatible.
+
 ## Installation
 
 Install with [lazy.nvim](https://github.com/folke/lazy.nvim) straight from GitHub:
@@ -142,7 +144,7 @@ Installing from a local checkout instead? Point `dir` at your clone — everythi
 },
 ```
 
-Declaring jc.nvim only as an inline `dependencies` entry without a spec of its own does **not** work: lazy.nvim then loads it too late and java-menu.nvim's `setup()` fails with its missing-dependency error (this exact shape was tested and rejected). The `dir` path is wherever you cloned this repository — it is an example, not an install script.
+Declaring jc.nvim only as an inline `dependencies` entry without a spec of its own does **not** work: lazy.nvim then loads it too late and java-menu.nvim's `setup()` fails with its missing-dependency error (this exact shape was tested and rejected). `java-menu.nvim` does not install, download, or vendor `jc.nvim` itself — your plugin manager must install and load `artur-shaik/jc.nvim` before `setup()` runs. The `dir` path is wherever you cloned this repository — it is an example, not an install script.
 
 ### jdtls is your responsibility
 
@@ -256,17 +258,19 @@ These keymaps belong to java-menu.nvim. jc.nvim ships its own separate command/m
 - **Dependencies are text-parsed.** Maven insertion does not use an XML parser; parent/BOM coverage and profile activation are not evaluated. Gradle inspection and editing use static Groovy/Kotlin DSL parsing without executing Gradle. The editor refuses unsupported or ambiguous constructs and never edits version catalogs; use **Open build file** for forms it cannot safely handle. Both editors recheck the file before replacement, but path-based filesystem APIs cannot guarantee conflict-free replacement against an uncooperative concurrent writer in the final instant.
 - **No `git init`, no installs.** Project creation never initializes a repository and never installs or configures any tool.
 - **Platform.** Tested on Linux. No Windows/macOS validation has been done.
-- **jc.nvim version.** Developed against jc.nvim v1.7.0. Compatibility with other versions is what the runtime contract checks make of it — no version matrix is promised.
+- **jc.nvim version.** The tested compatibility baseline is `jc.nvim` `v1.7.0` (pinned commit `0aaf5bbc07ed1a69d66779187d48bfea6ec863b6`). CI also runs the FAST suite against upstream `main` to flag API changes early; that moving branch is a change detector, not a supported-version promise. Because CI runs FAST only (no live `jdtls`, `neotest`, or `nvim-dap`), a passing run does not prove live semantic compatibility on `main` or establish compatibility with other releases or commits. Runtime contract checks disable affected operations (or fall back safely) with a clear reason when an expected API is missing, throws, or changes shape.
 
 ## Testing and development
 
 For setup, contribution workflow, and pull request guidance, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-The repository ships a reproducible test suite (no framework; every spec runs in its own clean headless Neovim session, so no state carries between runs). It is not dependency-free: the fast specs need jc.nvim on the runtimepath, and the integration specs need a real jdtls binary, Maven, and nvim-dap with the java-debug bundle — the runner wires these up from your existing lazy.nvim plugin directory:
+The repository ships a reproducible test suite (no framework; every spec runs in its own clean headless Neovim session, so no state carries between runs). It is not dependency-free: the fast specs need `jc.nvim` on the runtimepath, and the integration specs need a real `jdtls` binary, Maven, and `nvim-dap` with the `java-debug` bundle — the runner wires these up from your existing `lazy.nvim` plugin directory without installing anything itself.
+
+GitHub Actions (`ci.yml`) runs only the 21 FAST specs against the pinned `v1.7.0` baseline commit (`0aaf5bbc07ed1a69d66779187d48bfea6ec863b6`) and current upstream `main` (change detection only), plus `stylua --check` and `:help` validation. Only `v1.7.0` is the compatibility baseline, and this matrix does not claim support for other `jc.nvim` versions. What FAST actually verifies for `jc.nvim` compatibility (`jc_compat_spec`, `modules_spec`, `setup_spec`, `new_template_indent_spec`) is headless module loading, adapter contract checks against real `jc.nvim`, real `jc.test` package-test discovery, `jc.templates` rendering, and mocked API failure/drift paths (missing modules or functions, unexpected return types, thrown errors, and deterministic fallbacks). Live `jc.nvim` + `jdtls` calls (`generate_*`, refactorings, `neotest`, `nvim-dap`) run only in the local `integration` suite, not in CI.
 
 ```sh
 tests/java_menu/run.sh fast         # 21 fast specs — no real server or network needed
-tests/java_menu/run.sh integration  # 9 specs with real JDTLS, DAP, Maven, Gradle, javac and Spring Initializr (skips when optional tools/network are absent)
+tests/java_menu/run.sh integration  # 9 specs with real JDTLS, DAP, Maven, Gradle, javac and Spring Initializr (local only; skips when optional tools/network are absent)
 tests/java_menu/run.sh all
 ```
 
