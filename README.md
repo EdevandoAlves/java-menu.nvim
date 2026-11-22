@@ -267,6 +267,8 @@ These keymaps belong to java-menu.nvim. jc.nvim ships its own separate command/m
 - **Platform.** Linux has the full local test suite. CI also runs a portable smoke suite on macOS and Windows covering setup, project discovery and WorkspaceEdit preview; it does not exercise JDTLS, Maven/Gradle processes, wrappers, symlinks or permissions on those systems. Process-group identity verification may be unavailable outside Linux, so automatic stop/restart can be disabled with a reason.
 - **jc.nvim version.** The tested compatibility baseline is `jc.nvim` `v1.7.0` (pinned commit `0aaf5bbc07ed1a69d66779187d48bfea6ec863b6`). CI also runs the FAST suite against upstream `main` to flag API changes early; that moving branch is a change detector, not a supported-version promise. Because CI runs FAST only (no live `jdtls`, `neotest`, or `nvim-dap`), a passing run does not prove live semantic compatibility on `main` or establish compatibility with other releases or commits. Runtime contract checks disable affected operations (or fall back safely) with a clear reason when an expected API is missing, throws, or changes shape.
 
+See the [phase 8 evaluation](docs/PHASE8_EVALUATION.md) for the tested navigation scenarios and outstanding limits.
+
 ## Testing and development
 
 For setup, contribution workflow, and pull request guidance, see [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -277,7 +279,7 @@ GitHub Actions (`ci.yml`) runs only the 23 FAST specs against the pinned `v1.7.0
 
 ```sh
 tests/java_menu/run.sh fast         # 23 fast specs — no real server or network needed
-tests/java_menu/run.sh integration  # 9 specs with real JDTLS, DAP, Maven, Gradle, javac and Spring Initializr (local only; skips when optional tools/network are absent)
+tests/java_menu/run.sh integration  # 12 specs with real JDTLS, DAP, Maven, Gradle, javac and Spring Initializr (local only; skips when optional tools/network are absent)
 tests/java_menu/run.sh all
 ```
 
