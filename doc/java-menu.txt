@@ -348,8 +348,11 @@ opens a diff view. From there:
 
 Before applying, the plan is revalidated: buffers with unsaved
 modifications to affected files block the apply, and a file that changed
-on disk since the preview opened makes the operation refuse rather than
-corrupt it.
+on disk since the preview opened makes the operation refuse. Path-based
+operations cannot atomically verify source contents or pin parent directories:
+concurrent writes or directory replacements in the final instant can still
+cause conflicts. Renames are refused when a no-overwrite operation is
+unavailable.
 
 Change Signature reads the method signature from jdtls
 (`java/getChangeSignatureInfo`) and lets you reorder/edit parameters,

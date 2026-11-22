@@ -146,8 +146,87 @@ local function run_smoke()
   )
   local maven_mods = project.modules(maven_root)
   assert(#maven_mods == 1, "expected 1 Maven module, got " .. tostring(#maven_mods))
+  local maven_srs = project.source_roots(maven_root)
+  assert(#maven_srs == 1, "expected 1 Maven source root, got " .. tostring(#maven_srs))
+  local maven_pref = project.preferred(maven_srs, maven_buf)
+  assert(
+    maven_pref and maven_pref.path == expected_maven_root .. "/src/main/java",
+    "preferred source root mismatch: " .. tostring(maven_pref and maven_pref.path)
+  )
+  assert(project.package_for(maven_buf, maven_srs[1].path) == "com.smoke", "package_for existing file mismatch")
+
+  local draft_java = vim.fs.joinpath(maven_root, "src", "main", "java", "com", "smoke", "sub", "Draft.java")
+  local draft_buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(draft_buf, draft_java)
+  assert(
+    project.root(draft_buf) == expected_maven_root,
+    "draft buffer Maven root mismatch: " .. tostring(project.root(draft_buf)) .. " ~= " .. expected_maven_root
+  )
+  local draft_pref = project.preferred(maven_srs, draft_buf)
+  assert(
+    draft_pref and draft_pref.path == expected_maven_root .. "/src/main/java",
+    "preferred source root mismatch for draft buffer"
+  )
+  assert(
+    project.package_for(draft_buf, maven_srs[1].path) == "com.smoke.sub",
+    "package_for draft buffer mismatch: " .. tostring(project.package_for(draft_buf, maven_srs[1].path))
+  )
+
   local ws_id = project.workspace_id(maven_root)
   assert(type(ws_id) == "string" and #ws_id > 0, "workspace_id empty")
+  assert(ws_id == project.workspace_id(expected_maven_root), "workspace_id diverged between raw and canonical root")
+
+  local mm_root = make_temp_dir("mm-maven")
+  write_lines(vim.fs.joinpath(mm_root, "pom.xml"), {
+    '<project xmlns="http://maven.apache.org/POM/4.0.0">',
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <groupId>com.mm</groupId>",
+    "  <artifactId>mm-parent</artifactId>",
+    "  <version>1.0</version>",
+    "  <packaging>pom</packaging>",
+    "  <modules>",
+    "    <module>core-module</module>",
+    "    <module>service-module</module>",
+    "  </modules>",
+    "</project>",
+  })
+  write_lines(vim.fs.joinpath(mm_root, "core-module", "pom.xml"), {
+    '<project xmlns="http://maven.apache.org/POM/4.0.0">',
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <artifactId>core-module</artifactId>",
+    "</project>",
+  })
+  write_lines(vim.fs.joinpath(mm_root, "core-module", "src", "main", "java", "com", "mm", "core", "Core.java"), {
+    "package com.mm.core;",
+    "",
+    "public class Core {}",
+  })
+  write_lines(vim.fs.joinpath(mm_root, "service-module", "pom.xml"), {
+    '<project xmlns="http://maven.apache.org/POM/4.0.0">',
+    "  <modelVersion>4.0.0</modelVersion>",
+    "  <artifactId>service-module</artifactId>",
+    "</project>",
+  })
+  local mm_svc_java =
+    vim.fs.joinpath(mm_root, "service-module", "src", "main", "java", "com", "mm", "svc", "Service.java")
+  write_lines(mm_svc_java, {
+    "package com.mm.svc;",
+    "",
+    "public class Service {}",
+  })
+  local expected_mm_root = vim.fs.normalize(vim.uv.fs_realpath(mm_root))
+  local mm_buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(mm_buf, mm_svc_java)
+  assert(
+    project.root(mm_buf) == expected_mm_root,
+    "multi-module Maven root mismatch: " .. tostring(project.root(mm_buf)) .. " ~= " .. expected_mm_root
+  )
+  local mm_srs = project.source_roots(mm_root)
+  local mm_pref = project.preferred(mm_srs, mm_buf)
+  assert(
+    mm_pref and mm_pref.path == expected_mm_root .. "/service-module/src/main/java",
+    "multi-module preferred source root mismatch: " .. tostring(mm_pref and mm_pref.path)
+  )
 
   local gradle_root = make_temp_dir("gradle")
   write_lines(vim.fs.joinpath(gradle_root, "settings.gradle"), {
@@ -188,12 +267,34 @@ local function run_smoke()
   local other_root = make_temp_dir("other")
   assert(preview._inside_project(maven_root, maven_java) == true, "inside_project rejected valid path")
   assert(
+    preview._inside_project(
+      expected_maven_root,
+      vim.fs.joinpath(maven_root, "src", "main", "java", "com", "smoke", "newpkg", "New.java")
+    ) == true,
+    "inside_project rejected non-existent nested path under project root"
+  )
+  assert(
+    preview._inside_project(
+      maven_root,
+      vim.fs.joinpath(expected_maven_root, "src", "main", "java", "com", "smoke", "newpkg", "New.java")
+    ) == true,
+    "inside_project rejected canonical nested path under raw project root"
+  )
+  assert(
     preview._inside_project(maven_root, vim.fs.joinpath(other_root, "App.java")) == false,
     "inside_project accepted sibling directory"
   )
   assert(
+    preview._inside_project(expected_maven_root, vim.fs.joinpath(other_root, "newpkg", "New.java")) == false,
+    "inside_project accepted non-existent path in sibling directory"
+  )
+  assert(
     preview._inside_project(maven_root, maven_root .. "2/src/App.java") == false,
     "inside_project accepted prefix-collision path"
+  )
+  assert(
+    preview._inside_project(expected_maven_root, maven_root .. "2/newpkg/New.java") == false,
+    "inside_project accepted non-existent prefix-collision path"
   )
 
   local plan, plan_err = preview.plan({
@@ -211,6 +312,10 @@ local function run_smoke()
   }, { root = expected_maven_root, encoding = "utf-16" })
   assert(plan ~= nil, "preview.plan failed: " .. tostring(plan_err))
   assert(#plan.files == 1 and plan.files[1].added == 1, "preview.plan diff count unexpected")
+  assert(
+    plan.files[1].diff[1] == "--- a/src/main/java/com/smoke/App.java",
+    "preview.plan diff header should be relative to root, got: " .. tostring(plan.files[1].diff[1])
+  )
 
   local ui = require("java_menu.ui")
   local orig_menu = ui.menu
@@ -227,6 +332,120 @@ local function run_smoke()
   ui.menu = orig_menu
   assert(review_ok, review_err)
   assert(cancelled == true, "preview.review cancel callback did not run")
+
+  local move_src_raw = vim.fs.joinpath(maven_root, "src", "main", "java", "com", "smoke", "MoveTarget.java")
+  write_lines(move_src_raw, {
+    "package com.smoke;",
+    "",
+    "public class MoveTarget {}",
+  })
+  local move_src_buf = vim.fn.bufadd(move_src_raw)
+  vim.fn.bufload(move_src_buf)
+  local renamed_java =
+    vim.fs.joinpath(expected_maven_root, "src", "main", "java", "com", "smoke", "MoveTargetRenamed.java")
+  local stale_dest_buf =
+    vim.fn.bufadd(vim.fs.joinpath(maven_root, "src", "main", "java", "com", "smoke", "MoveTargetRenamed.java"))
+  vim.api.nvim_buf_set_lines(stale_dest_buf, 0, -1, false, { "// unsaved" })
+  assert(vim.bo[stale_dest_buf].modified, "draft destination buffer was not marked modified")
+  assert(
+    preview._modified_buffer_for(renamed_java) == stale_dest_buf,
+    "modified_buffer_for missed unsaved buffer across raw/canonical root"
+  )
+  vim.bo[stale_dest_buf].modified = false
+  pcall(vim.api.nvim_buf_delete, stale_dest_buf, { force = true })
+
+  local rename_plan, rename_err = preview.plan({
+    documentChanges = {
+      {
+        textDocument = { uri = vim.uri_from_fname(renamed_java) },
+        edits = {
+          {
+            range = {
+              start = { line = 2, character = 13 },
+              ["end"] = { line = 2, character = 23 },
+            },
+            newText = "MoveTargetRenamed",
+          },
+        },
+      },
+      {
+        kind = "rename",
+        oldUri = vim.uri_from_fname(move_src_raw),
+        newUri = vim.uri_from_fname(renamed_java),
+      },
+    },
+  }, { root = expected_maven_root, encoding = "utf-16" })
+  assert(rename_plan ~= nil, "mixed-root rename preview.plan failed: " .. tostring(rename_err))
+  assert(
+    rename_plan.files[1].diff[1] == "--- a/src/main/java/com/smoke/MoveTargetRenamed.java",
+    "mixed-root rename diff header mismatch: " .. tostring(rename_plan.files[1].diff[1])
+  )
+  local apply_res, apply_problems = preview._apply(rename_plan)
+  assert(
+    apply_res ~= nil and apply_res.error == nil,
+    "mixed-root rename apply failed: "
+      .. tostring(apply_res and apply_res.error)
+      .. " / "
+      .. vim.inspect(apply_problems)
+  )
+  assert(vim.fn.filereadable(renamed_java) == 1, "renamed file missing after apply")
+  pcall(vim.api.nvim_buf_delete, vim.fn.bufnr(renamed_java), { force = true })
+
+  -- Pure RenameFile preserves unsaved buffer changes across raw/canonical path
+  local unsaved_src_raw = vim.fs.joinpath(maven_root, "src", "main", "java", "com", "smoke", "KeepEdits.java")
+  local unsaved_dst =
+    vim.fs.joinpath(expected_maven_root, "src", "main", "java", "com", "smoke", "KeepEditsRenamed.java")
+  write_lines(unsaved_src_raw, { "package com.smoke;", "", "public class KeepEdits {}" })
+  local unsaved_buf = vim.fn.bufadd(unsaved_src_raw)
+  vim.fn.bufload(unsaved_buf)
+  vim.api.nvim_buf_set_lines(unsaved_buf, 0, -1, false, {
+    "package com.smoke;",
+    "",
+    "public class KeepEdits { int keep = 42; }",
+  })
+  assert(vim.bo[unsaved_buf].modified, "unsaved source buffer was not marked modified")
+  local keep_plan, keep_err = preview.plan({
+    documentChanges = {
+      {
+        kind = "rename",
+        oldUri = vim.uri_from_fname(unsaved_src_raw),
+        newUri = vim.uri_from_fname(unsaved_dst),
+      },
+    },
+  }, { root = expected_maven_root, encoding = "utf-16" })
+  assert(keep_plan ~= nil, "pure rename preview.plan failed: " .. tostring(keep_err))
+  local keep_res, keep_probs = preview._apply(keep_plan)
+  assert(
+    keep_res ~= nil and keep_res.error == nil,
+    "pure rename apply failed: " .. tostring(keep_res and keep_res.error) .. " / " .. vim.inspect(keep_probs)
+  )
+  local kept_new_buf = vim.fn.bufnr(unsaved_dst)
+  assert(kept_new_buf ~= -1 and vim.api.nvim_buf_is_loaded(kept_new_buf), "renamed buffer missing")
+  assert(vim.bo[kept_new_buf].modified, "renamed buffer lost modified flag")
+  assert(
+    table.concat(vim.api.nvim_buf_get_lines(kept_new_buf, 0, -1, false), "\n"):find("int keep = 42;", 1, true) ~= nil,
+    "pure rename lost unsaved buffer edits"
+  )
+  vim.bo[kept_new_buf].modified = false
+  pcall(vim.api.nvim_buf_delete, kept_new_buf, { force = true })
+
+  -- Out-of-project CreateFile blocked in plan and apply
+  local outside_create = vim.fs.joinpath(other_root, "Escape.java")
+  local blocked_plan, blocked_err = preview.plan({
+    documentChanges = {
+      { kind = "create", uri = vim.uri_from_fname(outside_create) },
+    },
+  }, { root = expected_maven_root, encoding = "utf-16" })
+  assert(blocked_plan == nil, "preview.plan allowed CreateFile outside project")
+  assert(type(blocked_err) == "string" and blocked_err:find("outside the project", 1, true) ~= nil)
+  local blocked_apply_res, blocked_apply_probs = preview._apply({
+    root = expected_maven_root,
+    encoding = "utf-16",
+    ops = { { kind = "create", uri = vim.uri_from_fname(outside_create), path = outside_create } },
+    files = {},
+  })
+  assert(blocked_apply_res == nil and #blocked_apply_probs > 0, "apply allowed CreateFile outside project")
+  assert(vim.fn.filereadable(outside_create) == 0, "CreateFile wrote outside project")
 
   -- ---------- 8. Honest portability summary ----------
   print(

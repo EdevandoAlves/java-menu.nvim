@@ -505,6 +505,116 @@ do
   assert(read(doc) == "int a = 1;", "apply bloqueado alterou o documento")
   vim.bo[doc_buf].modified = false
   vim.api.nvim_buf_delete(doc_buf, { force = true })
+
+  -- buffer carregado (limpo) + RenameFile precedendo TextDocumentEdit + disco alterado após prévia:
+  -- bloqueia antes de qualquer mutação, preserva arquivo externo e buffer, e :wa não sobrescreve
+  local stale_src = root .. "/src/LoadedDiskRace.java"
+  local stale_dst = root .. "/src/LoadedDiskRaceRenamed.java"
+  write_file(stale_src, WIDGET)
+  vim.cmd("edit " .. vim.fn.fnameescape(stale_src))
+  local stale_buf = vim.api.nvim_get_current_buf()
+  local plan3 = plan_for(
+    { documentChanges = { rename_op(stale_src, stale_dst), tde(stale_dst, widget_edits("LoadedDiskRaceRenamed")) } },
+    root
+  )
+  assert(type(plan3) == "table", "plan3 falhou")
+  local external_disk = WIDGET:gsub("class Widget", "class WidgetExternal")
+  write_file(stale_src, external_disk)
+  assert_apply_blocked(plan3, "file changed since the preview")
+  assert(read(stale_src) == external_disk, "apply bloqueado alterou o arquivo externo")
+  assert(vim.fn.filereadable(stale_dst) == 0, "apply bloqueado criou o destino")
+  assert(vim.api.nvim_buf_is_valid(stale_buf) and vim.api.nvim_buf_is_loaded(stale_buf), "buffer foi perdido")
+  assert(
+    vim.uv.fs_realpath(vim.api.nvim_buf_get_name(stale_buf)) == vim.uv.fs_realpath(stale_src),
+    "nome do buffer mudou"
+  )
+  assert(join(vim.api.nvim_buf_get_lines(stale_buf, 0, -1, false)) == WIDGET, "conteúdo do buffer mudou")
+  assert(not vim.bo[stale_buf].modified, "buffer limpo foi marcado como modified")
+  vim.cmd("silent wa")
+  assert(read(stale_src) == external_disk, ":wa sobrescreveu alteração externa após bloqueio")
+  vim.api.nvim_buf_delete(stale_buf, { force = true })
+
+  -- A mudança somente no newline final também altera os bytes do arquivo.
+  write_file(stale_src, WIDGET)
+  vim.cmd("edit " .. vim.fn.fnameescape(stale_src))
+  local newline_buf = vim.api.nvim_get_current_buf()
+  local newline_plan = plan_for(
+    { documentChanges = { rename_op(stale_src, stale_dst), tde(stale_dst, widget_edits("LoadedDiskRaceRenamed")) } },
+    root
+  )
+  vim.fn.writefile(vim.split(WIDGET, "\n", { plain = true }), stale_src, "b")
+  assert_apply_blocked(newline_plan, "file changed since the preview")
+  assert(vim.fn.filereadable(stale_dst) == 0, "mudança no newline final criou destino")
+  vim.api.nvim_buf_delete(newline_buf, { force = true })
+
+  -- buffer carregado com edição prévia não salva + RenameFile precedendo TextDocumentEdit + disco alterado após prévia:
+  -- bloqueia e preserva tanto a alteração externa no disco quanto a edição no buffer
+  local dirty_src = root .. "/src/LoadedDirtyDiskRace.java"
+  local dirty_dst = root .. "/src/LoadedDirtyDiskRaceRenamed.java"
+  write_file(dirty_src, WIDGET)
+  vim.cmd("edit " .. vim.fn.fnameescape(dirty_src))
+  local dirty_buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(dirty_buf, 0, 1, false, { "package com.demo; // local-unsaved" })
+  assert(vim.bo[dirty_buf].modified, "buffer de teste não ficou modificado")
+  local dirty_buf_text = join(vim.api.nvim_buf_get_lines(dirty_buf, 0, -1, false))
+  local plan4 = plan_for({
+    documentChanges = { rename_op(dirty_src, dirty_dst), tde(dirty_dst, widget_edits("LoadedDirtyDiskRaceRenamed")) },
+  }, root)
+  assert(type(plan4) == "table", "plan4 falhou")
+  local external_dirty_disk = WIDGET:gsub('return "Widget";', 'return "External";')
+  write_file(dirty_src, external_dirty_disk)
+  assert_apply_blocked(plan4, "file changed since the preview")
+  assert(read(dirty_src) == external_dirty_disk, "arquivo externo foi sobrescrito ou movido")
+  assert(vim.fn.filereadable(dirty_dst) == 0, "destino criado apesar do bloqueio")
+  assert(
+    vim.api.nvim_buf_is_valid(dirty_buf) and vim.api.nvim_buf_is_loaded(dirty_buf),
+    "buffer modificado foi perdido"
+  )
+  assert(join(vim.api.nvim_buf_get_lines(dirty_buf, 0, -1, false)) == dirty_buf_text, "edição do buffer foi perdida")
+  assert(vim.bo[dirty_buf].modified, "buffer perdeu estado modified")
+  vim.bo[dirty_buf].modified = false
+  vim.api.nvim_buf_delete(dirty_buf, { force = true })
+
+  -- corrida após revalidate (entre revalidate e rename_noreplace): buffer carregado + RenameFile -> TextDocumentEdit
+  local race_src = root .. "/src/PostRevalidateDiskRace.java"
+  local race_dst = root .. "/src/PostRevalidateDiskRaceRenamed.java"
+  write_file(race_src, WIDGET)
+  vim.cmd("edit " .. vim.fn.fnameescape(race_src))
+  local race_buf = vim.api.nvim_get_current_buf()
+  local plan5 = plan_for({
+    documentChanges = { rename_op(race_src, race_dst), tde(race_dst, widget_edits("PostRevalidateDiskRaceRenamed")) },
+  }, root)
+  assert(type(plan5) == "table", "plan5 falhou")
+  local external_race_disk = WIDGET:gsub("class Widget", "class WidgetPostRevalidate")
+  local real_fs_stat = vim.uv.fs_stat
+  local injected_disk_race = false
+  vim.uv.fs_stat = function(p)
+    if not injected_disk_race and p == race_src then
+      injected_disk_race = true
+      write_file(race_src, external_race_disk)
+    end
+    return real_fs_stat(p)
+  end
+  local ok_race5, res5 = pcall(preview._apply, plan5)
+  vim.uv.fs_stat = real_fs_stat
+  assert(ok_race5, tostring(res5))
+  assert(injected_disk_race, "injeção pós-revalidate não executou")
+  assert(
+    res5 ~= nil and res5.error ~= nil and res5.error:find("file changed since the preview", 1, true) ~= nil,
+    "apply não bloqueou alteração em disco no ramo rename com buffer carregado: " .. vim.inspect(res5)
+  )
+  assert(read(race_src) == external_race_disk, "corrida no rename moveu/alterou arquivo externo")
+  assert(vim.fn.filereadable(race_dst) == 0, "corrida no rename criou destino")
+  assert(vim.api.nvim_buf_is_valid(race_buf) and vim.api.nvim_buf_is_loaded(race_buf), "buffer foi perdido na corrida")
+  assert(
+    vim.uv.fs_realpath(vim.api.nvim_buf_get_name(race_buf)) == vim.uv.fs_realpath(race_src),
+    "nome do buffer mudou"
+  )
+  assert(join(vim.api.nvim_buf_get_lines(race_buf, 0, -1, false)) == WIDGET, "buffer foi alterado na corrida")
+  assert(not vim.bo[race_buf].modified, "buffer limpo ficou modified na corrida")
+  vim.cmd("silent wa")
+  assert(read(race_src) == external_race_disk, ":wa sobrescreveu alteração externa após corrida")
+  vim.api.nvim_buf_delete(race_buf, { force = true })
 end
 
 -- ---------- L. Cancelamento sem qualquer alteração ----------
@@ -554,6 +664,34 @@ do
   assert(read(new) == join(plan.files[1].after), "disco diverge da prévia após :wa")
 
   ui.menu = original_menu
+end
+
+-- ---------- M. RenameFile puro preserva alterações em buffer não salvo ----------
+
+do
+  local root = scenario_dir("m-rename-unsaved-buffer")
+  local old = widget_fixture(root)
+  local new = root .. "/src/WidgetMoved.java"
+
+  vim.cmd("edit " .. vim.fn.fnameescape(old))
+  local buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(buf, 0, 1, false, { "package com.demo; // buffer-edit" })
+  assert(vim.bo[buf].modified, "buffer de origem não ficou modificado")
+
+  local plan = plan_for({ documentChanges = { rename_op(old, new) } }, root)
+  assert(type(plan) == "table", "plan recusou RenameFile puro")
+  local result, problems = preview._apply(plan)
+  assert(result and not result.error, vim.inspect(problems or (result and result.error)))
+  local new_buf = vim.fn.bufnr(new)
+  assert(new_buf ~= -1 and vim.api.nvim_buf_is_loaded(new_buf), "buffer renomeado ausente")
+  assert(vim.bo[new_buf].modified, "buffer renomeado perdeu estado modified")
+  assert(
+    join(vim.api.nvim_buf_get_lines(new_buf, 0, -1, false)):find("// buffer-edit", 1, true) ~= nil,
+    "RenameFile puro perdeu alterações não salvas do buffer"
+  )
+  vim.cmd("silent wa")
+  assert(read(new):find("// buffer-edit", 1, true) ~= nil, "disco diverge após :wa")
+  pcall(vim.api.nvim_buf_delete, new_buf, { force = true })
 end
 
 print("preview_workspaceedit_spec: OK")

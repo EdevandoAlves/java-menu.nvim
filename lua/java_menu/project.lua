@@ -36,27 +36,64 @@ local function has_any(dir, list)
   return false
 end
 
----Reference path of the buffer (file, netrw directory or cwd).
----@param buf number|nil
----@return string
-function M.start_path(buf)
-  buf = buf and buf > 0 and buf or vim.api.nvim_get_current_buf()
-  local name = vim.api.nvim_buf_get_name(buf)
-  if name == "" then
-    return vim.fs.normalize(vim.uv.cwd())
-  end
-  return vim.fs.normalize(name)
-end
-
 ---Canonical path (realpath + normalized) or nil when it does not exist.
 local function canonical(path)
   local real = vim.uv.fs_realpath(path)
   return real and vim.fs.normalize(real) or nil
 end
 
+---Resolve `candidate` to its canonical path if it exists, or otherwise normalize
+---lexically while canonicalizing its deepest existing ancestor so non-existent
+---paths outside `root` (or through outward symlinks / Windows short paths)
+---still resolve consistently.
+local function resolve_lexical_or_canonical(candidate)
+  local canon = canonical(candidate)
+  if canon then
+    return canon, true
+  end
+  local norm = vim.fs.normalize(candidate)
+  local cur, tail = norm, ""
+  while cur and cur ~= "" and cur ~= "/" do
+    local c = canonical(cur)
+    if c then
+      return (tail == "" and c or (c:gsub("/+$", "") .. "/" .. tail)), false
+    end
+    local parent = vim.fs.dirname(cur)
+    local base = vim.fs.basename(cur)
+    if not parent or parent == cur then
+      break
+    end
+    tail = tail == "" and base or (base .. "/" .. tail)
+    cur = parent
+  end
+  return norm, false
+end
+
+local function is_abs_path(path)
+  return path:sub(1, 1) == "/" or path:match("^%a:[/\\]") ~= nil or path:sub(1, 2) == "\\\\"
+end
+
+---Reference path of the buffer (file, netrw directory or cwd), canonicalized
+---when its file or an ancestor directory exists on disk.
+---@param buf number|nil
+---@return string
+function M.start_path(buf)
+  buf = buf and buf > 0 and buf or vim.api.nvim_get_current_buf()
+  local name = vim.api.nvim_buf_get_name(buf)
+  local raw = name ~= "" and name or vim.uv.cwd() or "."
+  local lstat = vim.uv.fs_lstat(raw)
+  if lstat and lstat.type == "link" and not isdir(raw) then
+    local dir = resolve_lexical_or_canonical(vim.fs.dirname(raw))
+    return dir:gsub("/+$", "") .. "/" .. vim.fs.basename(raw)
+  end
+  local resolved = resolve_lexical_or_canonical(raw)
+  return resolved
+end
+
 ---Is `path` inside the subtree of `parent` (both canonical)?
 local function subtree(parent, path)
-  return parent == path or path:sub(1, #parent + 1) == parent .. "/"
+  local sep = parent:sub(-1) == "/" and "" or "/"
+  return parent == path or path:sub(1, #parent + #sep) == parent .. sep
 end
 
 ---Does `parent` declare `child` as a module (Maven <module> / Gradle include)?
@@ -108,7 +145,7 @@ function M.root(buf)
       found = dir
       local parent = vim.fs.dirname(dir)
       if not parent or parent == dir then
-        return found
+        return canonical(found) or found
       end
       if has_any(parent, M.markers) and declares_module(parent, vim.fs.basename(dir)) then
         dir = parent -- aggregates; the preferred source root is resolved later
@@ -116,7 +153,7 @@ function M.root(buf)
         -- a higher aggregator may declare this module with a relative path
         -- aninhado (<module>libraries/core</module> / :libraries:core)
         local ancestor = topmost_aggregator(dir)
-        return ancestor or found
+        return ancestor or canonical(found) or found
       end
     else
       local parent = vim.fs.dirname(dir)
@@ -126,7 +163,7 @@ function M.root(buf)
       dir = parent
     end
   end
-  return found
+  return found and (canonical(found) or found) or nil
 end
 
 ---@param buf number|nil
@@ -171,7 +208,7 @@ local function maven_modules(root, seen, depth)
   end
   local out = {}
   for _, decl in ipairs(pom_module_decls(root .. "/pom.xml")) do
-    local candidate = decl:sub(1, 1) == "/" and decl or (root .. "/" .. decl)
+    local candidate = is_abs_path(decl) and decl or (root .. "/" .. decl)
     local dir = canonical(candidate)
     if dir and dir ~= root and subtree(root, dir) and not seen[dir] then
       seen[dir] = true
@@ -611,7 +648,7 @@ local function parse_static_project_dir(expr, depth, is_groovy)
       local lit = unquote_literal(args[1])
       if lit then
         local val, reason = validate_dir_literal(args[1], is_groovy)
-        return val, (val ~= nil and val:sub(1, 1) == "/"), reason
+        return val, (val ~= nil and is_abs_path(val)), reason
       end
       if depth == 0 then
         return parse_static_project_dir(args[1], 1, is_groovy)
@@ -623,7 +660,7 @@ local function parse_static_project_dir(expr, depth, is_groovy)
   local file_bare = expr:match("^file%s+(.+)$")
   if file_bare then
     local val, reason = validate_dir_literal(file_bare, is_groovy)
-    return val, (val ~= nil and val:sub(1, 1) == "/"), reason
+    return val, (val ~= nil and is_abs_path(val)), reason
   end
 
   local file_ctor_args = expr:match("^new%s+java%.io%.File%s*(%b())$")
@@ -634,7 +671,7 @@ local function parse_static_project_dir(expr, depth, is_groovy)
     local args = split_top_level_args(file_ctor_args:sub(2, -2), is_groovy)
     if #args == 1 then
       local val, reason = validate_dir_literal(args[1], is_groovy)
-      return val, (val ~= nil and val:sub(1, 1) == "/"), reason
+      return val, (val ~= nil and is_abs_path(val)), reason
     elseif #args == 2 then
       local base = args[1]:gsub("%s+", "")
       if STATIC_GRADLE_BASE_DIRS[base] then
@@ -655,7 +692,7 @@ local function parse_static_project_dir(expr, depth, is_groovy)
     if STATIC_GRADLE_BASE_DIRS[base] and #args == 1 then
       local val, reason = validate_dir_literal(args[1], is_groovy)
       if val then
-        if val:sub(1, 1) == "/" then
+        if is_abs_path(val) then
           return val, true, nil
         end
         return val, false, nil
@@ -760,32 +797,6 @@ local function has_apply_from(raw, code_only)
   return false
 end
 
----Resolve `candidate` to its canonical path if it exists, or otherwise normalize
----lexically while canonicalizing its deepest existing ancestor so non-existent
----paths outside `root` (or through outward symlinks) are still detected.
-local function resolve_lexical_or_canonical(candidate)
-  local canon = canonical(candidate)
-  if canon then
-    return canon, true
-  end
-  local norm = vim.fs.normalize(candidate)
-  local cur, tail = norm, ""
-  while cur and cur ~= "" and cur ~= "/" do
-    local c = canonical(cur)
-    if c then
-      return (tail == "" and c or (c:gsub("/+$", "") .. "/" .. tail)), false
-    end
-    local parent = vim.fs.dirname(cur)
-    local base = vim.fs.basename(cur)
-    if not parent or parent == cur then
-      break
-    end
-    tail = tail == "" and base or (base .. "/" .. tail)
-    cur = parent
-  end
-  return norm, false
-end
-
 ---Skip `(` ... `)` starting at `open_idx` while respecting string literals.
 local function skip_paren_group(text, open_idx, is_groovy)
   local depth, i, n = 0, open_idx, #text
@@ -886,7 +897,7 @@ end
 ---@param root string canonical root
 ---@return string[] dirs, string|nil note, table<string,string> logical_by_dir
 function gradle_modules(root)
-  root = canonical(root) or root
+  root = canonical(root) or vim.fs.normalize(root)
   local settings = root .. "/settings.gradle"
   local kts = root .. "/settings.gradle.kts"
   local path = isfile(settings) and settings or (isfile(kts) and kts or nil)
@@ -1361,7 +1372,7 @@ function topmost_aggregator(dir)
   end
   local top, depth = nil, 0
   local cur = vim.fs.dirname(target)
-  while cur and #cur > 3 and depth < 16 do
+  while cur and cur ~= "" and cur ~= vim.fs.dirname(cur) and depth < 16 do
     depth = depth + 1
     local declared
     if isfile(cur .. "/pom.xml") then
@@ -1389,7 +1400,7 @@ end
 ---@param root string
 ---@return string[]
 local function modules(root)
-  root = canonical(root) or root
+  root = canonical(root) or vim.fs.normalize(root)
   local list = { root }
   if isfile(root .. "/pom.xml") then
     vim.list_extend(list, maven_modules(root, { [root] = true }, 0))
@@ -1412,7 +1423,7 @@ end
 ---@param root string
 ---@return string|nil note
 function M.discovery_limitation(root)
-  root = canonical(root) or root
+  root = canonical(root) or vim.fs.normalize(root)
   if isfile(root .. "/pom.xml") then
     return nil
   end
@@ -1427,8 +1438,8 @@ end
 ---@param dir string
 ---@return string
 function M.gradle_path(root, dir)
-  root = canonical(root) or root
-  dir = canonical(dir) or dir
+  root = canonical(root) or vim.fs.normalize(root)
+  dir = canonical(dir) or vim.fs.normalize(dir)
   local _, _, logical_by_dir = gradle_modules(root)
   if logical_by_dir[dir] then
     return logical_by_dir[dir]
@@ -1444,7 +1455,7 @@ end
 ---@param root string
 ---@return table[] { path, module, set, label }
 function M.source_roots(root)
-  local canon_root = canonical(root) or root
+  local canon_root = canonical(root) or vim.fs.normalize(root)
   local out = {}
   for _, mod in ipairs(modules(root)) do
     for _, set in ipairs({ "main", "test" }) do
@@ -1471,7 +1482,8 @@ end
 function M.preferred(roots, buf)
   local name = M.start_path(buf)
   for _, r in ipairs(roots) do
-    if r.set == "main" and name:sub(1, #r.path + 1) == r.path .. "/" then
+    local rp = resolve_lexical_or_canonical(r.path)
+    if r.set == "main" and subtree(rp, name) then
       return r
     end
   end
@@ -1488,6 +1500,7 @@ end
 ---@param limit integer|nil
 ---@return string[]
 function M.packages(source_root, limit)
+  source_root = resolve_lexical_or_canonical(source_root)
   local seen, out = {}, {}
   local files = vim.fs.find(function(name)
     return name:sub(-5) == ".java"
@@ -1533,7 +1546,9 @@ function M.package_for(buf, source_root)
   end
 
   local dir = isdir(name) and name or vim.fs.dirname(name)
-  local rel = vim.fs.relpath(source_root, dir)
+  local canon_sr = resolve_lexical_or_canonical(source_root)
+  local canon_dir = resolve_lexical_or_canonical(dir)
+  local rel = vim.fs.relpath(canon_sr, canon_dir)
   if rel and rel ~= "" and rel ~= "." and not rel:match("^%.%.") then
     return (rel:gsub("/", "."))
   end
@@ -1553,9 +1568,8 @@ end
 ---@param root string
 ---@return string
 function M.workspace_id(root)
-  local real = vim.uv.fs_realpath(root) or root
-  local canonical = vim.fs.normalize(real)
-  return (canonical:gsub("%%", "%%%%"):gsub("/", "%%"))
+  local canonical_root = resolve_lexical_or_canonical(root)
+  return (canonical_root:gsub("%%", "%%%%"):gsub("/", "%%"))
 end
 
 ---Project-exclusive `-data` directory (JDTLS creates it when missing).
