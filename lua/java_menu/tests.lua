@@ -103,6 +103,407 @@ local function owning_module(path, modules)
   return best
 end
 
+---Is `path` inside `parent` (both canonical)?
+---@param parent string|nil
+---@param path string|nil
+---@return boolean
+local function subtree(parent, path)
+  if not parent or not path then
+    return false
+  end
+  local sep = parent:sub(-1) == "/" and "" or "/"
+  return parent == path or path:sub(1, #parent + #sep) == parent .. sep
+end
+
+---Canonicalized list of declared project modules.
+---@param root string|nil
+---@return string[]
+local function canonical_modules(root)
+  local raw = root and project.modules(root) or {}
+  local out, seen = {}, {}
+  for _, m in ipairs(raw) do
+    local cm = canonical(m)
+    if cm and not seen[cm] then
+      seen[cm] = true
+      out[#out + 1] = cm
+    end
+  end
+  return out
+end
+
+local function canonical_modules_set(root, mods)
+  local set = {}
+  local croot = canonical(root)
+  if croot then
+    set[croot] = true
+  end
+  for _, m in ipairs(mods or (croot and canonical_modules(croot) or {})) do
+    local cm = canonical(m)
+    if cm then
+      set[cm] = true
+    end
+  end
+  return set
+end
+
+---True when `cpath` sits inside an independent nested project or checkout
+---strictly below `croot` (nested `.git`, `settings.gradle(.kts)`, or an
+---undeclared `pom.xml`/`build.gradle(.kts)`).
+---@param cpath string
+---@param croot string
+---@param mods_set table<string, boolean>|nil
+---@return boolean
+local function has_nested_project_boundary(cpath, croot, mods_set)
+  local dir = vim.fn.isdirectory(cpath) == 1 and cpath or vim.fs.dirname(cpath)
+  while dir and dir ~= "" and subtree(croot, dir) and dir ~= croot do
+    if vim.uv.fs_stat(dir .. "/.git") ~= nil then
+      return true
+    end
+    if
+      vim.fn.filereadable(dir .. "/settings.gradle") == 1
+      or vim.fn.filereadable(dir .. "/settings.gradle.kts") == 1
+    then
+      return true
+    end
+    if
+      (
+        vim.fn.filereadable(dir .. "/pom.xml") == 1
+        or vim.fn.filereadable(dir .. "/build.gradle") == 1
+        or vim.fn.filereadable(dir .. "/build.gradle.kts") == 1
+      ) and not (mods_set and mods_set[dir])
+    then
+      return true
+    end
+    local parent = vim.fs.dirname(dir)
+    if not parent or parent == dir then
+      break
+    end
+    dir = parent
+  end
+  return false
+end
+
+---Whether `adapter_id` identifies the `jc` neotest adapter owning `root`
+---(and `target_mod` when scoped to a module), excluding other adapters and
+---other projects.
+---@param adapter_id string
+---@param adapter_obj table|nil
+---@param root string
+---@param target_mod string|nil
+---@param mods string[]|nil
+---@return boolean
+local function is_jc_adapter_for_scope(adapter_id, adapter_obj, root, target_mod, mods)
+  if type(adapter_id) ~= "string" then
+    return false
+  end
+  local ad_root = adapter_id:match("^jc:(.+)$")
+  if not ad_root then
+    return false
+  end
+  if type(adapter_obj) == "table" and adapter_obj.name ~= nil and adapter_obj.name ~= "jc" then
+    return false
+  end
+  local cad = canonical(ad_root)
+  if not cad then
+    return false
+  end
+  if cad == root then
+    return true
+  end
+  if target_mod then
+    return cad == target_mod or (subtree(root, cad) and subtree(cad, target_mod))
+  end
+  if not subtree(root, cad) then
+    return false
+  end
+  for _, m in ipairs(mods or {}) do
+    if cad == m then
+      return true
+    end
+  end
+  return false
+end
+
+---Per-(project, module) Repeat Last Test history, isolated from jc.test's and
+---neotest's global last-run state.
+local last_runs = {}
+local run_seq = 0
+local resolve_suite_replay_path
+local pos_belongs_to_scope
+
+local function run_in_nio(nio, body_fn, on_finish)
+  local settled = false
+  local function settle(ok, err)
+    if not settled then
+      settled = true
+      on_finish(ok, err)
+    end
+  end
+  local ok_nio, nio_err = pcall(nio.run, function()
+    local ok_body, body_err = xpcall(body_fn, debug.traceback)
+    if not ok_body then
+      settle(false, body_err)
+      return
+    end
+    settle(true, nil)
+  end, function(task_ok, task_err)
+    settle(task_ok == true, not task_ok and task_err or nil)
+  end)
+  if not ok_nio then
+    settle(false, nio_err)
+    return false, nio_err
+  end
+  return true, nil
+end
+
+local function scope_key(root, mod_dir)
+  local croot = canonical(root) or ""
+  local cmod = canonical(mod_dir) or croot
+  return croot .. "::" .. cmod
+end
+
+local function record_last_run(kind, path, root, mod_dir, suite_dir, pos_id, adapter_id)
+  local croot = canonical(root)
+  if not croot then
+    return
+  end
+  local cmod = canonical(mod_dir) or croot
+  local cpath = canonical(path) or path
+  local csuite = suite_dir and (canonical(suite_dir) or suite_dir) or nil
+  run_seq = run_seq + 1
+  last_runs[scope_key(croot, cmod)] = {
+    kind = kind,
+    path = cpath,
+    root = croot,
+    module = cmod,
+    suite_dir = csuite,
+    pos_id = pos_id,
+    adapter_id = adapter_id,
+    seq = run_seq,
+  }
+end
+
+pos_belongs_to_scope = function(pos_id, root, mod_dir, mods)
+  if type(pos_id) ~= "string" or pos_id == "" then
+    return false
+  end
+  local raw_path = pos_id:match("^(.-)::") or pos_id
+  local cpath = canonical(raw_path)
+  local croot = canonical(root)
+  if not cpath or not croot or not subtree(croot, cpath) then
+    return false
+  end
+  local eff_mods = mods or canonical_modules(croot)
+  local mods_set = canonical_modules_set(croot, eff_mods)
+  if has_nested_project_boundary(cpath, croot, mods_set) then
+    return false
+  end
+  local cmod = canonical(mod_dir) or croot
+  if eff_mods and #eff_mods > 0 then
+    local pos_mod = owning_module(cpath, eff_mods) or croot
+    return pos_mod == cmod
+  end
+  if cmod ~= croot then
+    return subtree(cmod, cpath)
+  end
+  return true
+end
+
+local function neotest_last_run(nt)
+  if not (nt and nt.run and type(nt.run.get_last_run) == "function") then
+    return nil, nil
+  end
+  local ok, pos_id, args = pcall(nt.run.get_last_run)
+  if not ok then
+    return nil, nil
+  end
+  return pos_id, args
+end
+
+local function neotest_pinned_runner_apis(nt)
+  local ok_ref, refresh = pcall(require, "jc.neotest.refresh")
+  local ok_tgt, target_mod = pcall(require, "jc.neotest.target")
+  local ok_cons, cons = pcall(require, "jc.neotest.consumer")
+  if
+    not (
+      nt
+      and type(nt.run) == "table"
+      and type(nt.run.run) == "function"
+      and ok_ref
+      and type(refresh) == "table"
+      and type(refresh.before_run) == "function"
+      and ok_tgt
+      and type(target_mod) == "table"
+      and type(target_mod.run_args) == "function"
+    )
+  then
+    return nil
+  end
+  return {
+    refresh = refresh,
+    target_mod = target_mod,
+    cons = ok_cons and type(cons) == "table" and cons or nil,
+  }
+end
+
+local function verified_jc_adapter_for_scope(ad_id, cons, path, croot, cmod, mods, target_mod)
+  local candidate = type(ad_id) == "string" and ad_id ~= "" and ad_id or nil
+  if
+    not candidate
+    and target_mod
+    and type(target_mod.adapter_id) == "function"
+    and type(path) == "string"
+    and path ~= ""
+  then
+    local ok_a, aid = pcall(target_mod.adapter_id, path)
+    if ok_a and type(aid) == "string" and aid ~= "" then
+      candidate = aid
+    end
+  end
+  if not candidate then
+    return nil
+  end
+  local ad_obj = cons and cons.client and type(cons.client._adapters) == "table" and cons.client._adapters[candidate]
+    or nil
+  if not is_jc_adapter_for_scope(candidate, ad_obj, croot, cmod, mods) then
+    return nil
+  end
+  return candidate
+end
+
+local function last_run_state(root, mod_dir, mods, nt)
+  local croot = canonical(root)
+  local cmod = canonical(mod_dir) or croot
+  local rec = croot and last_runs[scope_key(croot, cmod)] or nil
+  local nt_pos, nt_args = neotest_last_run(nt)
+  local ok_cons, cons = pcall(require, "jc.neotest.consumer")
+  local cons_tbl = ok_cons and type(cons) == "table" and cons or nil
+
+  if rec then
+    if rec.kind == "file" then
+      if not rec.path or vim.fn.filereadable(rec.path) ~= 1 then
+        return {
+          available = false,
+          reason = "last test file no longer exists on disk",
+        }
+      end
+      return {
+        available = true,
+        rec = rec,
+        detail = vim.fs.basename(rec.path),
+      }
+    end
+    if rec.kind == "suite" then
+      local replay_path, target_suite = resolve_suite_replay_path(rec)
+      if not replay_path or not target_suite then
+        return {
+          available = false,
+          reason = "original suite target no longer matches or exists",
+        }
+      end
+      local detail = target_suite ~= croot and ("suite: " .. module_label(croot, target_suite))
+        or (mods and #mods > 1 and "suite: all modules" or "suite")
+      return {
+        available = true,
+        rec = rec,
+        detail = detail,
+      }
+    end
+    -- rec.kind == "nearest": never fall back to global jc.run_last without a fixed safe target
+    if type(rec.pos_id) ~= "string" or rec.pos_id == "" then
+      return {
+        available = false,
+        reason = "last nearest-test run has no pinned test position",
+      }
+    end
+    if not pos_belongs_to_scope(rec.pos_id, croot, cmod, mods) then
+      return {
+        available = false,
+        reason = "last nearest-test run is outside this project or module",
+      }
+    end
+    if not rec.path or vim.fn.filereadable(rec.path) ~= 1 then
+      return {
+        available = false,
+        reason = "last test file no longer exists on disk",
+      }
+    end
+    local apis = neotest_pinned_runner_apis(nt)
+    if not apis then
+      return {
+        available = false,
+        reason = "cannot replay nearest test safely without neotest/jc target APIs",
+      }
+    end
+    local ad_id = verified_jc_adapter_for_scope(rec.adapter_id, cons_tbl, rec.path, croot, cmod, mods, apis.target_mod)
+    if not ad_id then
+      return {
+        available = false,
+        reason = "last nearest-test run has no verified jc adapter for this scope",
+      }
+    end
+    return {
+      available = true,
+      rec = rec,
+      adapter_id = ad_id,
+      detail = vim.fs.basename(rec.path),
+    }
+  end
+
+  if nt_pos ~= nil then
+    if not pos_belongs_to_scope(nt_pos, croot, cmod, mods) then
+      return {
+        available = false,
+        reason = "last neotest run belongs to another project or module",
+      }
+    end
+    local nt_adapter = type(nt_args) == "table" and nt_args.adapter or nil
+    local ad_obj = nt_adapter
+        and cons_tbl
+        and cons_tbl.client
+        and type(cons_tbl.client._adapters) == "table"
+        and cons_tbl.client._adapters[nt_adapter]
+      or nil
+    if not (type(nt_adapter) == "string" and is_jc_adapter_for_scope(nt_adapter, ad_obj, croot, cmod, mods)) then
+      return {
+        available = false,
+        reason = "last neotest run has no verified jc adapter for this scope",
+      }
+    end
+    local apis = neotest_pinned_runner_apis(nt)
+    if not apis then
+      return {
+        available = false,
+        reason = "cannot replay neotest run safely without neotest/jc target APIs",
+      }
+    end
+    local raw_path = nt_pos:match("^(.-)::") or nt_pos
+    local cpath = canonical(raw_path)
+    if not cpath or (vim.fn.filereadable(cpath) ~= 1 and vim.fn.isdirectory(cpath) ~= 1) then
+      return {
+        available = false,
+        reason = "last neotest target no longer exists on disk",
+      }
+    end
+    return {
+      available = true,
+      pinned = {
+        pos_id = nt_pos,
+        path = cpath,
+        root = croot,
+        module = cmod,
+        adapter_id = nt_adapter,
+      },
+      detail = vim.fs.basename(cpath),
+    }
+  end
+
+  return {
+    available = false,
+    reason = "no previous test run in this project/module",
+  }
+end
+
 ---Parse a Java file under `.../src/(main|test)/java/<pkg>/<Name>.java`.
 ---@param path string|nil
 ---@return table|nil
@@ -540,8 +941,131 @@ local function goto_counterpart(buf_or_path, root)
   end)
 end
 
+local SUITE_BUILD_MARKERS = {
+  "settings.gradle",
+  "settings.gradle.kts",
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+}
+
+local JC_SUITE_MARKERS = {
+  "settings.gradle",
+  "settings.gradle.kts",
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+  ".git",
+}
+
+---Effective root directory `jc.test.run_all()` resolves from `buf_or_path`.
+---@param buf_or_path integer|string
+---@return string
+local function effective_jc_suite_target(buf_or_path)
+  local found = vim.fs.root(buf_or_path, JC_SUITE_MARKERS)
+  if found and found ~= "" then
+    return canonical(found) or found
+  end
+  local cwd = vim.fn.getcwd()
+  return canonical(cwd) or cwd
+end
+
+---Directory `jc.test.run_all()` will actually target from `cur_buf` / `cur_path`,
+---or nil when `jc.test.run_all()` resolves outside `root`.
+---@param cur_path string|nil
+---@param root string
+---@param cur_buf integer|nil
+---@return string|nil suite_dir, boolean valid
+local function suite_target_dir(cur_path, root, cur_buf)
+  local croot = canonical(root) or root
+  local probe = (cur_buf and vim.api.nvim_buf_is_valid(cur_buf)) and cur_buf or cur_path
+  if probe and probe ~= "" then
+    local eff = effective_jc_suite_target(probe)
+    if eff and subtree(croot, eff) then
+      return eff, true
+    end
+  end
+  return nil, false
+end
+
+local function maybe_open_jc_summary(nt, target_path)
+  local ok_jc, jc_mod = pcall(require, "jc")
+  local t = ok_jc and type(jc_mod) == "table" and jc_mod.config and jc_mod.config.test
+  if t and t.open_summary == false then
+    return
+  end
+  if nt and nt.summary and type(nt.summary.open) == "function" then
+    pcall(nt.summary.open)
+  end
+  if target_path and nt and nt.summary and type(nt.summary.expand) == "function" then
+    vim.defer_fn(function()
+      pcall(function()
+        nt.summary:expand(target_path, true)
+      end)
+    end, 300)
+  end
+end
+
+local function launch_nt_run(opts)
+  local nt = opts.nt
+  local nio = opts.nio
+  local err_prefix = opts.err_prefix or "could not run test: "
+  local use_nio = nio ~= nil and type(nio) == "table" and type(nio.run) == "function"
+
+  if use_nio then
+    local ok_nio_call, nio_err = run_in_nio(nio, function()
+      local ok_run, run_err = pcall(nt.run.run, opts.args)
+      if not ok_run then
+        error(run_err)
+      end
+    end, function(ok, err)
+      if not ok and err then
+        vim.schedule(function()
+          ui.notify(err_prefix .. tostring(err), vim.log.levels.ERROR)
+        end)
+      end
+    end)
+    if not ok_nio_call then
+      ui.notify(err_prefix .. tostring(nio_err), vim.log.levels.ERROR)
+      return false
+    end
+  else
+    local ok_run, run_err = pcall(nt.run.run, opts.args)
+    if not ok_run then
+      ui.notify(err_prefix .. tostring(run_err), vim.log.levels.ERROR)
+      return false
+    end
+  end
+
+  maybe_open_jc_summary(nt, opts.summary_path)
+  if opts.on_started then
+    opts.on_started()
+  end
+  return true
+end
+
+local function dispatch_test_file(bufnr, path, root, is_test, mod, jc)
+  if type(jc.run_file) ~= "function" then
+    ui.notify("jc test runner is not available", vim.log.levels.ERROR)
+    return
+  end
+  local ok, err = pcall(vim.api.nvim_buf_call, bufnr, jc.run_file)
+  if not ok then
+    ui.notify("could not run test: " .. tostring(err), vim.log.levels.ERROR)
+    return
+  end
+  if is_test and root then
+    record_last_run("file", path, root, mod)
+  end
+end
+
 ---Run a test file through neotest using the jc adapter.
-local function run_file(path)
+local function run_file(path, root_hint)
+  local jc_guard = lsp.jc_global_reason("Tests")
+  if jc_guard then
+    ui.notify(jc_guard, vim.log.levels.WARN)
+    return
+  end
   local jc = jc_test()
   if not jc or type(jc.run_file) ~= "function" then
     ui.notify("jc test runner is not available", vim.log.levels.ERROR)
@@ -549,13 +1073,17 @@ local function run_file(path)
   end
   local buf = vim.fn.bufadd(path)
   vim.fn.bufload(buf)
-  local ok, err = pcall(vim.api.nvim_buf_call, buf, jc.run_file)
-  if not ok then
-    ui.notify("could not run test: " .. tostring(err), vim.log.levels.ERROR)
+  local cpath = canonical(path) or path
+  local troot = canonical(root_hint or project.root(buf))
+  local tmod = nil
+  if troot then
+    local mods = canonical_modules(troot)
+    tmod = owning_module(cpath, mods) or troot
   end
+  dispatch_test_file(buf, cpath, troot, true, tmod, jc)
 end
 
-local function pick_and_run_matches(matches, prompt)
+local function pick_and_run_matches(matches, prompt, root)
   local labels, by_label = {}, {}
   for _, m in ipairs(matches) do
     local label = m.module_label .. " · " .. m.fqn
@@ -564,41 +1092,331 @@ local function pick_and_run_matches(matches, prompt)
   end
   ui.pick_one(labels, prompt, function(choice)
     if by_label[choice] then
-      run_file(by_label[choice])
+      run_file(by_label[choice], root)
     end
   end)
+end
+
+local function find_nearest_pos_id(cons, nt_lib, target_path, raw_path, row0, root, mod, target_mod)
+  if not (cons and cons.client and cons.client._state and type(cons.client._state.positions) == "function") then
+    return nil, nil
+  end
+  if not (nt_lib and nt_lib.positions and type(nt_lib.positions.nearest) == "function") then
+    return nil, nil
+  end
+  local real_path = (nt_lib.files and nt_lib.files.path and type(nt_lib.files.path.real) == "function")
+      and (nt_lib.files.path.real(target_path) or target_path)
+    or target_path
+  local candidate_adapters = {}
+  local seen_ad = {}
+  local function add_ad(id)
+    if type(id) == "string" and id ~= "" and not seen_ad[id] then
+      seen_ad[id] = true
+      candidate_adapters[#candidate_adapters + 1] = id
+    end
+  end
+  if target_mod and type(target_mod.adapter_id) == "function" then
+    local ok_a, aid1 = pcall(target_mod.adapter_id, real_path)
+    if ok_a then
+      add_ad(aid1)
+    end
+    local ok_b, aid2 = pcall(target_mod.adapter_id, raw_path)
+    if ok_b then
+      add_ad(aid2)
+    end
+  end
+  if type(cons.client._adapters) == "table" then
+    local croot = canonical(root)
+    local mods = croot and canonical_modules(croot) or {}
+    for id, obj in pairs(cons.client._adapters) do
+      if croot and is_jc_adapter_for_scope(id, obj, croot, mod, mods) then
+        add_ad(id)
+      end
+    end
+  end
+  for _, ad_id in ipairs(candidate_adapters) do
+    for _, key in ipairs({ real_path, target_path, raw_path }) do
+      if type(key) == "string" and key ~= "" then
+        local ok_tree, file_tree = pcall(cons.client._state.positions, cons.client._state, ad_id, key)
+        if ok_tree and file_tree and type(file_tree.iter_nodes) == "function" then
+          local ok_n, nearest = pcall(nt_lib.positions.nearest, file_tree, row0)
+          if ok_n and nearest and type(nearest.data) == "function" then
+            local ok_d, data = pcall(nearest.data, nearest)
+            if ok_d and type(data) == "table" and type(data.id) == "string" and data.id ~= "" then
+              return data.id, ad_id
+            end
+          end
+        end
+      end
+    end
+  end
+  return nil, nil
+end
+
+local function build_pinned_run_args(target_mod, cons, pos_id, path, matched_ad)
+  local args = target_mod.run_args(pos_id, path)
+  if type(args) == "table" and not args.adapter and matched_ad and type(target_mod._pinnable) == "function" then
+    local ok_p, pinnable = pcall(target_mod._pinnable, cons.client, matched_ad, pos_id)
+    if ok_p and pinnable then
+      args.adapter = matched_ad
+    end
+  end
+  return args
+end
+
+local function run_nearest_in_buffer(bufnr, path, root, is_test, mod, jc)
+  if vim.api.nvim_get_current_buf() ~= bufnr then
+    ui.notify("the buffer changed — cannot run test at cursor", vim.log.levels.WARN)
+    return
+  end
+  local cpath = canonical(path) or path
+  local croot = canonical(root) or root
+  local row0 = vim.api.nvim_win_get_cursor(0)[1] - 1
+
+  local nt = neotest()
+  local ok_ref, refresh = pcall(require, "jc.neotest.refresh")
+  local ok_tgt, target_mod = pcall(require, "jc.neotest.target")
+  local ok_cons, cons = pcall(require, "jc.neotest.consumer")
+  local ok_lib, nt_lib = pcall(require, "neotest.lib")
+  local ok_nio, nio = pcall(require, "nio")
+  local ok_jcnt, jc_nt = pcall(require, "jc.neotest")
+
+  local nothing_to_run = type(jc._nothing_to_run) == "function" and select(2, pcall(jc._nothing_to_run, path)) == true
+  if nothing_to_run then
+    if type(jc._package_tests) == "function" then
+      local ok, files = pcall(jc._package_tests, path)
+      local labels, targets = {}, {}
+      local mods = canonical_modules(croot)
+      if ok and type(files) == "table" then
+        for _, file in ipairs(files) do
+          if type(file) == "string" and pos_belongs_to_scope(file, croot, mod, mods) then
+            local label = test_fqn(file)
+            labels[#labels + 1] = label
+            targets[label] = file
+          end
+        end
+      end
+      if #labels > 0 then
+        ui.pick_one(labels, "Java: Tests — run from package", function(choice)
+          if targets[choice] then
+            run_file(targets[choice], root)
+          end
+        end)
+        return
+      end
+    end
+    ui.notify("no tests in " .. vim.fs.basename(path), vim.log.levels.WARN)
+    return
+  end
+
+  local has_started_client = ok_cons and type(cons) == "table" and cons.client and cons.client._started == true
+  local has_nt_run = nt ~= nil and type(nt.run) == "table" and type(nt.run.run) == "function"
+  local has_refresh = ok_ref and type(refresh) == "table" and type(refresh.before_run) == "function"
+  local has_target = ok_tgt and type(target_mod) == "table" and type(target_mod.run_args) == "function"
+  local mods = croot and canonical_modules(croot) or {}
+
+  local function launch_pinned(pos_id, matched_ad)
+    local cons_tbl = ok_cons and type(cons) == "table" and cons or {}
+    local args = build_pinned_run_args(target_mod, cons_tbl, pos_id, cpath, matched_ad)
+    local eff_ad = (type(args) == "table" and args.adapter) or matched_ad
+    launch_nt_run({
+      nt = nt,
+      nio = ok_nio and nio or nil,
+      args = args,
+      summary_path = cpath,
+      err_prefix = "could not run test: ",
+      on_started = function()
+        if is_test then
+          record_last_run("nearest", cpath, root, mod, nil, pos_id, eff_ad)
+        end
+      end,
+    })
+  end
+
+  if has_started_client then
+    if not (has_nt_run and has_refresh and has_target) then
+      ui.notify("cannot preserve nearest test target across async refresh", vim.log.levels.WARN)
+      return
+    end
+    -- Preserve exact (file, row) across jc.neotest.refresh's async nio/vim.schedule
+    -- callback instead of letting jc.run_at_cursor re-read current buffer/cursor later.
+    pcall(function()
+      cons.suppressed = false
+    end)
+    pcall(function()
+      require("jc.neotest").clear_precompile_cache()
+    end)
+    local adapter_id = type(target_mod.adapter_id) == "function" and select(2, pcall(target_mod.adapter_id, cpath))
+      or nil
+    local ok_ref_call, ref_err = pcall(refresh.before_run, { cpath }, function()
+      local pos_id, matched_ad = find_nearest_pos_id(cons, nt_lib, cpath, path, row0, root, mod, target_mod)
+      if pos_id then
+        launch_pinned(pos_id, matched_ad)
+        return
+      end
+
+      if vim.api.nvim_get_current_buf() ~= bufnr or (vim.api.nvim_win_get_cursor(0)[1] - 1) ~= row0 then
+        ui.notify("buffer or cursor changed during test refresh — run again", vim.log.levels.WARN)
+        return
+      end
+      ui.notify(
+        "could not resolve nearest test position at cursor — save test file or check cursor position",
+        vim.log.levels.WARN
+      )
+    end, adapter_id)
+    if not ok_ref_call then
+      ui.notify("could not run test: " .. tostring(ref_err), vim.log.levels.ERROR)
+    end
+    return
+  end
+
+  -- Cold client: preserve exact (cpath, row0) via real neotest/jc discovery APIs
+  -- instead of calling async jc.run_at_cursor() (which re-reads buffer/cursor after yield).
+  local can_client_nearest = ok_cons
+    and type(cons) == "table"
+    and type(cons.client) == "table"
+    and type(cons.client.get_nearest) == "function"
+  local can_discover_nearest = ok_jcnt
+    and type(jc_nt) == "table"
+    and type(jc_nt.discover_positions) == "function"
+    and ok_lib
+    and type(nt_lib) == "table"
+    and type(nt_lib.positions) == "table"
+    and type(nt_lib.positions.nearest) == "function"
+  local has_nio_run = ok_nio and type(nio) == "table" and type(nio.run) == "function"
+
+  if not (has_nt_run and has_target and has_nio_run and (can_client_nearest or can_discover_nearest)) then
+    ui.notify(
+      "cannot preserve nearest test target on cold neotest client — run test file or start neotest first",
+      vim.log.levels.WARN
+    )
+    return
+  end
+
+  pcall(function()
+    if ok_cons and type(cons) == "table" then
+      cons.suppressed = false
+    end
+  end)
+  pcall(function()
+    require("jc.neotest").clear_precompile_cache()
+  end)
+  local adapter_id = type(target_mod.adapter_id) == "function" and select(2, pcall(target_mod.adapter_id, cpath)) or nil
+
+  local function run_cold_resolve()
+    local pos_id, matched_ad
+    local ok_nio_call = run_in_nio(nio, function()
+      if can_client_nearest then
+        if type(cons.client._ensure_started) == "function" then
+          pcall(cons.client._ensure_started, cons.client)
+        end
+        if
+          adapter_id
+          and type(cons.client._adapters) == "table"
+          and not cons.client._adapters[adapter_id]
+          and type(cons.client._update_adapters) == "function"
+        then
+          pcall(cons.client._update_adapters, cons.client, croot or vim.fs.dirname(cpath))
+          if not cons.client._adapters[adapter_id] then
+            pcall(cons.client._update_adapters, cons.client, vim.fs.dirname(cpath))
+          end
+        end
+        local ad_opt = (adapter_id and type(cons.client._adapters) == "table" and cons.client._adapters[adapter_id])
+            and { adapter = adapter_id }
+          or nil
+        local ok_gn, nearest, ad_id = pcall(cons.client.get_nearest, cons.client, cpath, row0, ad_opt)
+        if (not ok_gn or not nearest) and type(cons.client._update_positions) == "function" then
+          pcall(cons.client._update_positions, cons.client, cpath, ad_opt)
+          ok_gn, nearest, ad_id = pcall(cons.client.get_nearest, cons.client, cpath, row0, ad_opt)
+        end
+        if ok_gn and nearest and type(nearest.data) == "function" then
+          local ok_d, d = pcall(nearest.data, nearest)
+          if ok_d and type(d) == "table" and type(d.id) == "string" and d.id ~= "" then
+            pos_id = d.id
+            matched_ad = ad_id
+          end
+        end
+      elseif can_discover_nearest then
+        local ok_dp, file_tree = pcall(jc_nt.discover_positions, cpath)
+        if ok_dp and file_tree and type(file_tree.iter_nodes) == "function" then
+          local ok_n, nearest = pcall(nt_lib.positions.nearest, file_tree, row0)
+          if ok_n and nearest and type(nearest.data) == "function" then
+            local ok_d, d = pcall(nearest.data, nearest)
+            if ok_d and type(d) == "table" and type(d.id) == "string" and d.id ~= "" then
+              pos_id = d.id
+            end
+          end
+        end
+      end
+    end, function(ok, err)
+      if not ok then
+        vim.schedule(function()
+          ui.notify("could not run test: " .. tostring(err), vim.log.levels.ERROR)
+        end)
+        return
+      end
+      vim.schedule(function()
+        if not pos_id or pos_id == "" then
+          ui.notify(
+            "could not resolve nearest test position on cold neotest client — run test file or check cursor position",
+            vim.log.levels.WARN
+          )
+          return
+        end
+        local chosen_ad = matched_ad or adapter_id
+        if chosen_ad then
+          local ad_obj = ok_cons
+              and type(cons) == "table"
+              and cons.client
+              and type(cons.client._adapters) == "table"
+              and cons.client._adapters[chosen_ad]
+            or nil
+          if croot and not is_jc_adapter_for_scope(chosen_ad, ad_obj, croot, mod, mods) then
+            ui.notify("nearest test resolved to non-jc adapter — refusing to run", vim.log.levels.WARN)
+            return
+          end
+        end
+        launch_pinned(pos_id, chosen_ad)
+      end)
+    end)
+    if not ok_nio_call then
+      return
+    end
+  end
+
+  if has_refresh then
+    local ok_ref_call, ref_err = pcall(refresh.before_run, { cpath }, run_cold_resolve, adapter_id)
+    if not ok_ref_call then
+      ui.notify("could not run test: " .. tostring(ref_err), vim.log.levels.ERROR)
+    end
+  else
+    run_cold_resolve()
+  end
 end
 
 ---Run Nearest (or Test File when `file_only` is true), honoring module-aware
 ---counterparts (*Test, *Tests, *IT, Test*) and Snacks package-test fallback.
 local function run_contextual(bufnr, root, file_only)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    ui.notify("the target buffer no longer exists", vim.log.levels.WARN)
+    return
+  end
+  if not file_only and vim.api.nvim_get_current_buf() ~= bufnr then
+    ui.notify("the target buffer is no longer active — run test at cursor again", vim.log.levels.WARN)
+    return
+  end
   local jc = jc_test()
   local path = vim.api.nvim_buf_get_name(bufnr)
   local nav = resolve_counterpart(bufnr, root)
 
   if nav.resolvable and nav.direction == "to_test" then
     if nav.status == "match" then
-      local ok_cg, cg = pcall(require, "jc.class_generator")
-      local jc_target
-      if ok_cg and type(cg.test_counterpart) == "function" then
-        local ok_tc, target_path = pcall(cg.test_counterpart, path)
-        if ok_tc then
-          jc_target = canonical(target_path)
-        end
-      end
-      if jc_target == nav.target and jc then
-        local fn = file_only and jc.run_file or jc.run_at_cursor
-        if type(fn) == "function" then
-          fn()
-          return
-        end
-      end
-      run_file(nav.target)
+      run_file(nav.target, root)
       return
     end
 
     if nav.status == "ambiguous" then
-      pick_and_run_matches(nav.matches, "Java: Tests — multiple paired tests")
+      pick_and_run_matches(nav.matches, "Java: Tests — multiple paired tests", root)
       return
     end
 
@@ -612,23 +1430,28 @@ local function run_contextual(bufnr, root, file_only)
       end
       ui.pick_one(labels, "Java: Tests — no paired test (run from package)", function(choice)
         if by_label[choice] then
-          run_file(by_label[choice])
+          run_file(by_label[choice], root)
         end
       end)
       return
     end
 
     if nav.status == "cross_module" then
-      pick_and_run_matches(nav.matches, "Java: Tests — run from another module")
+      pick_and_run_matches(nav.matches, "Java: Tests — run from another module", root)
       return
     end
   end
 
   if jc then
-    local fn = file_only and jc.run_file or jc.run_at_cursor
-    if type(fn) == "function" then
-      fn()
+    local is_test = (nav.resolvable and nav.direction == "to_class")
+      or (not (nav.resolvable and nav.direction == "to_test") and path:find("[/\\]src[/\\]test[/\\]") ~= nil)
+    local mods = canonical_modules(root)
+    local mod = (nav.resolvable and nav.module) or owning_module(path, mods) or root
+    if not file_only then
+      run_nearest_in_buffer(bufnr, path, root, is_test, mod, jc)
+      return
     end
+    dispatch_test_file(bufnr, path, root, is_test, mod, jc)
   end
 end
 
@@ -649,9 +1472,173 @@ local function pick_test(root, bufnr)
   ui.pick_one(labels, "Java: Tests — run test", function(choice)
     local item = by_label[choice]
     if item then
-      run_file(item.path)
+      run_file(item.path, root)
     end
   end)
+end
+
+local function run_suite(cur, root, suite_dir, multimodule, scope_mod)
+  if not vim.api.nvim_buf_is_valid(cur) then
+    ui.notify("the target buffer no longer exists", vim.log.levels.WARN)
+    return
+  end
+  local jc = jc_test()
+  if not jc or type(jc.run_all) ~= "function" then
+    ui.notify("jc test runner is not available", vim.log.levels.ERROR)
+    return
+  end
+  local croot = canonical(root) or root
+  local csuite = suite_dir and canonical(suite_dir) or nil
+  local eff = effective_jc_suite_target(cur)
+  if not csuite or not eff or not subtree(croot, eff) or eff ~= csuite then
+    ui.notify(
+      "cannot run test suite: jc.test.run_all effective target does not match project/module scope",
+      vim.log.levels.WARN
+    )
+    return
+  end
+  local cmod = canonical(scope_mod) or csuite
+  if multimodule or csuite ~= croot then
+    if csuite ~= croot then
+      ui.notify(
+        "multi-module suite: jc/neotest roots at module "
+          .. module_label(croot, csuite)
+          .. " — use Pick Test or Run Test File for other modules",
+        vim.log.levels.WARN
+      )
+    else
+      ui.notify(
+        "multi-module suite: running all modules in one neotest tree — if one module fails to produce a report, neotest/jc can mark tests in other modules failed too",
+        vim.log.levels.WARN
+      )
+    end
+  end
+  local cur_name = vim.api.nvim_buf_get_name(cur)
+  local cur_path = cur_name ~= "" and cur_name or nil
+  local ok, err = pcall(vim.api.nvim_buf_call, cur, jc.run_all)
+  if not ok then
+    ui.notify("could not run test suite: " .. tostring(err), vim.log.levels.ERROR)
+    return
+  end
+  record_last_run("suite", cur_path, croot, cmod, csuite)
+end
+
+resolve_suite_replay_path = function(rec)
+  local target_suite = canonical(rec.suite_dir or rec.module) or canonical(rec.root)
+  local croot = canonical(rec.root)
+  if not target_suite or not croot or not subtree(croot, target_suite) then
+    return nil, nil
+  end
+  if
+    type(rec.path) == "string"
+    and rec.path ~= ""
+    and (vim.fn.filereadable(rec.path) == 1 or vim.uv.fs_stat(rec.path) ~= nil)
+    and effective_jc_suite_target(rec.path) == target_suite
+  then
+    return rec.path, target_suite
+  end
+  for _, marker in ipairs(SUITE_BUILD_MARKERS) do
+    local mpath = target_suite .. "/" .. marker
+    if vim.fn.filereadable(mpath) == 1 and effective_jc_suite_target(mpath) == target_suite then
+      return mpath, target_suite
+    end
+  end
+  local git_path = target_suite .. "/.git"
+  if vim.uv.fs_stat(git_path) ~= nil and effective_jc_suite_target(git_path) == target_suite then
+    return git_path, target_suite
+  end
+  return nil, nil
+end
+
+local function replay_pinned_nearest(nt, apis, pos_id, path, root, mod, adapter_id)
+  pcall(function()
+    if apis.cons then
+      apis.cons.suppressed = false
+    end
+  end)
+  pcall(function()
+    require("jc.neotest").clear_precompile_cache()
+  end)
+  local ok_ref_call, ref_err = pcall(apis.refresh.before_run, { path }, function()
+    local cons_tbl = apis.cons or {}
+    local args = build_pinned_run_args(apis.target_mod, cons_tbl, pos_id, path, adapter_id)
+    if
+      type(args) == "table"
+      and not args.adapter
+      and cons_tbl.client
+      and cons_tbl.client._started == true
+      and type(apis.target_mod._pinnable) == "function"
+    then
+      ui.notify("last test position no longer exists in neotest tree", vim.log.levels.WARN)
+      return
+    end
+    local eff_ad = (type(args) == "table" and args.adapter) or adapter_id
+    local ok_nio, nio = pcall(require, "nio")
+    launch_nt_run({
+      nt = nt,
+      nio = ok_nio and nio or nil,
+      args = args,
+      summary_path = path,
+      err_prefix = "could not repeat last test: ",
+      on_started = function()
+        record_last_run("nearest", path, root, mod, nil, pos_id, eff_ad)
+      end,
+    })
+  end, adapter_id)
+  if not ok_ref_call then
+    ui.notify("could not repeat last test: " .. tostring(ref_err), vim.log.levels.ERROR)
+  end
+end
+
+local function repeat_last(cur, root, cur_mod, mods, nt)
+  local jc = jc_test()
+  if not jc then
+    ui.notify("jc test runner is not available", vim.log.levels.ERROR)
+    return
+  end
+  local state = last_run_state(root, cur_mod, mods, nt)
+  if not state.available then
+    ui.notify(state.reason or "no previous test run in this project/module", vim.log.levels.WARN)
+    return
+  end
+  local rec = state.rec
+  if rec then
+    if rec.kind == "file" then
+      run_file(rec.path, rec.root)
+      return
+    end
+    if rec.kind == "suite" then
+      local replay_path, target_suite = resolve_suite_replay_path(rec)
+      if not replay_path or not target_suite then
+        ui.notify("original suite target no longer matches or exists", vim.log.levels.WARN)
+        return
+      end
+      local buf = vim.fn.bufadd(replay_path)
+      vim.fn.bufload(buf)
+      run_suite(buf, rec.root, target_suite, #canonical_modules(rec.root) > 1, rec.module)
+      return
+    end
+    if rec.kind == "nearest" then
+      local apis = neotest_pinned_runner_apis(nt)
+      if not apis or type(rec.pos_id) ~= "string" or rec.pos_id == "" then
+        ui.notify("last nearest-test run has no fixed safe target", vim.log.levels.WARN)
+        return
+      end
+      replay_pinned_nearest(nt, apis, rec.pos_id, rec.path, rec.root, rec.module, state.adapter_id or rec.adapter_id)
+      return
+    end
+  end
+  if state.pinned then
+    local apis = neotest_pinned_runner_apis(nt)
+    if not apis then
+      ui.notify("cannot replay neotest run safely without neotest/jc target APIs", vim.log.levels.WARN)
+      return
+    end
+    local p = state.pinned
+    replay_pinned_nearest(nt, apis, p.pos_id, p.path, p.root, p.module, p.adapter_id)
+    return
+  end
+  ui.notify("no safe previous test target to repeat", vim.log.levels.WARN)
 end
 
 local function goto_entry(is_java, nav)
@@ -3107,6 +4094,386 @@ function M.create_method_test()
   run_method_test_flow(ctx, nav)
 end
 
+local function collect_jc_adapters(client, nt, root, target_mod, mods)
+  local seen, raw_ids = {}, {}
+  local discovery_failed = false
+  local adapter_objs = nil
+  if client._adapters ~= nil then
+    if type(client._adapters) == "table" then
+      adapter_objs = client._adapters
+    else
+      discovery_failed = true
+    end
+  end
+  local had_source = adapter_objs ~= nil
+
+  if adapter_objs then
+    for id, obj in pairs(adapter_objs) do
+      if type(id) ~= "string" or (obj ~= nil and type(obj) ~= "table") then
+        discovery_failed = true
+      elseif not seen[id] then
+        seen[id] = true
+        raw_ids[#raw_ids + 1] = id
+      end
+    end
+  end
+
+  if #raw_ids == 0 and nt and nt.state and type(nt.state.adapter_ids) == "function" then
+    had_source = true
+    local ok, list = pcall(nt.state.adapter_ids)
+    if not ok or type(list) ~= "table" then
+      discovery_failed = true
+    else
+      for _, id in ipairs(list) do
+        if type(id) ~= "string" then
+          discovery_failed = true
+        elseif not seen[id] then
+          seen[id] = true
+          raw_ids[#raw_ids + 1] = id
+        end
+      end
+    end
+  end
+
+  local matching = {}
+  for _, id in ipairs(raw_ids) do
+    local obj = adapter_objs and adapter_objs[id] or nil
+    if is_jc_adapter_for_scope(id, obj, root, target_mod, mods) then
+      matching[#matching + 1] = id
+    end
+  end
+  table.sort(matching)
+  return matching, had_source, discovery_failed
+end
+
+local function adapter_tree(client, adapter_id, nt)
+  local saw_error = false
+  local saw_invalid = false
+
+  if client._state and type(client._state.positions) == "function" then
+    local ok, tree = pcall(client._state.positions, client._state, adapter_id)
+    if not ok then
+      saw_error = true
+    elseif tree ~= nil then
+      if type(tree) == "table" and type(tree.iter_nodes) == "function" then
+        return tree, nil
+      end
+      saw_invalid = true
+    end
+  end
+  if nt and nt.state and type(nt.state.positions) == "function" then
+    local ok, tree = pcall(nt.state.positions, adapter_id)
+    if not ok then
+      saw_error = true
+    elseif tree ~= nil then
+      if type(tree) == "table" and type(tree.iter_nodes) == "function" then
+        return tree, nil
+      end
+      saw_invalid = true
+    end
+  end
+  if client._started ~= false and type(client.get_position) == "function" then
+    local ok, tree = pcall(client.get_position, client, nil, { adapter = adapter_id })
+    if not ok then
+      saw_error = true
+    elseif tree ~= nil then
+      if type(tree) == "table" and type(tree.iter_nodes) == "function" then
+        return tree, nil
+      end
+      saw_invalid = true
+    end
+  end
+  if saw_error or saw_invalid then
+    return nil, "position_tree_read_failed"
+  end
+  return nil, "missing_position_tree"
+end
+
+local function has_valid_failure_errors(errors)
+  if type(errors) ~= "table" or #errors == 0 then
+    return false
+  end
+  local count = 0
+  for k, e in pairs(errors) do
+    if type(k) ~= "number" or k < 1 or k > #errors or math.floor(k) ~= k or type(e) ~= "table" then
+      return false
+    end
+    local has_msg = type(e.message) == "string" and e.message ~= ""
+    local has_line = type(e.line) == "number"
+    if not has_msg and not has_line then
+      return false
+    end
+    count = count + 1
+  end
+  return count > 0
+end
+
+local function is_synthetic_failure(res)
+  if type(res) ~= "table" or res.status ~= "failed" then
+    return false
+  end
+  -- jc.neotest only attaches a non-empty `errors` array when a JUnit XML
+  -- <testcase> failure/error was parsed; no-report `runner_failed` leaves
+  -- `errors == nil` and neotest's missing-position fill sets `errors = {}`.
+  return not has_valid_failure_errors(res.errors)
+end
+
+local function classify_result(res)
+  if res == nil then
+    return "unrun", nil
+  end
+  if type(res) ~= "table" then
+    return "invalid", "invalid_test_result"
+  end
+  if res.status == "passed" then
+    return "passed", nil
+  end
+  if res.status == "skipped" then
+    return "skipped", nil
+  end
+  if res.status == "failed" then
+    if res.errors ~= nil and type(res.errors) ~= "table" then
+      return "synthetic_failed", "invalid_test_result"
+    end
+    if type(res.errors) == "table" and #res.errors > 0 and not has_valid_failure_errors(res.errors) then
+      return "synthetic_failed", "invalid_test_result"
+    end
+    if is_synthetic_failure(res) then
+      return "synthetic_failed", "no_report_or_runner_failure"
+    end
+    return "verified_failed", nil
+  end
+  return "unknown_status", "unknown_result_status"
+end
+
+---Inspect neotest/jc results isolated to a single project and (optionally)
+---module, separating verified JUnit XML failures from synthetic no-report /
+---runner failures. Never modifies or monkey-patches jc.nvim.
+---@param opts table|nil { bufnr?, root?, module?, client?, jdtls_count?, nt? }
+---@return table report
+function M.inspect_results(opts)
+  opts = opts or {}
+  local bufnr = opts.bufnr and opts.bufnr > 0 and opts.bufnr or context_buf()
+  local root = canonical(opts.root or project.root(bufnr))
+  local counts = {
+    total = 0,
+    passed = 0,
+    verified_failed = 0,
+    synthetic_failed = 0,
+    skipped = 0,
+    unrun = 0,
+  }
+  local reasons, seen_reasons = {}, {}
+  local function add_reason(r)
+    if r and not seen_reasons[r] then
+      seen_reasons[r] = true
+      reasons[#reasons + 1] = r
+    end
+  end
+
+  if not root then
+    add_reason("no_project")
+    return {
+      root = nil,
+      module = nil,
+      reliable = false,
+      reasons = reasons,
+      counts = counts,
+      passed_ids = {},
+      verified_failed_ids = {},
+      synthetic_failed_ids = {},
+      skipped_ids = {},
+      unrun_ids = {},
+      rerun_failed_supported = false,
+    }
+  end
+
+  local mods = canonical_modules(root)
+  local mods_set = canonical_modules_set(root, mods)
+  local target_mod
+  if opts.module then
+    local cm = canonical(opts.module)
+    if not cm or not subtree(root, cm) or (cm ~= root and not mods_set[cm]) then
+      add_reason("invalid_module_scope")
+    elseif cm ~= root and #mods > 1 then
+      target_mod = cm
+    end
+  elseif not opts.root and vim.api.nvim_buf_is_valid(bufnr) then
+    local bpath = vim.api.nvim_buf_get_name(bufnr)
+    local m = bpath ~= "" and owning_module(bpath, mods) or nil
+    if m and m ~= root and #mods > 1 then
+      target_mod = m
+    end
+  end
+
+  local jdtls_count = opts.jdtls_count ~= nil and opts.jdtls_count or lsp.global_count()
+  if jdtls_count > 1 then
+    add_reason("ambiguous_jdtls_clients")
+  end
+
+  local client = opts.client
+  if client == nil then
+    local ok_c, cons = pcall(require, "jc.neotest.consumer")
+    client = (ok_c and type(cons) == "table") and cons.client or nil
+  end
+  if not client or type(client.get_results) ~= "function" then
+    add_reason("no_consumer_client")
+    return {
+      root = root,
+      module = target_mod,
+      reliable = false,
+      reasons = reasons,
+      counts = counts,
+      passed_ids = {},
+      verified_failed_ids = {},
+      synthetic_failed_ids = {},
+      skipped_ids = {},
+      unrun_ids = {},
+      rerun_failed_supported = false,
+    }
+  end
+
+  local nt = opts.nt ~= nil and opts.nt or neotest()
+  if client._started ~= true then
+    add_reason("client_not_started")
+  end
+  local adapter_ids, had_adapter_source, adapter_discovery_failed =
+    collect_jc_adapters(client, nt, root, target_mod, mods)
+  if adapter_discovery_failed then
+    add_reason("adapter_discovery_failed")
+  elseif not had_adapter_source or #adapter_ids == 0 then
+    add_reason("no_jc_adapter")
+  end
+
+  local pos_by_id = {}
+  for _, adapter_id in ipairs(adapter_ids) do
+    local tree, tree_err = adapter_tree(client, adapter_id, nt)
+    if not tree then
+      add_reason(tree_err or "missing_position_tree")
+    else
+      local ok_res, results_map = pcall(client.get_results, client, adapter_id)
+      if not ok_res or type(results_map) ~= "table" then
+        add_reason("results_read_failed")
+        results_map = {}
+      end
+      local ok_iter = pcall(function()
+        for _, node in tree:iter_nodes() do
+          if type(node) ~= "table" then
+            add_reason("invalid_position_node")
+          else
+            local ok_d, d
+            if type(node.data) == "function" then
+              ok_d, d = pcall(node.data, node)
+            elseif node.data == nil then
+              ok_d, d = true, node
+            else
+              ok_d, d = false, nil
+            end
+            if not ok_d then
+              add_reason("position_tree_read_failed")
+            elseif type(d) ~= "table" or type(d.type) ~= "string" or d.type == "" then
+              add_reason("invalid_position_node")
+            elseif d.type == "test" then
+              local valid_id = type(d.id) == "string" and vim.trim(d.id) ~= ""
+              local valid_path = type(d.path) == "string" and vim.trim(d.path) ~= ""
+              local cpath = valid_path and canonical(d.path) or nil
+              if not valid_id or not valid_path or not cpath then
+                add_reason("invalid_test_position")
+              elseif subtree(root, cpath) and not has_nested_project_boundary(cpath, root, mods_set) then
+                local pos_mod = owning_module(cpath, mods) or root
+                if not target_mod or pos_mod == target_mod then
+                  local res = results_map[d.id]
+                  local kind, r_reason = classify_result(res)
+                  if r_reason then
+                    add_reason(r_reason)
+                  end
+                  local prev = pos_by_id[d.id]
+                  if prev and prev.res ~= nil and res ~= nil then
+                    if prev.kind ~= kind then
+                      add_reason("conflicting_adapter_results")
+                    elseif prev.adapter_id ~= adapter_id then
+                      add_reason("ambiguous_adapter_results")
+                    end
+                  end
+                  if not prev or (prev.res == nil and res ~= nil) then
+                    pos_by_id[d.id] = {
+                      id = d.id,
+                      path = cpath,
+                      module = pos_mod,
+                      adapter_id = adapter_id,
+                      res = res,
+                      kind = kind,
+                    }
+                  end
+                end
+              end
+            elseif d.type == "dir" or d.type == "file" or d.type == "namespace" then
+              if
+                (d.id ~= nil and (type(d.id) ~= "string" or vim.trim(d.id) == ""))
+                or (d.path ~= nil and (type(d.path) ~= "string" or vim.trim(d.path) == ""))
+              then
+                add_reason("invalid_position_node")
+              end
+            else
+              add_reason("invalid_position_node")
+            end
+          end
+        end
+      end)
+      if not ok_iter then
+        add_reason("position_tree_read_failed")
+      end
+    end
+  end
+
+  local sorted_ids = {}
+  for id in pairs(pos_by_id) do
+    sorted_ids[#sorted_ids + 1] = id
+  end
+  table.sort(sorted_ids)
+
+  local passed_ids, verified_failed_ids, synthetic_failed_ids, skipped_ids, unrun_ids = {}, {}, {}, {}, {}
+  for _, id in ipairs(sorted_ids) do
+    counts.total = counts.total + 1
+    local entry = pos_by_id[id]
+    local kind = entry.kind
+    if kind == "passed" then
+      counts.passed = counts.passed + 1
+      passed_ids[#passed_ids + 1] = id
+    elseif kind == "skipped" then
+      counts.skipped = counts.skipped + 1
+      skipped_ids[#skipped_ids + 1] = id
+    elseif kind == "verified_failed" then
+      counts.verified_failed = counts.verified_failed + 1
+      verified_failed_ids[#verified_failed_ids + 1] = id
+    elseif kind == "synthetic_failed" then
+      counts.synthetic_failed = counts.synthetic_failed + 1
+      synthetic_failed_ids[#synthetic_failed_ids + 1] = id
+    else
+      counts.unrun = counts.unrun + 1
+      unrun_ids[#unrun_ids + 1] = id
+    end
+  end
+
+  if counts.synthetic_failed > 0 then
+    add_reason("no_report_or_runner_failure")
+  end
+
+  return {
+    root = root,
+    module = target_mod,
+    reliable = #reasons == 0,
+    reasons = reasons,
+    counts = counts,
+    passed_ids = passed_ids,
+    verified_failed_ids = verified_failed_ids,
+    synthetic_failed_ids = synthetic_failed_ids,
+    skipped_ids = skipped_ids,
+    unrun_ids = unrun_ids,
+    rerun_failed_supported = false,
+  }
+end
+
 ---Entry point of `<leader>jt`.
 function M.tests()
   local cur = vim.api.nvim_get_current_buf()
@@ -3125,11 +4492,15 @@ function M.tests()
   local jc = jc_test()
   local attached = ui.jdtls_attached(ctx_buf)
   local is_java = vim.bo[cur].buftype == "" and vim.bo[cur].filetype == "java"
-  local mods = project.modules(root)
+  local croot = canonical(root) or root
+  local mods = canonical_modules(root)
   local multimodule = #mods > 1
   local ctx_path = is_java and vim.api.nvim_buf_get_name(cur) or vim.api.nvim_buf_get_name(ctx_buf)
   local cur_mod = ctx_path ~= "" and owning_module(ctx_path, mods) or nil
   local mod_desc = cur_mod and module_label(root, cur_mod) or vim.fs.basename(root)
+  local suite_dir, suite_valid = suite_target_dir(ctx_path, root, cur)
+  local suite_desc = (suite_dir and suite_dir ~= croot) and ("module: " .. module_label(root, suite_dir))
+    or "all modules"
   local nav = is_java and resolve_counterpart(cur, root) or nil
   local ctx = hierarchy.capture_context()
   local opened_seq = skeleton_ctrl:seq()
@@ -3141,6 +4512,19 @@ function M.tests()
       "this buffer has unsaved changes: test discovery reads the file from disk, so new test names may not appear until you save",
       vim.log.levels.WARN
     )
+  end
+
+  if nt then
+    local ok_rep, rep = pcall(M.inspect_results, { bufnr = cur, root = root, module = cur_mod })
+    if ok_rep and rep and rep.counts and rep.counts.synthetic_failed > 0 then
+      ui.notify(
+        ("neotest/jc marked %d test(s) failed in %s without a JUnit XML report (build/classpath/runner failure, not per-test failures) — check Show Test Output"):format(
+          rep.counts.synthetic_failed,
+          mod_desc
+        ),
+        vim.log.levels.WARN
+      )
+    end
   end
 
   local no_neotest = "neotest is not installed"
@@ -3157,6 +4541,10 @@ function M.tests()
     if not attached then
       return no_jdtls
     end
+    local jc_guard = lsp.jc_global_reason("Tests")
+    if jc_guard then
+      return jc_guard
+    end
   end
 
   local precompile = false
@@ -3167,6 +4555,7 @@ function M.tests()
 
   local run_enabled = run_reason() == nil
   local java_reason = run_reason() or "open a .java file"
+  local last_state = last_run_state(root, cur_mod, mods, nt)
 
   local by_key = {
     nearest = {
@@ -3183,9 +4572,12 @@ function M.tests()
     },
     suite = {
       key = "suite",
-      label = "Run Test Suite" .. (multimodule and ("  (module: " .. mod_desc .. ")") or ""),
-      enabled = run_enabled,
-      reason = run_reason(),
+      label = "Run Test Suite"
+        .. ((multimodule or (suite_dir and suite_dir ~= croot)) and ("  (" .. suite_desc .. ")") or ""),
+      enabled = run_enabled and suite_valid,
+      reason = (not run_enabled and run_reason())
+        or (not suite_valid and "jc.test.run_all target resolves outside this project")
+        or nil,
     },
     pick = {
       key = "pick",
@@ -3195,9 +4587,9 @@ function M.tests()
     },
     last = {
       key = "last",
-      label = "Repeat Last Test",
-      enabled = run_enabled,
-      reason = run_reason(),
+      label = "Repeat Last Test" .. (last_state.detail and ("  (" .. last_state.detail .. ")") or ""),
+      enabled = run_enabled and last_state.available,
+      reason = (not run_enabled and run_reason()) or last_state.reason,
     },
     stop = {
       key = "stop",
@@ -3309,27 +4701,35 @@ function M.tests()
       end
     end
     if entry.key == "nearest" then
+      if not ui.same_buffer(cur) then
+        return
+      end
       run_contextual(cur, root, false)
     elseif entry.key == "file" then
+      if not ui.same_buffer(cur) then
+        return
+      end
       run_contextual(cur, root, true)
     elseif entry.key == "suite" then
-      if multimodule then
-        ui.notify(
-          "multi-module suite: jc/neotest roots at the current module — use Pick Test or Run Test File for other modules",
-          vim.log.levels.WARN
-        )
-      end
-      jc.run_all()
+      run_suite(cur, root, suite_dir, multimodule, cur_mod)
     elseif entry.key == "pick" then
       pick_test(root, is_java and cur or ctx_buf)
     elseif entry.key == "last" then
-      jc.run_last()
+      repeat_last(cur, root, cur_mod, mods, nt)
     elseif entry.key == "stop" then
-      jc.stop()
+      if vim.api.nvim_buf_is_valid(cur) then
+        vim.api.nvim_buf_call(cur, jc.stop)
+      else
+        jc.stop()
+      end
     elseif entry.key == "summary" then
       jc.summary()
     elseif entry.key == "output" then
-      jc.output()
+      if vim.api.nvim_buf_is_valid(cur) then
+        vim.api.nvim_buf_call(cur, jc.output)
+      else
+        jc.output()
+      end
     elseif entry.key == "precompile" then
       jc.toggle_precompile()
     elseif entry.key == "goto_test" then
@@ -3349,6 +4749,7 @@ end
 -- exposed for tests
 M._test_files = test_files
 M._run_file = run_file
+M._run_contextual = run_contextual
 M._resolve_counterpart = resolve_counterpart
 M._goto_counterpart = goto_counterpart
 M._owning_module = owning_module
@@ -3358,8 +4759,14 @@ M._analyze_test_file = analyze_test_file
 M._plan_existing_test_edit = plan_existing_test_edit
 M._render_junit5_for_method = render_junit5_for_method
 M._inspect_junit5_classpath = inspect_junit5_classpath
+M._is_synthetic_failure = is_synthetic_failure
+M._pos_belongs_to_scope = pos_belongs_to_scope
+M._effective_jc_suite_target = effective_jc_suite_target
+M._resolve_suite_replay_path = resolve_suite_replay_path
 M._reset = function()
   skeleton_ctrl:reset()
+  last_runs = {}
+  run_seq = 0
 end
 
 return M

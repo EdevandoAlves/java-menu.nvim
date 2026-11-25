@@ -95,6 +95,7 @@ FAST_SPECS=(
   environment_spec
   deps_spec
   tests_navigation_spec
+  tests_isolation_spec
   junit_method_spec
   run_experience_spec
   calls_spec

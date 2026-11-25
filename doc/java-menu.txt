@@ -276,7 +276,11 @@ and inserts an explicitly pending/failing `@Test` skeleton
 Supports explicit multi-client selection, cancellation (`$/cancelRequest` or
 `require("java_menu.tests").cancel()`), `changedtick`/window/buffer guards,
 and dirty-buffer/symlink/disk-race refusal.
-The test picker prioritizes the current module and package. Open a project
+The test picker prioritizes the current module and package. Repeat Last
+Test is isolated per project root and module (never re-running a test from
+another project or module via neotest's global last-run state), and opening
+the Tests menu warns when neotest/jc marked tests failed without a JUnit XML
+report. Open a project
 file before using the menu from an output buffer. Without neotest the menu
 says so instead of breaking (Create JUnit 5 Test for Method... only needs an
 attached jdtls client).
@@ -476,9 +480,20 @@ generate delegate methods.
 - Multiple jdtls clients: operations jc.nvim resolves against one global
   client are blocked with an explanatory reason while more than one
   client is attached — Generate, every Imports entry except Replace
-  Import, and Extract Variable / Extract Method / Static Import.
-  Rename, Move Class, Change Signature and Replace Import keep working
-  per buffer.
+  Import, Extract Variable / Extract Method / Static Import, and neotest
+  test execution. Rename, Move Class, Change Signature, Replace Import and
+  Create JUnit 5 Test for Method... keep working per buffer.
+- Test result reliability & upstream jc.nvim/neotest limits:
+  `require("java_menu.tests").inspect_results()` isolates results per
+  project root and module and separates verified JUnit XML failures
+  (non-empty `errors`) from synthetic failures (`errors` absent/empty).
+  Upstream jc.nvim/neotest behavior is not monkey-patched: when no XML report
+  is generated, jc/neotest marks every position in the active tree `failed`
+  (including passed and @Disabled tests, and across modules during root suite
+  runs), and `jc.test.run_all()` targets the nearest module build file.
+  Selective rerun of failed tests is intentionally omitted (permanently
+  discarded in `docs/ARCHITECTURE.md` AD-11) because neotest/jc.nvim expose
+  no verifiable per-run provenance or correlation IDs.
 - Gradle discovery is static: nested modules come from parsing
   `settings.gradle(.kts)` includes and explicit `projectDir` entries.
   Dynamic declarations produce a partial-result note instead of invented

@@ -42,6 +42,7 @@ expect_fn(build, "output_provenance", "menu Build")
 
 local tests_menu = require("java_menu.tests")
 expect_fn(tests_menu, "tests", "menu Tests")
+expect_fn(tests_menu, "inspect_results", "menu Tests")
 
 local debug = require("java_menu.debug")
 expect_fn(debug, "debug", "menu Debug")

@@ -514,6 +514,25 @@ Risks / Compatibility.
 - **Risks:** scope creep if more modules are touched.
 - **Compatibility:** fully additive except the three documented extensions.
 
+### AD-11 — Discard Rerun Failed Tests (neotest/jc.nvim provenance gap)
+
+- **Problem:** Safely re-running only failed tests (`Rerun Failed Tests`) within a `(project_root, module)` scope requires proving that observed `neotest` failures originated from a specific Java Menu dispatch, correspond to completed results for that dispatch, and were not supplied or overwritten by concurrent or same-target external runs.
+- **Alternatives:**
+  1. Monkey-patch `neotest` or `jc.nvim` internals (rejected by Design Principle 2).
+  2. Track `neotest` listener generation counters (`run` / `results` events), `neotest.run.get_last_run()`, and disk/buffer snapshots around `neotest.run.run(args)` without a run ID.
+  3. Discard the feature permanently and keep only `(project_root, module)` test isolation, `Repeat Last Test` history isolation, cold-client target preservation, and read-only `M.inspect_results()` / synthetic-failure warnings.
+- **Real API findings (`neotest`, `nvim-nio`, `jc.nvim`):**
+  - `neotest.run.run(args)` (`neotest/lua/neotest/consumers/run.lua`, wrapped via `nio.create(neotest.run.run, 1)` in `nvim-nio/lua/nio/tasks.lua`) returns no run handle or correlation ID (`nil` inside `nio` coroutines), and returns silently without emitting `run` or `results` events when `neotest.run.get_tree_from_args` returns `nil` or `client:run_tree` (`neotest/lua/neotest/client/init.lua`) finds no adapter.
+  - `NeotestEventProcessor:emit(event, ...)` (`neotest/lua/neotest/client/events/init.lua`) spawns an independent `nio.run(...)` task per emitted event and iterates `pairs(self.listeners[event] or {})` in unspecified order. `run` (`adapter_id, root_id, position_ids`) and `results` (`adapter_id, results, partial`) events carry no run/correlation ID and have no delivery-order guarantee between `run`, `results`, and callers.
+  - `neotest.run.get_last_run()` exposes only `(position_id, args)` for the last `get_tree_from_args(_, true)` call without any run token, timestamp, or completion state.
+  - `NeotestClientState:update_results` (`neotest/lua/neotest/client/state/init.lua`) merges results via `vim.tbl_extend("force", ...)` with no run ID or provenance metadata; `_events`, `_adapters`, `_state`, and `_runner` are private fields on `neotest.Client`, and `jc.neotest.consumer.client` (`jc.nvim/lua/jc/neotest/consumer.lua`) is populated only when the user registers the `jc` consumer.
+  - `jc.nvim` (`jc/test.lua`, `jc/neotest/init.lua`) exposes no per-run correlation token or provenance API.
+- **Why counters and heuristics fail:** Because `neotest.run.run` can silently fail to fire while an external run (e.g., `:Neotest run`, summary `<CR>`, `:JCtestNearest`, `:JCtestFile`) targeting the same `(adapter_id, root_id)` supplies `run`/`results` events, and events can be delivered out of order across independent `nio.run` tasks, listener counters and target-ID matching cannot prove run ownership or safety.
+- **Decision (durable):** **Discard `Rerun Failed Tests` permanently.** Remove all `Rerun Failed Tests` dispatch, provenance-counter, snapshot, and menu-entry code while preserving prior `(project_root, module)` test isolation and `M.inspect_results()` (`rerun_failed_supported = false`). **Do not attempt this feature again.**
+- **Dependencies:** `tests.lua`, `neotest`, `jc.nvim`.
+- **Available alternatives:** Users can continue to use `Run Nearest Test`, `Run Test File`, `Run Test Suite`, `Pick Test…`, and `Repeat Last Test`.
+- **Compatibility:** Preserves `M.inspect_results()` (with `rerun_failed_supported = false`) and all test isolation guarantees.
+
 ---
 
 ## 10. Implementation Plan 7B–7E
@@ -625,4 +644,7 @@ estimates are given.
   own top-level groups.
 - IntelliJ-style run-configuration UI.
 - Tree/explorer, statusline widgets, and tool windows (explicitly rejected in AD-8).
+- Selective `Rerun Failed Tests` (permanently discarded in AD-11 due to missing
+  per-run provenance in `neotest` / `jc.nvim`; must not be re-attempted unless
+  upstream APIs change with verified proof).
 - Any rewrite of an existing module, or installation/configuration of jdtls.
