@@ -180,11 +180,19 @@ function M.project()
   local ui = require("java_menu.ui")
   local bufnr = context_buf()
   local deps_available, deps_reason = require("java_menu.deps").available(bufnr)
+  local spring_buf = vim.api.nvim_get_current_buf()
+  local spring_available, spring_reason = require("java_menu.spring_config").available(spring_buf)
 
   local entries = {
     { key = "new", label = "New Project…", enabled = true },
     { key = "info", label = "Project Info…", enabled = M._info_available(bufnr), reason = INFO_REASON },
     { key = "deps", label = "Dependencies…", enabled = deps_available, reason = deps_reason or DEPS_REASON },
+    {
+      key = "spring_config",
+      label = "Open Spring Configuration…",
+      enabled = spring_available,
+      reason = spring_reason,
+    },
     { key = "env", label = "Environment…", enabled = true },
   }
 
@@ -195,6 +203,8 @@ function M.project()
       M.info(bufnr)
     elseif entry.key == "deps" then
       require("java_menu.deps").menu(bufnr)
+    elseif entry.key == "spring_config" then
+      require("java_menu.spring_config").open(spring_buf)
     elseif entry.key == "env" then
       require("java_menu.diagnostics").report()
     end

@@ -363,60 +363,196 @@ function M.reset(root)
   return true, nil
 end
 
+---@param parent string
+---@param path string
+---@return boolean
+local function is_subtree(parent, path)
+  if type(parent) ~= "string" or parent == "" or type(path) ~= "string" or path == "" then
+    return false
+  end
+  local sep = parent:sub(-1) == "/" and "" or "/"
+  return parent == path or path:sub(1, #parent + #sep) == parent .. sep
+end
+
+---@param file_dir string
+---@param base string
+---@return boolean
+local function has_nested_build_marker(file_dir, base)
+  local dir = file_dir
+  while dir and dir ~= "" and dir ~= base and is_subtree(base, dir) do
+    for _, marker in ipairs(project.markers) do
+      if vim.fn.filereadable(dir .. "/" .. marker) == 1 then
+        return true
+      end
+    end
+    local parent = vim.fs.dirname(dir)
+    if not parent or parent == dir then
+      break
+    end
+    dir = parent
+  end
+  return false
+end
+
+---@param name string
+---@return { is_default: boolean, profile: string|nil, ext: string }|nil
+local function classify_spring_config_name(name)
+  local ext = name:match("^application%.(properties)$") or name:match("^application%.(ya?ml)$")
+  if ext then
+    return { is_default = true, profile = nil, ext = ext }
+  end
+  local profile, pext = name:match("^application%-([%w%-%_%.]+)%.(properties)$")
+  if not profile then
+    profile, pext = name:match("^application%-([%w%-%_%.]+)%.(ya?ml)$")
+  end
+  if profile and profile ~= "" and pext then
+    return { is_default = false, profile = profile, ext = pext }
+  end
+  local other_ext = name:match("^application.*%.(properties)$") or name:match("^application.*%.(ya?ml)$")
+  if other_ext then
+    return { is_default = false, profile = nil, ext = other_ext }
+  end
+  return nil
+end
+
 ---Textual scan of `src/main/resources/application*.{yml,yaml,properties}`
----(and `src/main/resources/config/`) for Spring Boot profile names.
+---(and `src/main/resources/config/`) for Spring Boot profile names and
+---configuration files within project/module boundaries.
 ---@param root string
 ---@param module string|nil
----@return { profiles: string[], has_default: boolean }
+---@return { profiles: string[], has_default: boolean, files: table[] }
 function M.scan_profiles(root, module)
-  local bases = {}
-  local seen_base = {}
+  if type(root) ~= "string" or root == "" then
+    return { profiles = {}, has_default = false, files = {} }
+  end
+  local real_root = vim.uv.fs_realpath(root)
+  if not real_root or vim.fn.isdirectory(real_root) ~= 1 then
+    return { profiles = {}, has_default = false, files = {} }
+  end
+  local canon_root = vim.fs.normalize(real_root)
+
+  local declared_mods, declared_set = {}, {}
+  for _, mod in ipairs(project.modules(canon_root)) do
+    local rm = vim.uv.fs_realpath(mod)
+    if rm then
+      local cm = vim.fs.normalize(rm)
+      if is_subtree(canon_root, cm) and not declared_set[cm] then
+        declared_set[cm] = true
+        declared_mods[#declared_mods + 1] = cm
+      end
+    end
+  end
+  if not declared_set[canon_root] then
+    declared_set[canon_root] = true
+    table.insert(declared_mods, 1, canon_root)
+  end
+
+  local bases, seen_base = {}, {}
   local function add_base(dir)
     if type(dir) ~= "string" or dir == "" then
       return
     end
-    local canon = M.canonical(dir)
-    if not seen_base[canon] then
-      seen_base[canon] = true
-      bases[#bases + 1] = canon
+    local rm = vim.uv.fs_realpath(dir)
+    if not rm or vim.fn.isdirectory(rm) ~= 1 then
+      return
+    end
+    local cm = vim.fs.normalize(rm)
+    if is_subtree(canon_root, cm) and declared_set[cm] and not seen_base[cm] then
+      seen_base[cm] = true
+      bases[#bases + 1] = cm
     end
   end
 
   if module and module ~= "" then
     add_base(module)
-    add_base(root)
+    add_base(canon_root)
   else
-    add_base(root)
-    for _, mod in ipairs(project.modules(root)) do
+    add_base(canon_root)
+    for _, mod in ipairs(declared_mods) do
       add_base(mod)
     end
   end
 
+  local function owner_module(path)
+    local best, best_len = nil, -1
+    for _, mod in ipairs(declared_mods) do
+      if is_subtree(mod, path) and #mod > best_len then
+        best = mod
+        best_len = #mod
+      end
+    end
+    return best
+  end
+
   local seen_profile, profiles = {}, {}
+  local seen_file, files = {}, {}
   local has_default = false
 
-  local function scan_dir(res_dir)
-    if vim.fn.isdirectory(res_dir) ~= 1 then
+  local function scan_dir(base, res_dir, location)
+    local real_res = vim.uv.fs_realpath(res_dir)
+    if not real_res then
       return
     end
-    local handle = vim.uv.fs_scandir(res_dir)
+    real_res = vim.fs.normalize(real_res)
+    local res_stat = vim.uv.fs_stat(real_res)
+    if not res_stat or res_stat.type ~= "directory" then
+      return
+    end
+    if
+      not is_subtree(canon_root, real_res)
+      or not is_subtree(base, real_res)
+      or owner_module(real_res) ~= base
+      or has_nested_build_marker(real_res, base)
+    then
+      return
+    end
+
+    local handle = vim.uv.fs_scandir(real_res)
     if not handle then
       return
     end
     while true do
-      local name, typ = vim.uv.fs_scandir_next(handle)
+      local name = vim.uv.fs_scandir_next(handle)
       if not name then
         break
       end
-      if typ == "file" or typ == nil then
-        if name:match("^application%.properties$") or name:match("^application%.ya?ml$") then
-          has_default = true
-        else
-          local profile = name:match("^application%-([%w%-%_%.]+)%.properties$")
-            or name:match("^application%-([%w%-%_%.]+)%.ya?ml$")
-          if profile and profile ~= "" and not seen_profile[profile] then
-            seen_profile[profile] = true
-            profiles[#profiles + 1] = profile
+      local spec = classify_spring_config_name(name)
+      if spec then
+        local real_file = vim.uv.fs_realpath(res_dir .. "/" .. name)
+        if real_file then
+          real_file = vim.fs.normalize(real_file)
+          local st = vim.uv.fs_stat(real_file)
+          if
+            st
+            and st.type == "file"
+            and is_subtree(canon_root, real_file)
+            and is_subtree(base, real_file)
+            and owner_module(real_file) == base
+            and not has_nested_build_marker(vim.fs.dirname(real_file), base)
+            and vim.fn.filereadable(real_file) == 1
+          then
+            if spec.is_default then
+              has_default = true
+            elseif spec.profile and not seen_profile[spec.profile] then
+              seen_profile[spec.profile] = true
+              profiles[#profiles + 1] = spec.profile
+            end
+            if not seen_file[real_file] then
+              seen_file[real_file] = true
+              local mod_rel = base == canon_root and "root"
+                or (vim.fs.relpath(canon_root, base) or vim.fs.basename(base))
+              files[#files + 1] = {
+                path = real_file,
+                relpath = vim.fs.relpath(canon_root, real_file) or real_file,
+                module = base,
+                module_rel = mod_rel,
+                location = location,
+                name = name,
+                ext = spec.ext,
+                profile = spec.profile,
+                is_default = spec.is_default,
+              }
+            end
           end
         end
       end
@@ -424,14 +560,18 @@ function M.scan_profiles(root, module)
   end
 
   for _, base in ipairs(bases) do
-    scan_dir(base .. "/src/main/resources")
-    scan_dir(base .. "/src/main/resources/config")
+    scan_dir(base, base .. "/src/main/resources", "resources")
+    scan_dir(base, base .. "/src/main/resources/config", "config")
   end
 
   table.sort(profiles)
+  table.sort(files, function(a, b)
+    return a.relpath < b.relpath
+  end)
   return {
     profiles = profiles,
     has_default = has_default,
+    files = files,
   }
 end
 

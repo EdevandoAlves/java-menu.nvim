@@ -65,6 +65,11 @@ for _, name in ipairs({ "stacktrace", "cancel" }) do
   expect_fn(stacktrace, name, "menu Stack Trace")
 end
 
+local spring_config = require("java_menu.spring_config")
+for _, name in ipairs({ "available", "discover", "open" }) do
+  expect_fn(spring_config, name, "spring_config")
+end
+
 -- ---------- infraestrutura ----------
 
 local ui = require("java_menu.ui")

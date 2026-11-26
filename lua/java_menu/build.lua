@@ -7,6 +7,7 @@ local ui = require("java_menu.ui")
 local project = require("java_menu.project")
 local lsp = require("java_menu.lsp")
 local run_config = require("java_menu.run_config")
+local spring_config = require("java_menu.spring_config")
 
 local M = {}
 
@@ -2982,6 +2983,7 @@ function M.build()
   local stop_canon = fg_active and active_root or (bg_chosen and bg_chosen.canon_root) or nil
 
   local _, has_last_build = resolve_last_build(canon_root, false)
+  local spring_cfg_available, spring_cfg_reason = spring_config.available(bufnr)
   local entries = {
     {
       key = "run_main",
@@ -3019,6 +3021,12 @@ function M.build()
       key = "run_settings",
       label = "Run Settings…",
       enabled = true,
+    },
+    {
+      key = "spring_config",
+      label = "Open Spring Configuration…",
+      enabled = spring_cfg_available,
+      reason = spring_cfg_reason,
     },
     { key = "compile", label = "Compile", enabled = can_build, reason = build_reason },
     { key = "package", label = "Package", enabled = can_build, reason = build_reason },
@@ -3085,6 +3093,8 @@ function M.build()
         M.restart()
       elseif entry.key == "run_settings" then
         M.run_settings()
+      elseif entry.key == "spring_config" then
+        spring_config.open(bufnr)
       elseif entry.key == "compile" then
         do_goal(root, bufnr, tool, LIFECYCLE.compile)
       elseif entry.key == "package" then

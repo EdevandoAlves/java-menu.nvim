@@ -230,7 +230,10 @@ at a time: starting another build — including Repeat — is refused until
 you stop. Repeat/Stop/Output are keyed by project root, and stopping a
 process that belongs to another project asks "keep / terminate" first.
 Run Settings stores JVM and application arguments per project and offers
-Spring profiles discovered from application-* files. Restart Last Process
+Spring profiles discovered from application-* files. Open Spring
+Configuration... lists and opens discovered application*.properties/yml/yaml
+files under src/main/resources and src/main/resources/config (also available
+under Project). Restart Last Process
 relaunches the project's recorded command. Run Main and Spring load the
 project-root .env by default when present; toggle it in Run Settings.
 The parser accepts simple KEY=VALUE lines without shell execution. Captured
@@ -295,7 +298,7 @@ and session controls — through nvim-dap and the java-debug bundle.
                                                                 *java-menu-project*
 Project ~
 Project-level actions, available even in an empty directory and without
-jdtls. Four entries:
+jdtls. Five entries:
   New Project...    Wizard for Plain Java, Maven and Spring Boot projects.
                     Nothing is written before the final confirmation;
                     cancelling at any step creates nothing. Generation or
@@ -356,6 +359,17 @@ jdtls. Four entries:
                     - Open build file: opens pom.xml / build.gradle(.kts).
                     - Sync JDTLS: re-imports the build file on the buffer's
                       attached JDTLS client (disabled when not attached).
+  Open Spring Configuration...
+                    Lists and opens application*.{properties,yml,yaml} files
+                    discovered under src/main/resources and
+                    src/main/resources/config across the project root and
+                    declared Maven/Gradle modules (reusing
+                    `run_config.scan_profiles`; also available under
+                    Build/Run). Orders the current module first, labels
+                    module, profile (`default` or `profile: <name>`), and
+                    project-relative path without running Spring or inferring
+                    active values, enforces project/module boundaries, and
+                    degrades safely when unavailable, empty, or cancelled.
   Environment...    Read-only buffer (q closes): Neovim version, java/javac,
                     JAVA_HOME, Maven/Gradle, curl/wget and unzip, wrappers,
                     jdtls attached (client count + workspace dir) or not
@@ -519,6 +533,13 @@ generate delegate methods.
   Gradle is not run. Files are rechecked before replacement, but path-based
   APIs cannot guarantee conflict-free replacement against an uncooperative
   concurrent writer in the final instant.
+- Spring Boot configuration discovery is static and scoped: Open Spring
+  Configuration... only scans `src/main/resources` and
+  `src/main/resources/config` across the project root and declared
+  Maven/Gradle modules (`run_config.scan_profiles`), ignoring outward symlinks
+  and undeclared folders; it never runs Spring, evaluates
+  `spring.profiles.active` / `spring.config.import` / external config
+  locations, or marks any profile as active.
 - Project creation runs no git init and installs/configures no tools.
 - Rename Package / Move Package are disabled (see |java-menu-refactor|).
 - Call & Type Hierarchy require an attached jdtls client advertising

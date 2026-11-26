@@ -98,6 +98,7 @@ FAST_SPECS=(
   tests_isolation_spec
   junit_method_spec
   run_experience_spec
+  spring_config_spec
   calls_spec
   types_spec
   stacktrace_spec

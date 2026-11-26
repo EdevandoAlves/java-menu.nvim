@@ -85,6 +85,16 @@ assert(
   deps_line and deps_line:find("(unavailable: no Maven/Gradle project", 1, true),
   "Dependencies deveria estar desabilitado sem projeto: " .. tostring(deps_line)
 )
+local spring_line
+for line in text:gmatch("[^\n]+") do
+  if line:find("Open Spring Configuration", 1, true) then
+    spring_line = line
+  end
+end
+assert(
+  spring_line and spring_line:find("(unavailable: no Maven/Gradle project", 1, true),
+  "Open Spring Configuration deveria estar desabilitado sem projeto: " .. tostring(spring_line)
+)
 local env_line
 for line in text:gmatch("[^\n]+") do
   if line:find("Environment", 1, true) then
